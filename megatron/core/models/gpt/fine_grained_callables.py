@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -204,7 +205,10 @@ class PostProcessNode(ScheduleNode):
         """
 
         empty_decoder = len(self.gpt_model.decoder.layers) == 0
-        layer_norm = self.gpt_model.decoder.final_layernorm
+        # TransformerBlock uses final_layernorm, MambaStack uses final_norm
+        layer_norm = getattr(
+            self.gpt_model.decoder, 'final_layernorm', None
+        ) or getattr(self.gpt_model.decoder, 'final_norm', None)
         if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
             hidden_states = layer_norm(hidden_states)
             hidden_states = make_viewless_tensor(
@@ -404,6 +408,99 @@ class _BackwardDWWrapper:
     def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
         """Store the CUDA graphed backward weight gradient callable."""
         self.graphed_backward_dw_callable = graphed_backward_dw_callable
+
+
+class _MambaBackwardDWWrapper:
+    """Wrapper for managing backward weight gradient computation of MambaLayer.
+
+    Unlike _BackwardDWWrapper which coordinates attention and shared expert wgrad,
+    MambaLayer has no separate attention or shared expert components. The mixer's
+    weight gradients are computed as part of the standard backward pass, so this
+    wrapper provides a no-op backward_dw for compatibility with the schedule plan.
+    """
+
+    def __init__(self, layer):
+        assert isinstance(layer, MambaLayer), (
+            "_MambaBackwardDWWrapper only supports MambaLayer."
+        )
+        self.layer = layer
+
+    def backward_dw(self):
+        """No-op: MambaLayer wgrad is computed in the standard backward pass."""
+        self.layer = None
+
+    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
+        """Store the CUDA graphed backward weight gradient callable (unused for Mamba)."""
+        pass
+
+
+def build_mamba_layer_callables(layer: MambaLayer):
+    """Create callables for MambaLayer nodes.
+
+    MambaLayer has no MoE component, so dispatch/combine are never called
+    (NoopScheduleNode handles them). The entire MambaLayer computation
+    (norm + mixer + bias-dropout-add) is mapped to the attn node on the
+    compute stream. The mlp node is a passthrough identity.
+
+    This allows MambaLayer to participate in the fine-grained 1F1B schedule,
+    where its computation on the comp_stream can overlap with A2A communication
+    from adjacent MoE layers on the comm_stream.
+
+    Args:
+        layer: The MambaLayer to build callables for.
+
+    Returns:
+        A tuple containing:
+        - forward_funcs: List of 5 callable functions for the layer
+        - backward_dw: Dict of weight gradient functions for the layer
+    """
+
+    def submodule_mamba_forward(node, hidden_states):
+        """Full MambaLayer forward mapped to the attn slot."""
+        residual = hidden_states
+        if layer.config.fp32_residual_connection:
+            residual = residual.float()
+
+        hidden_states = hidden_states.to(dtype=layer.config.params_dtype)
+        hidden_states = apply_module(layer.norm)(hidden_states)
+
+        mixer_out_with_bias = layer.mixer(
+            hidden_states,
+            inference_context=None,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+        )
+
+        with layer.bias_dropout_add_exec_handler():
+            hidden_states = layer.mamba_bda(
+                training=layer.training, fused=layer.config.bias_dropout_fusion
+            )(mixer_out_with_bias, residual, layer.hidden_dropout)
+
+        # Apply final_norm for the last layer in the decoder stack
+        final_norm = getattr(node.chunk_state.model.decoder, 'final_norm', None)
+        if not getattr(node, 'is_mtp', False) and final_norm and node.is_last_layer:
+            hidden_states = final_norm(hidden_states)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        return hidden_states
+
+    def mlp_passthrough(node, hidden_states):
+        """No-op MLP for MambaLayer — all compute is in attn node."""
+        return hidden_states
+
+    def raise_not_implemented(*args):
+        """Raise NotImplementedError for MambaLayer (no MoE dispatch/combine)."""
+        raise NotImplementedError("MambaLayer has no MoE dispatch/combine.")
+
+    attn_func = submodule_mamba_forward
+    dispatch_func = raise_not_implemented
+    mlp_func = mlp_passthrough
+    combine_func = raise_not_implemented
+
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
+    backward_dw = {"attn": _MambaBackwardDWWrapper(layer), "mlp": None}
+    return forward_funcs, backward_dw
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):
@@ -621,8 +718,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.residual = None
         node.layer_state.shared_expert_output = None
 
-        # final layer norm from decoder
-        final_layernorm = node.chunk_state.model.decoder.final_layernorm
+        # final layer norm from decoder (TransformerBlock uses final_layernorm,
+        # MambaStack uses final_norm)
+        final_layernorm = getattr(
+            node.chunk_state.model.decoder, 'final_layernorm', None
+        ) or getattr(node.chunk_state.model.decoder, 'final_norm', None)
         if not node.is_mtp and final_layernorm and node.is_last_layer:
             output = final_layernorm(output)
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
@@ -736,7 +836,7 @@ def build_mtp_layer_callables(layer):
 def build_layer_callables(layer):
     """
     Builds the callable functions(forward and dw) for the given layer.
-    For now, 1f1b overlap only support TransformerLayer and MultiTokenPredictionLayer.
+    Supports TransformerLayer, MultiTokenPredictionLayer, and MambaLayer.
 
     Args:
         layer: The layer to build callables for.
@@ -749,5 +849,7 @@ def build_layer_callables(layer):
         return build_transformer_layer_callables(layer)
     elif isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
+    elif isinstance(layer, MambaLayer):
+        return build_mamba_layer_callables(layer)
 
     raise ValueError(f"Unsupported layer type: {type(layer)}")
