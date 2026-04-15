@@ -208,13 +208,16 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: MambaModel):
+def forward_step(data_iterator, model: MambaModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
-        model (MambaModel): The GPT Model
+        model (MambaModel): The Mamba Model
+        return_schedule_plan (bool): Whether to return the schedule plan instead of the output
+            tensor. Used by EP A2A overlap (--overlap-moe-expert-parallel-comm).
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -252,14 +255,24 @@ def forward_step(data_iterator, model: MambaModel):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(
-            tokens,
-            position_ids,
-            attention_mask,
-            labels=labels,
-            packed_seq_params=packed_seq_params,
-            loss_mask=loss_mask
-        )
+        if return_schedule_plan:
+            assert args.overlap_moe_expert_parallel_comm, \
+                "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+            schedule_plan = model.build_schedule_plan(
+                tokens, position_ids, attention_mask,
+                labels=labels, loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+            return schedule_plan, partial(loss_func, loss_mask, model=model)
+        else:
+            output_tensor = model(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                packed_seq_params=packed_seq_params,
+                loss_mask=loss_mask
+            )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

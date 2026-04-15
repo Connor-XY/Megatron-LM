@@ -124,8 +124,10 @@ class TransformerLayerSchedulePlan:
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
         transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
-        is_moe = isinstance(transformer_layer.mlp, MoELayer)
-        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
+        # MambaLayer has no .mlp attribute (uses .mixer instead), so use getattr
+        mlp = getattr(transformer_layer, 'mlp', None)
+        is_moe = isinstance(mlp, MoELayer)
+        num_local_experts = mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe

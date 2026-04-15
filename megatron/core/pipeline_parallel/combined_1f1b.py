@@ -340,7 +340,7 @@ def combined_forward_backward_step(
             )
             assert hasattr(unwrapped_model, 'build_schedule_plan'), (
                 "Model must implement build_schedule_plan() for EP A2A overlapping. "
-                "Supported models: GPTModel, MambaModel."
+                "Supported models: GPTModel, HybridModel."
             )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
