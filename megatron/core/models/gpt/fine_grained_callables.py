@@ -383,7 +383,9 @@ class _BackwardDWWrapper:
         ), "cuda graphed ep overlap only supports TransformerLayer for now."
         self.layer = layer
         self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
+        # MoE-only TransformerLayers (e.g. in Mamba hybrid patterns) have
+        # IdentityOp as self_attention, which has no backward_dw.
+        self.attn_dw_callable = getattr(layer.self_attention, 'backward_dw', None)
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
                 layer.mlp.backward_dw, routed_experts=False, shared_experts=True
@@ -399,7 +401,9 @@ class _BackwardDWWrapper:
             not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphScope.attn not in self.cuda_graph_scope:
+        if self.attn_dw_callable is not None and (
+            not is_replay or CudaGraphScope.attn not in self.cuda_graph_scope
+        ):
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()
