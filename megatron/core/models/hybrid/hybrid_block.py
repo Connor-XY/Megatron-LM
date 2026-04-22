@@ -78,6 +78,8 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         submodules: HybridStackSubmodules,
         pre_process: bool = True,
         layer_type_list: Optional[list[str]] = None,
+        combined_layer_specs: Optional[list] = None,
+        combined_layer_submodules: Optional[object] = None,
         pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -101,14 +103,66 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        assert layer_type_list is not None, (
-            "layer_type_list must be provided. It should be pre-computed from "
-            "--hybrid-layer-pattern by HybridModel."
-        )
+        # Exactly one of (layer_type_list, combined_layer_specs) must be set.
+        # - layer_type_list: legacy path, one module per single-char symbol
+        # - combined_layer_specs: new path, one CombinedHybridLayer per bracket group
+        use_combined = combined_layer_specs is not None
+        if use_combined:
+            assert layer_type_list is None, (
+                "Cannot pass both layer_type_list and combined_layer_specs; pick one"
+            )
+            assert combined_layer_submodules is not None, (
+                "combined_layer_submodules must be provided when using bracket patterns"
+            )
+        else:
+            assert layer_type_list is not None, (
+                "layer_type_list must be provided. It should be pre-computed from "
+                "--hybrid-layer-pattern by HybridModel."
+            )
         self.layer_type_list = layer_type_list
+        self.combined_layer_specs = combined_layer_specs
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
+
+        if use_combined:
+            # Combined-layer path: one CombinedHybridLayer per bracket group
+            from megatron.core.models.hybrid.combined_layer import CombinedHybridLayer
+
+            for i, spec in enumerate(combined_layer_specs):
+                layer_number = i + 1 + pp_layer_offset
+                if self.config.fp8:
+                    quant_init_context = get_fp8_context(
+                        self.config, i + pp_layer_offset, is_init=True
+                    )
+                elif self.config.fp4:
+                    quant_init_context = get_fp4_context(
+                        self.config, i + pp_layer_offset, is_init=True
+                    )
+                else:
+                    quant_init_context = nullcontext()
+                with quant_init_context:
+                    layer = CombinedHybridLayer(
+                        config=self.config,
+                        submodules=combined_layer_submodules,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        pp_layer_offset=pp_layer_offset,
+                        **spec.kwargs,
+                    )
+                self.layers.append(layer)
+
+            # Required for activation recomputation
+            self.num_layers_per_pipeline_rank = len(self.layers)
+
+            if self.post_process and self.post_layer_norm:
+                self.final_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                )
+            return
+
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
@@ -336,7 +390,19 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
                 with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
+                    # Avoid importing CombinedHybridLayer at module scope to skip
+                    # the import when combined layers are not in use.
+                    from megatron.core.models.hybrid.combined_layer import CombinedHybridLayer
+                    if isinstance(layer, CombinedHybridLayer):
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                            packed_seq_params=packed_seq_params,
+                        )
+                    elif isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,

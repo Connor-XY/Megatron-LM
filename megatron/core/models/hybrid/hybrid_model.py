@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -175,22 +176,74 @@ class HybridModel(LanguageModule):
 
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
+        from megatron.core.models.hybrid.combined_layer_pattern import (
+            is_bracket_pattern,
+            parse_bracket_pattern,
+        )
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
 
-        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-        self.mtp_pattern = parsed.mtp_pattern
-        self.mtp_num_depths = parsed.mtp_num_depths
-
-        layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+        # Split on MTP separator first so bracket-mode main and single-char MTP
+        # can coexist if needed. Today we require both halves to use the same
+        # notation, but the split is independent.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as _Symbols
+        _parts = (
+            self.hybrid_layer_pattern.split(_Symbols.MTP_SEPARATOR)
+            if self.hybrid_layer_pattern else ['']
         )
+        self.uses_combined_layers = is_bracket_pattern(_parts[0])
+
+        if self.uses_combined_layers:
+            # Bracket-notation path: each [...] becomes a CombinedHybridLayer.
+            all_segments = parse_bracket_pattern(_parts[0])
+            pp_rank = (
+                torch.distributed.get_rank(self.pg_collection.pp)
+                if self.pg_collection.pp is not None
+                else 0
+            )
+            pp_size = (
+                torch.distributed.get_world_size(self.pg_collection.pp)
+                if self.pg_collection.pp is not None
+                else 1
+            )
+            vp_rel = vp_stage if vp_stage is not None else 0
+            segment_index = vp_rel * pp_size + pp_rank
+            if segment_index >= len(all_segments):
+                raise ValueError(
+                    f"Bracket pattern has {len(all_segments)} pipeline segments but "
+                    f"segment_index={segment_index} (pp_rank={pp_rank}, "
+                    f"vp_stage={vp_stage}, pp_size={pp_size}) is out of range."
+                )
+            combined_layer_specs = all_segments[segment_index]
+            layer_offset = sum(len(s) for s in all_segments[:segment_index])
+            layer_type_list = None
+
+            # MTP with bracket mode: only single-char MTP supported today, reuse parser
+            if len(_parts) > 1:
+                mtp_joined = _Symbols.MTP_SEPARATOR.join(_parts[1:])
+                mtp_parsed = parse_hybrid_pattern(
+                    _Symbols.MTP_SEPARATOR + mtp_joined  # restore separator
+                )
+                self.mtp_pattern = mtp_parsed.mtp_pattern
+                self.mtp_num_depths = mtp_parsed.mtp_num_depths
+            else:
+                self.mtp_pattern = None
+                self.mtp_num_depths = 0
+        else:
+            combined_layer_specs = None
+            parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+            self.mtp_pattern = parsed.mtp_pattern
+            self.mtp_num_depths = parsed.mtp_num_depths
+
+            layer_type_list, layer_offset = select_pipeline_segment(
+                parsed.main_pattern or '',
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -229,16 +282,23 @@ class HybridModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
-        self.decoder = build_module(
-            hybrid_stack_spec,
-            self.config,
+        decoder_kwargs = dict(
             pre_process=self.pre_process,
-            layer_type_list=layer_type_list,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
         )
+        if self.uses_combined_layers:
+            from megatron.core.models.hybrid.hybrid_layer_specs import (
+                combined_hybrid_layer_submodules,
+            )
+            decoder_kwargs['combined_layer_specs'] = combined_layer_specs
+            decoder_kwargs['combined_layer_submodules'] = combined_hybrid_layer_submodules
+        else:
+            decoder_kwargs['layer_type_list'] = layer_type_list
+
+        self.decoder = build_module(hybrid_stack_spec, self.config, **decoder_kwargs)
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:

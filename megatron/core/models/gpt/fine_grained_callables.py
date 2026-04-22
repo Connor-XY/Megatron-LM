@@ -840,7 +840,8 @@ def build_mtp_layer_callables(layer):
 def build_layer_callables(layer):
     """
     Builds the callable functions(forward and dw) for the given layer.
-    Supports TransformerLayer, MultiTokenPredictionLayer, and MambaLayer.
+    Supports TransformerLayer, MultiTokenPredictionLayer, MambaLayer, and
+    CombinedHybridLayer.
 
     Args:
         layer: The layer to build callables for.
@@ -849,6 +850,14 @@ def build_layer_callables(layer):
         forward_funcs: list of callable functions for the layer.
         backward_dw: dict of weight gradient functions for the layer.
     """
+    # Import lazily to avoid a hard dep when the combined-layer path is unused.
+    from megatron.core.models.hybrid.combined_layer import CombinedHybridLayer
+
+    if isinstance(layer, CombinedHybridLayer):
+        from megatron.core.models.hybrid.combined_layer_callables import (
+            build_combined_hybrid_layer_callables,
+        )
+        return build_combined_hybrid_layer_callables(layer)
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
     elif isinstance(layer, MultiTokenPredictionLayer):

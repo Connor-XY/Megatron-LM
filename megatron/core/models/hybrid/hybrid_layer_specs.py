@@ -306,3 +306,59 @@ hybrid_inference_stack_spec = ModuleSpec(
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
+
+
+# ---------------------------------------------------------------------------
+# Combined-hybrid-layer submodules (used by bracket-notation patterns).
+#
+# Each CombinedHybridLayer instance may choose any subset of these submodules
+# based on its (mamba_type, attention_type, mlp_type) selectors; the unused
+# specs are simply ignored.
+# ---------------------------------------------------------------------------
+
+from megatron.core.models.hybrid.combined_layer import CombinedHybridLayerSubmodules
+
+combined_hybrid_layer_submodules = CombinedHybridLayerSubmodules(
+    # Mamba family
+    mamba_norm=TENorm,
+    mamba_mixer=ModuleSpec(
+        module=MambaMixer,
+        submodules=MambaMixerSubmodules(
+            in_proj=TELayerNormColumnParallelLinear,
+            out_proj=TERowParallelLinear,
+        ),
+    ),
+    gdn_mixer=ModuleSpec(
+        module=GatedDeltaNet,
+        submodules=GatedDeltaNetSubmodules(
+            in_proj=TELayerNormColumnParallelLinear,
+            out_norm=TENorm,
+            out_proj=TERowParallelLinear,
+        ),
+    ),
+    mamba_bda=get_bias_dropout_add,
+    # Attention
+    attn_norm=TENorm,
+    self_attention=ModuleSpec(
+        module=SelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=SelfAttentionSubmodules(
+            linear_qkv=TELayerNormColumnParallelLinear,
+            core_attention=TEDotProductAttention,
+            linear_proj=TERowParallelLinear,
+        ),
+    ),
+    # mla_attention — fill in when needed; default IdentityOp is fine for now
+    attn_bda=get_bias_dropout_add,
+    # MLP / MoE
+    pre_mlp_layernorm=TENorm,
+    mlp=ModuleSpec(
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TELayerNormColumnParallelLinear,
+            linear_fc2=TERowParallelLinear,
+        ),
+    ),
+    moe=moe,
+    mlp_bda=get_bias_dropout_add,
+)
