@@ -13,15 +13,14 @@ import torch
 
 from megatron.core.models.hybrid.combined_layer import (
     ATTENTION_TYPE_ATTENTION,
-    ATTENTION_TYPE_GATED_DELTA_NET,
     ATTENTION_TYPE_NONE,
+    MAMBA_TYPE_GDN,
     MAMBA_TYPE_MAMBA,
-    MAMBA_TYPE_NONE,
     MLP_TYPE_MLP,
     AttnMoELayer,
     CombinedHybridLayer,
+    GDNSelfAttnMLPLayer,
     GDNMLPLayer,
-    MambaGDNMLPLayer,
     MambaMLPLayer,
     MambaMoELayer,
     MambaSelfAttnMLPLayer,
@@ -110,8 +109,7 @@ class TestCombinedHybridLayer:
         assert layer.self_attention is not None
         assert layer.attention_type == ATTENTION_TYPE_ATTENTION
 
-    def test_pure_gdn_mlp_forward_shape(self):
-        """Pure GDN + MLP (no Mamba) -- GDN in the attention slot."""
+    def test_gdn_mlp_forward_shape(self):
         try:
             from megatron.core.ssm.gated_delta_net import HAVE_FLA
         except ImportError:
@@ -129,14 +127,13 @@ class TestCombinedHybridLayer:
         hidden_states, attention_mask = self._inputs(self.config.hidden_size)
         output = layer(hidden_states, attention_mask=attention_mask)
         assert output.shape == hidden_states.shape
-        # Mamba mixer is absent; GDN sits in the attention slot.
-        assert layer.mamba_type == MAMBA_TYPE_NONE
-        assert layer.mixer is None
-        assert layer.attention_type == ATTENTION_TYPE_GATED_DELTA_NET
-        assert layer.self_attention is not None
+        assert layer.mamba_type == MAMBA_TYPE_GDN
+        assert layer.mixer is not None
+        # GDN replaces Mamba in the mixer slot, not the attention slot.
+        assert layer.self_attention is None
 
-    def test_mamba_gdn_stacked_forward_shape(self):
-        """Mamba + GDN stacked in one combined layer (both mixers present)."""
+    def test_gdn_self_attn_mlp_forward_shape(self):
+        """GDN mixer followed by full attention and MLP."""
         try:
             from megatron.core.ssm.gated_delta_net import HAVE_FLA
         except ImportError:
@@ -146,7 +143,7 @@ class TestCombinedHybridLayer:
         if not hasattr(self.config, "linear_key_head_dim"):
             pytest.skip("TransformerConfig lacks GDN fields in this build")
 
-        layer = MambaGDNMLPLayer(
+        layer = GDNSelfAttnMLPLayer(
             self.config,
             combined_hybrid_layer_submodules,
             pg_collection=self.pg_collection,
@@ -154,10 +151,9 @@ class TestCombinedHybridLayer:
         hidden_states, attention_mask = self._inputs(self.config.hidden_size)
         output = layer(hidden_states, attention_mask=attention_mask)
         assert output.shape == hidden_states.shape
-        # Both mixers are present.
-        assert layer.mamba_type == MAMBA_TYPE_MAMBA
+        assert layer.mamba_type == MAMBA_TYPE_GDN
         assert layer.mixer is not None
-        assert layer.attention_type == ATTENTION_TYPE_GATED_DELTA_NET
+        assert layer.attention_type == ATTENTION_TYPE_ATTENTION
         assert layer.self_attention is not None
 
     def test_attn_moe_forward_shape(self):

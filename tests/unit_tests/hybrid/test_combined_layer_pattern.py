@@ -55,17 +55,18 @@ class TestParseBracketSegment:
         assert g.canonical == "[M*-]"
 
     def test_gdn_mlp(self):
-        """Pure GDN + MLP: GDN is the attention-slot choice, no Mamba."""
         [g] = parse_bracket_segment("[G-]")
-        assert g.mamba_type == "none"
-        assert g.attention_type == "gated_delta_net"
+        assert g.mamba_type == "gdn"
         assert g.mlp_type == "mlp"
 
-    def test_mamba_plus_gdn_stacked(self):
-        """``[MG-]`` stacks Mamba + GDN (GDN in the attention slot)."""
-        [g] = parse_bracket_segment("[MG-]")
-        assert g.mamba_type == "mamba"
-        assert g.attention_type == "gated_delta_net"
+    def test_gdn_self_attn_moe(self):
+        """GDN is the mixer slot; full attention is separate."""
+        [g] = parse_bracket_segment("[G*E]")
+        assert g.mamba_type == "gdn"
+        assert g.attention_type == "attention"
+        assert g.mlp_type == "moe"
+        assert g.is_moe
+        assert g.canonical == "[G*E]"
 
     def test_mamba_moe(self):
         [g] = parse_bracket_segment("[ME]")
@@ -110,19 +111,13 @@ class TestParseBracketSegment:
         with pytest.raises(ValueError, match="repeated"):
             parse_bracket_segment("[MM-]")
 
+    def test_two_sequence_mixers(self):
+        with pytest.raises(ValueError, match="sequence mixer"):
+            parse_bracket_segment("[MG-]")
+
     def test_two_attention_kinds(self):
-        # SelfAttention + MLA not allowed.
-        with pytest.raises(ValueError, match="multiple attention-kind"):
+        with pytest.raises(ValueError, match="both Attention"):
             parse_bracket_segment("[M*D-]")
-
-    def test_self_attn_and_gdn_both_in_attn_slot(self):
-        # * and G both occupy the attention slot -- rejected.
-        with pytest.raises(ValueError, match="multiple attention-kind"):
-            parse_bracket_segment("[M*G-]")
-
-    def test_mla_and_gdn_both_in_attn_slot(self):
-        with pytest.raises(ValueError, match="multiple attention-kind"):
-            parse_bracket_segment("[MDG-]")
 
     def test_two_mlp_kinds(self):
         with pytest.raises(ValueError, match="both MLP"):

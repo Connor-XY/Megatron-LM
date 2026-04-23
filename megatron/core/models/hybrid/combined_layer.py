@@ -7,13 +7,13 @@ The combined layer bundles up to three functional blocks into a single
 :class:`TransformerLayer`. The existing architecture-agnostic 1F1B fine-grained
 schedule plan therefore applies to hybrid models without model-specific
 branches: MoE All-to-All dispatch/combine can run on the comm stream while
-another microbatch's Mamba/attention compute runs on the compute stream.
+another microbatch's mixer/attention compute runs on the compute stream.
 
 Composition is controlled by three independent selectors passed to the
 constructor:
 
-* ``mamba_type``     -- ``'mamba'`` | ``'none'``  (the SSM "mixer" slot)
-* ``attention_type`` -- ``'attention'`` | ``'mla'`` | ``'gated_delta_net'`` | ``'none'``
+* ``mamba_type``     -- ``'mamba'`` | ``'gdn'`` | ``'none'``  (the "mixer" slot)
+* ``attention_type`` -- ``'attention'`` | ``'mla'`` | ``'none'``
 * ``mlp_type``       -- ``'mlp'`` | ``'moe'`` | ``'none'``
 
 The spec (``CombinedHybridLayerSubmodules``) provides every possible submodule;
@@ -21,12 +21,10 @@ the layer only builds the ones matching its selectors. Concrete subclasses
 (:class:`MambaMLPLayer`, :class:`MambaSelfAttnMoELayer`, etc.) pin the
 combination so ``type(layer).__name__`` tells you exactly what runs.
 
-GDN lives in the attention slot, consistent with the legacy
-:mod:`hybrid_layer_specs` (where a ``G`` layer is a ``TransformerLayer`` with
-``self_attention=GatedDeltaNet``) and with the original design doc. This
-also allows Mamba + GDN stacked in a single layer (``[MG-]``) in case a
-future architecture needs that; a pure-GDN layer (no Mamba) is ``[G-]``
-with ``mamba_type='none'`` and ``attention_type='gated_delta_net'``.
+Classifying GDN as a sequence mixer (not an "attention" alternative) is
+deliberate: a GDN layer replaces Mamba in the first slot, so mixer +
+attention + MLP/MoE layers can be expressed directly. The attention slot is
+reserved for SelfAttention / MLA when either is needed on top of the mixer.
 """
 
 from dataclasses import dataclass, field
@@ -52,19 +50,14 @@ from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
 # Valid values for the three selectors. Exposed as module-level constants so
 # callers and tests can introspect them without string magic.
 MAMBA_TYPE_MAMBA = "mamba"
+MAMBA_TYPE_GDN = "gdn"
 MAMBA_TYPE_NONE = "none"
-VALID_MAMBA_TYPES = (MAMBA_TYPE_MAMBA, MAMBA_TYPE_NONE)
+VALID_MAMBA_TYPES = (MAMBA_TYPE_MAMBA, MAMBA_TYPE_GDN, MAMBA_TYPE_NONE)
 
 ATTENTION_TYPE_ATTENTION = "attention"
 ATTENTION_TYPE_MLA = "mla"
-ATTENTION_TYPE_GATED_DELTA_NET = "gated_delta_net"
 ATTENTION_TYPE_NONE = "none"
-VALID_ATTENTION_TYPES = (
-    ATTENTION_TYPE_ATTENTION,
-    ATTENTION_TYPE_MLA,
-    ATTENTION_TYPE_GATED_DELTA_NET,
-    ATTENTION_TYPE_NONE,
-)
+VALID_ATTENTION_TYPES = (ATTENTION_TYPE_ATTENTION, ATTENTION_TYPE_MLA, ATTENTION_TYPE_NONE)
 
 MLP_TYPE_MLP = "mlp"
 MLP_TYPE_MOE = "moe"
@@ -81,19 +74,16 @@ class CombinedHybridLayerSubmodules:
     / ``mlp_type``. Unused specs are ignored.
     """
 
-    # --- Mamba family (``mamba_type`` picks between ``mamba_mixer`` and ``none``) ---
+    # --- Sequence mixer (``mamba_type`` picks between ``mamba_mixer`` and ``gdn_mixer``) ---
     mamba_norm: LayerNormBuilder = IdentityOp
     mamba_mixer: Union[ModuleSpec, type] = IdentityOp
+    gdn_mixer: Union[ModuleSpec, type] = IdentityOp
     mamba_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
-    # --- Attention slot (``attention_type`` picks among ``self_attention``,
-    # ``mla_attention``, and ``gdn_attention``). The slot holds whatever
-    # causal sequence mixer sits next to / beside the Mamba mixer --
-    # SelfAttention, MLA, or GDN.
+    # --- Attention (``attention_type`` picks between ``self_attention`` and ``mla_attention``) ---
     attn_norm: LayerNormBuilder = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     mla_attention: Union[ModuleSpec, type] = IdentityOp
-    gdn_attention: Union[ModuleSpec, type] = IdentityOp
     attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     # --- MLP / MoE (``mlp_type`` picks between ``mlp`` and ``moe``) ---
@@ -117,8 +107,8 @@ class CombinedHybridLayer(MegatronModule):
         config: TransformerConfig.
         submodules: :class:`CombinedHybridLayerSubmodules`; any building block
             this layer does not use is ignored.
-        mamba_type: ``'mamba'`` | ``'none'``.
-        attention_type: ``'attention'`` | ``'mla'`` | ``'gated_delta_net'`` | ``'none'``.
+        mamba_type: ``'mamba'`` | ``'gdn'`` | ``'none'``.
+        attention_type: ``'attention'`` | ``'mla'`` | ``'none'``.
         mlp_type: ``'mlp'`` | ``'moe'`` | ``'none'``.
         layer_number: 1-indexed combined-layer position in the decoder.
         hidden_dropout: Residual-path dropout; defaults to
@@ -196,7 +186,7 @@ class CombinedHybridLayer(MegatronModule):
 
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-        # ---- Mamba block (Mamba SSM mixer) ----
+        # ---- Mamba / GDN block ----
         self.mamba_norm = None
         self.mixer = None
         self.mamba_bda = None
@@ -211,22 +201,27 @@ class CombinedHybridLayer(MegatronModule):
                 pp_layer_offset=pp_layer_offset,
             )
             self.mamba_bda = build_module(submodules.mamba_bda)
+        elif mamba_type == MAMBA_TYPE_GDN:
+            self.mamba_norm = submodules.mamba_norm(config, config.hidden_size)
+            self.mixer = build_module(
+                submodules.gdn_mixer,
+                config,
+                layer_number=self.submodule_layer_numbers["mamba"],
+                pg_collection=pg_collection,
+            )
+            self.mamba_bda = build_module(submodules.mamba_bda)
 
-        # ---- Attention slot (SelfAttention / MLA / GatedDeltaNet) ----
+        # ---- Attention block ----
         self.attn_norm = None
         self.self_attention = None
         self.attn_bda = None
         if attention_type != ATTENTION_TYPE_NONE:
             self.attn_norm = submodules.attn_norm(config, config.hidden_size)
-            if attention_type == ATTENTION_TYPE_ATTENTION:
-                attn_spec = submodules.self_attention
-            elif attention_type == ATTENTION_TYPE_MLA:
-                attn_spec = submodules.mla_attention
-            elif attention_type == ATTENTION_TYPE_GATED_DELTA_NET:
-                attn_spec = submodules.gdn_attention
-            else:
-                raise ValueError(f"unhandled attention_type={attention_type!r}")
-
+            attn_spec = (
+                submodules.self_attention
+                if attention_type == ATTENTION_TYPE_ATTENTION
+                else submodules.mla_attention
+            )
             attn_kwargs: Dict[str, Any] = {
                 "config": config,
                 "layer_number": self.submodule_layer_numbers["attention"],
@@ -239,11 +234,7 @@ class CombinedHybridLayer(MegatronModule):
                     ]
                 else:
                     attn_kwargs["cp_comm_type"] = config.cp_comm_type
-            # GDN doesn't take pp_layer_offset; only SelfAttention/MLA do.
-            if (
-                pp_layer_offset is not None
-                and attention_type != ATTENTION_TYPE_GATED_DELTA_NET
-            ):
+            if pp_layer_offset is not None:
                 attn_kwargs["pp_layer_offset"] = pp_layer_offset
             self.self_attention = build_module(attn_spec, **attn_kwargs)
             self.attn_bda = build_module(submodules.attn_bda)
@@ -561,24 +552,39 @@ class MambaSelfAttnMoELayer(CombinedHybridLayer):
         super().__init__(*args, **kwargs)
 
 
-class MambaGDNMLPLayer(CombinedHybridLayer):
-    """Mamba + GatedDeltaNet + MLP (both sequence mixers stacked in one layer)."""
-
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("mamba_type", MAMBA_TYPE_MAMBA)
-        kwargs.setdefault("attention_type", ATTENTION_TYPE_GATED_DELTA_NET)
-        kwargs.setdefault("mlp_type", MLP_TYPE_MLP)
-        super().__init__(*args, **kwargs)
-
-
 class GDNMLPLayer(CombinedHybridLayer):
-    """GatedDeltaNet + MLP (GDN in the attention slot, no Mamba)."""
+    """GatedDeltaNet + MLP (GDN replaces Mamba in the mixer slot)."""
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("mamba_type", MAMBA_TYPE_NONE)
-        kwargs.setdefault("attention_type", ATTENTION_TYPE_GATED_DELTA_NET)
+        kwargs.setdefault("mamba_type", MAMBA_TYPE_GDN)
+        kwargs.setdefault("attention_type", ATTENTION_TYPE_NONE)
         kwargs.setdefault("mlp_type", MLP_TYPE_MLP)
         super().__init__(*args, **kwargs)
+
+
+class GDNSelfAttnMLPLayer(CombinedHybridLayer):
+    """GatedDeltaNet + SelfAttention + MLP."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("mamba_type", MAMBA_TYPE_GDN)
+        kwargs.setdefault("attention_type", ATTENTION_TYPE_ATTENTION)
+        kwargs.setdefault("mlp_type", MLP_TYPE_MLP)
+        super().__init__(*args, **kwargs)
+
+
+class GDNSelfAttnMoELayer(CombinedHybridLayer):
+    """GatedDeltaNet + SelfAttention + MoE."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("mamba_type", MAMBA_TYPE_GDN)
+        kwargs.setdefault("attention_type", ATTENTION_TYPE_ATTENTION)
+        kwargs.setdefault("mlp_type", MLP_TYPE_MOE)
+        super().__init__(*args, **kwargs)
+
+
+# Backward-compatible alias for the earlier class name. GDN is the mixer; no
+# Mamba block is instantiated by this layer.
+MambaGDNMLPLayer = GDNMLPLayer
 
 
 class AttnMoELayer(CombinedHybridLayer):
@@ -598,14 +604,16 @@ __all__ = [
     "MambaMoELayer",
     "MambaSelfAttnMLPLayer",
     "MambaSelfAttnMoELayer",
-    "MambaGDNMLPLayer",
     "GDNMLPLayer",
+    "GDNSelfAttnMLPLayer",
+    "GDNSelfAttnMoELayer",
+    "MambaGDNMLPLayer",
     "AttnMoELayer",
     "MAMBA_TYPE_MAMBA",
+    "MAMBA_TYPE_GDN",
     "MAMBA_TYPE_NONE",
     "ATTENTION_TYPE_ATTENTION",
     "ATTENTION_TYPE_MLA",
-    "ATTENTION_TYPE_GATED_DELTA_NET",
     "ATTENTION_TYPE_NONE",
     "MLP_TYPE_MLP",
     "MLP_TYPE_MOE",

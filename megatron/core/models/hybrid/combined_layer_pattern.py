@@ -18,23 +18,19 @@ Grammar
 
 Composition rules per bracket group (``_validate_group``):
 
-* at most one Mamba mixer (``M``)
-* at most one attention kind (``*`` or ``D`` or ``G``)
+* at most one sequence mixer (``M`` or ``G``)
+* at most one attention kind (``*`` or ``D``)
 * at most one MLP kind (``-`` or ``E``)
 * at least one component overall
 * each component may appear at most once; **ordering inside the bracket is
   ignored** -- only the *set* of components matters
 
-GDN (``G``) lives in the attention slot alongside SelfAttention (``*``) and
-MLA (``D``), consistent with the legacy :mod:`hybrid_layer_specs` where a
-``G`` layer is a :class:`TransformerLayer` with ``self_attention=GatedDeltaNet``.
-
 Examples
 --------
-* ``[M-]``          -> Mamba + MLP
+* ``[M-]``          -> one combined layer: Mamba + MLP
 * ``[M*-][M-][ME]`` -> Mamba+Attn+MLP, Mamba+MLP, Mamba+MoE
-* ``[G-]``          -> GatedDeltaNet + MLP (no Mamba -- GDN in the attention slot)
-* ``[MG-]``         -> Mamba + GatedDeltaNet + MLP (stacked mixers)
+* ``[GE]``          -> GatedDeltaNet + MoE (GDN replaces Mamba in the mixer)
+* ``[G*E]``         -> GatedDeltaNet + Attention + MoE
 * ``[*E][*E]``      -> pure Attention+MoE layers (GPT-style, no mamba mixer)
 * ``[M-][M*-]|[M-][ME]`` -> two PP stages with distinct combined layouts
 
@@ -54,25 +50,20 @@ from typing import List, Optional, Set
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
 # Role-to-selector lookups shared with the CombinedHybridLayer constructor.
-_MAMBA_SYMBOLS = {Symbols.MAMBA}
-_ATTN_SYMBOLS = {Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN}
+_MAMBA_SYMBOLS = {Symbols.MAMBA, Symbols.GDN}
+_ATTN_SYMBOLS = {Symbols.ATTENTION, Symbols.DS_ATTENTION}
 _MLP_SYMBOLS = {Symbols.MLP, Symbols.MOE}
 
-_MAMBA_TAG = {Symbols.MAMBA: "mamba"}
-_ATTN_TAG = {
-    Symbols.ATTENTION: "attention",
-    Symbols.DS_ATTENTION: "mla",
-    Symbols.GDN: "gated_delta_net",
-}
+_MAMBA_TAG = {Symbols.MAMBA: "mamba", Symbols.GDN: "gdn"}
+_ATTN_TAG = {Symbols.ATTENTION: "attention", Symbols.DS_ATTENTION: "mla"}
 _MLP_TAG = {Symbols.MLP: "mlp", Symbols.MOE: "moe"}
 
 # Canonical display order inside a bracket group, used by ``CombinedLayerSpec.canonical``.
-# Attention symbols (*, D, G) follow the Mamba mixer; MLP symbols come last.
 _CANONICAL_ORDER = (
     Symbols.MAMBA,
+    Symbols.GDN,
     Symbols.ATTENTION,
     Symbols.DS_ATTENTION,
-    Symbols.GDN,
     Symbols.MLP,
     Symbols.MOE,
 )
@@ -111,12 +102,12 @@ class CombinedLayerSpec:
         present = []
         if self.mamba_type == "mamba":
             present.append(Symbols.MAMBA)
+        elif self.mamba_type == "gdn":
+            present.append(Symbols.GDN)
         if self.attention_type == "attention":
             present.append(Symbols.ATTENTION)
         elif self.attention_type == "mla":
             present.append(Symbols.DS_ATTENTION)
-        elif self.attention_type == "gated_delta_net":
-            present.append(Symbols.GDN)
         if self.mlp_type == "mlp":
             present.append(Symbols.MLP)
         elif self.mlp_type == "moe":
@@ -168,21 +159,18 @@ def _validate_group(body: str) -> Set[str]:
             )
         seen.add(ch)
 
-    # At most one mamba, one attn, one MLP. (M is the only mamba symbol;
-    # the ``len > 1`` check is kept for future-proofing if more mamba
-    # variants are introduced.)
+    # At most one sequence mixer, one attention kind, one MLP kind.
     mamba_hits = seen & _MAMBA_SYMBOLS
     if len(mamba_hits) > 1:
         raise ValueError(
-            f"Bracket group '[{body}]' has multiple Mamba-family mixers "
-            f"({sorted(mamba_hits)}); pick at most one."
+            f"Bracket group '[{body}]' has both Mamba (M) and GDN (G); "
+            "pick at most one sequence mixer."
         )
     attn_hits = seen & _ATTN_SYMBOLS
     if len(attn_hits) > 1:
         raise ValueError(
-            f"Bracket group '[{body}]' has multiple attention-kind symbols "
-            f"({sorted(attn_hits)}); pick at most one of "
-            f"{sorted(_ATTN_SYMBOLS)}."
+            f"Bracket group '[{body}]' has both Attention (*) and DS_ATTENTION (D); "
+            "pick at most one attention kind."
         )
     mlp_hits = seen & _MLP_SYMBOLS
     if len(mlp_hits) > 1:
