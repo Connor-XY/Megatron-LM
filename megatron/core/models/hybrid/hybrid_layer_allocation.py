@@ -1,7 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -22,6 +22,10 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    # Bracket grammar used to mark a combined Mamba + (optional attn) + MLP
+    # layer when 1F1B overlap is enabled. Only appears in main patterns.
+    LBRACKET = "["
+    RBRACKET = "]"
     VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
 
     @classmethod
@@ -35,6 +39,245 @@ class Symbols:
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
+
+
+# ---------------------------------------------------------------------------
+# Bracketed "combined layer" grammar (Option 1 from the 1F1B overlap design).
+#
+# A bracketed main pattern groups symbols into combined layers:
+#     [M-]            Mamba + dense MLP
+#     [M*-]           Mamba + SelfAttention + dense MLP
+#     [MG-]           Mamba + GatedDeltaNet + dense MLP
+#     [ME]            Mamba + MoE
+#     [M*E]           Mamba + SelfAttention + MoE
+#     [M*-]|[M-][ME]  two PP stages, with combined layers in each
+#
+# Rules enforced by ``parse_bracketed_pattern``:
+#   * every bracket contains exactly one mixer (M / G / *) and exactly one
+#     MLP (- / E). Canonical order is mixer -> MLP (attention optional,
+#     between them). Order cannot be permuted.
+#   * D (MLA) is not supported in a combined layer for the initial refactor;
+#     users needing MLA must stay on the legacy non-bracketed pattern.
+#   * brackets must be balanced and contiguous: no text outside brackets
+#     other than the PP separator '|'.
+#   * '|' is allowed only between bracket groups. '|' inside a bracket is
+#     an error.
+# ---------------------------------------------------------------------------
+
+
+# attention_type values used by ``MambaAttnMLPLayer``. Kept as strings so the
+# pattern allocation module has no runtime dependency on the layer class.
+ATTENTION_TYPE_NONE = "none"
+ATTENTION_TYPE_SELF_ATTENTION = "self_attention"
+ATTENTION_TYPE_GATED_DELTA_NET = "gated_delta_net"
+ATTENTION_TYPE_DS_ATTENTION = "ds_attention"
+
+# mlp-kind values carried on CombinedLayerGroup.
+MLP_KIND_DENSE = "dense"
+MLP_KIND_MOE = "moe"
+
+# Symbol roles *inside a bracket group*. These differ from the legacy flat
+# grammar: in a combined layer ``M`` is always the mandatory mixer and
+# ``*``/``G``/``D`` are the optional attention-slot choices, whereas in the
+# flat pattern ``G`` is a standalone "mixer" layer. These sets are local to
+# the bracket parser.
+_BRACKET_ATTENTION_SYMBOLS = {Symbols.ATTENTION, Symbols.GDN, Symbols.DS_ATTENTION}
+_BRACKET_MLP_SYMBOLS = {Symbols.MLP, Symbols.MOE}
+
+# Mapping from attention/mlp single-symbol to the string tag stored on the
+# parsed group.
+_ATTENTION_TAG = {
+    Symbols.ATTENTION: ATTENTION_TYPE_SELF_ATTENTION,
+    Symbols.GDN: ATTENTION_TYPE_GATED_DELTA_NET,
+    Symbols.DS_ATTENTION: ATTENTION_TYPE_DS_ATTENTION,
+}
+_MLP_TAG = {
+    Symbols.MLP: MLP_KIND_DENSE,
+    Symbols.MOE: MLP_KIND_MOE,
+}
+
+
+@dataclass
+class CombinedLayerGroup:
+    """One combined Mamba + optional Attention + MLP layer parsed from brackets.
+
+    Attributes:
+        attention_type: Which attention sits in the attention slot -- one of
+            ``"none"``, ``"self_attention"``, ``"gated_delta_net"``, or
+            ``"ds_attention"``. ``HybridStack`` uses this to select the right
+            combined-layer subclass spec.
+        mlp_kind: ``"dense"`` or ``"moe"``.
+        submodule_standalone_indices: 1-indexed layer number each submodule
+            (``"mamba"``, ``"attention"``, ``"mlp"``) *would* have had in the
+            legacy flat hybrid pattern, for checkpoint interoperability with
+            the separate-layer path. ``"attention"`` key is absent when
+            ``attention_type == "none"``.
+        raw_symbols: Characters inside the bracket in source order (e.g.
+            ``["M", "*", "-"]``). Kept for diagnostics.
+    """
+
+    attention_type: str = ATTENTION_TYPE_NONE
+    mlp_kind: str = MLP_KIND_DENSE
+    submodule_standalone_indices: Dict[str, int] = field(default_factory=dict)
+    raw_symbols: List[str] = field(default_factory=list)
+
+
+def is_bracketed_pattern(pattern: Optional[str]) -> bool:
+    """Return True if ``pattern`` uses the bracketed combined-layer grammar.
+
+    Detection is by presence of ``'['``. The flat legacy grammar never uses
+    brackets, so this is unambiguous.
+    """
+    return pattern is not None and Symbols.LBRACKET in pattern
+
+
+def _parse_one_bracket(body: str, start_index: int) -> CombinedLayerGroup:
+    """Validate one bracket's contents and build a CombinedLayerGroup.
+
+    ``body`` is the characters *inside* the brackets (no ``[`` / ``]``).
+    ``start_index`` is the 1-indexed standalone layer number for the first
+    submodule in this group. Subsequent submodules within the group get
+    consecutive indices.
+    """
+    if not body:
+        raise ValueError("Empty bracket group '[]' is not allowed.")
+
+    if Symbols.PIPE in body:
+        raise ValueError(
+            f"Pipe '|' is not allowed inside a bracket group; got '[{body}]'."
+        )
+    if Symbols.MTP_SEPARATOR in body:
+        raise ValueError(
+            f"MTP separator '/' is not allowed inside a bracket group; got '[{body}]'."
+        )
+    if Symbols.LBRACKET in body or Symbols.RBRACKET in body:
+        raise ValueError(f"Nested brackets are not allowed; got '[{body}]'.")
+
+    # Validate every char is a recognized layer symbol.
+    for ch in body:
+        if ch not in Symbols.VALID_LAYERS:
+            raise ValueError(
+                f"In bracket group '[{body}]', '{ch}' is not a valid layer "
+                f"symbol. Valid symbols inside a bracket are "
+                f"{sorted(Symbols.VALID_LAYERS)}."
+            )
+
+    # In a combined layer, ``M`` is the mandatory mixer, ``*``/``G``/``D`` are
+    # the optional attention-slot choices, and ``-``/``E`` is the mandatory
+    # MLP. Any other number/role combination is invalid.
+    mamba_count = body.count(Symbols.MAMBA)
+    attn_syms = [ch for ch in body if ch in _BRACKET_ATTENTION_SYMBOLS]
+    mlp_syms = [ch for ch in body if ch in _BRACKET_MLP_SYMBOLS]
+
+    if mamba_count != 1:
+        raise ValueError(
+            f"Bracket group '[{body}]' must contain exactly one Mamba symbol "
+            f"'{Symbols.MAMBA}'; got {mamba_count}."
+        )
+    if len(attn_syms) > 1:
+        raise ValueError(
+            f"Bracket group '[{body}]' has {len(attn_syms)} attention symbols; "
+            f"at most one attention symbol is allowed (one of "
+            f"{sorted(_BRACKET_ATTENTION_SYMBOLS)})."
+        )
+    if len(mlp_syms) != 1:
+        raise ValueError(
+            f"Bracket group '[{body}]' must contain exactly one MLP symbol "
+            f"(one of {sorted(_BRACKET_MLP_SYMBOLS)}); got {len(mlp_syms)}."
+        )
+
+    # Canonical order: M first, then optional attn, then MLP last.
+    if body[0] != Symbols.MAMBA:
+        raise ValueError(
+            f"Canonical bracket order is Mamba first (optional attention, "
+            f"MLP last); got '[{body}]'."
+        )
+    if body[-1] not in _BRACKET_MLP_SYMBOLS:
+        raise ValueError(
+            f"Canonical bracket order puts the MLP symbol last; got '[{body}]'."
+        )
+    # Middle (between the first M and the last MLP char) must be either empty
+    # or a single attention symbol.
+    middle = body[1:-1]
+    attention_symbol = None
+    if middle:
+        if len(middle) != 1 or middle not in _BRACKET_ATTENTION_SYMBOLS:
+            raise ValueError(
+                f"Bracket group '[{body}]' must have the form "
+                f"M[<attention>]<mlp>; only one attention symbol "
+                f"({sorted(_BRACKET_ATTENTION_SYMBOLS)}) is allowed between "
+                f"the Mamba mixer and the MLP."
+            )
+        attention_symbol = middle
+
+    # Build the group.
+    group = CombinedLayerGroup(raw_symbols=list(body))
+    group.mlp_kind = _MLP_TAG[mlp_syms[0]]
+
+    # Assign standalone indices in source order: each symbol gets one index.
+    next_idx = start_index
+    group.submodule_standalone_indices["mamba"] = next_idx
+    next_idx += 1
+    if attention_symbol is not None:
+        group.attention_type = _ATTENTION_TAG[attention_symbol]
+        group.submodule_standalone_indices["attention"] = next_idx
+        next_idx += 1
+    else:
+        group.attention_type = ATTENTION_TYPE_NONE
+    group.submodule_standalone_indices["mlp"] = next_idx
+    # (next_idx is discarded; the caller tracks the running total itself)
+    return group
+
+
+def parse_bracketed_pattern(pattern: str) -> List[CombinedLayerGroup]:
+    """Parse a bracketed main pattern (no PP separators) into combined layers.
+
+    Args:
+        pattern: Main pattern consisting only of bracket groups, e.g.
+            ``"[M-][M*-][ME]"``. PP and MTP separators must have been stripped
+            by the caller.
+
+    Returns:
+        Ordered list of :class:`CombinedLayerGroup`. For the example above
+        the first group's ``submodule_standalone_indices`` is
+        ``{"mamba": 1, "mlp": 2}``; the second is
+        ``{"mamba": 3, "attention": 4, "mlp": 5}``; and so on.
+
+    Raises:
+        ValueError: On any malformed pattern (unbalanced brackets, bad
+            contents, stray characters outside brackets).
+    """
+    if pattern is None or pattern == "":
+        return []
+
+    groups: List[CombinedLayerGroup] = []
+    running_standalone_index = 1  # 1-indexed to match legacy layer_number
+
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch != Symbols.LBRACKET:
+            raise ValueError(
+                f"Bracketed patterns must consist only of bracket groups; "
+                f"found unexpected '{ch}' at position {i} in '{pattern}'. "
+                f"(Use '[' to open a combined-layer group.)"
+            )
+        # Find the matching ']'.
+        end = pattern.find(Symbols.RBRACKET, i + 1)
+        if end == -1:
+            raise ValueError(
+                f"Unclosed bracket starting at position {i} in '{pattern}'."
+            )
+        body = pattern[i + 1 : end]
+        group = _parse_one_bracket(body, start_index=running_standalone_index)
+        # Advance the running standalone index by the number of submodules in
+        # the group (mamba + optional attention + mlp).
+        running_standalone_index += len(group.submodule_standalone_indices)
+        groups.append(group)
+        i = end + 1
+
+    return groups
 
 
 @dataclass
@@ -284,7 +527,17 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
     Raises:
         ValueError: If pattern contains invalid symbols
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
+    # Bracketed combined-layer patterns have their own (stricter) validator;
+    # this function's role for those patterns is just to accept the bracket
+    # characters so ``parse_hybrid_pattern`` passes them through unchanged.
+    # ``parse_bracketed_pattern`` (called downstream) then enforces the full
+    # bracket grammar.
+    if allow_pipe and Symbols.LBRACKET in pattern:
+        valid_chars = (
+            Symbols.VALID_LAYERS | {Symbols.PIPE, Symbols.LBRACKET, Symbols.RBRACKET}
+        )
+    else:
+        valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
     for char in pattern:
         if char not in valid_chars:
             raise ValueError(

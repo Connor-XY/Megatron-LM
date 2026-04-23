@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -175,7 +176,10 @@ class HybridModel(LanguageModule):
 
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as _HybridSymbols
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            is_bracketed_pattern,
+            parse_bracketed_pattern,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
@@ -184,13 +188,103 @@ class HybridModel(LanguageModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
-        layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-        )
+        # Bracketed grammar triggers the combined-layer path used for 1F1B
+        # compute/communication overlap on hybrid models. Detect it up front
+        # so downstream code can branch on the pattern shape rather than the
+        # config flag alone.
+        self.uses_combined_layers = is_bracketed_pattern(parsed.main_pattern)
+
+        # If the user supplied the legacy ``hybrid_stack_spec`` (combined-
+        # layer fields default to IdentityOp) but wrote a bracketed pattern,
+        # auto-substitute the spec that populates those fields. This avoids a
+        # surprising error at layer-build time and keeps the import surface
+        # small for users who have default specs.
+        if self.uses_combined_layers:
+            from megatron.core.transformer.identity_op import IdentityOp as _IdentityOp
+
+            provided = hybrid_stack_spec.submodules
+            needs_sub = (
+                provided.combined_layer is _IdentityOp
+                and provided.combined_attn_layer is _IdentityOp
+                and provided.combined_gdn_layer is _IdentityOp
+            )
+            if needs_sub:
+                from megatron.core.models.hybrid.hybrid_layer_specs import (
+                    hybrid_stack_spec_with_combined_layers,
+                )
+
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "HybridModel: bracketed hybrid_layer_pattern detected but the "
+                    "provided hybrid_stack_spec has no combined-layer fields "
+                    "populated. Auto-substituting hybrid_stack_spec_with_combined_layers.",
+                )
+                hybrid_stack_spec = hybrid_stack_spec_with_combined_layers
+                self.hybrid_stack_spec = hybrid_stack_spec
+
+        layer_type_list: Optional[list] = None
+        combined_layer_groups: Optional[list] = None
+        if self.uses_combined_layers:
+            # Bracketed pattern: split by '|' at bracket boundaries to pick the
+            # current PP/VPP segment, then parse the selected segment into
+            # ``CombinedLayerGroup`` records. ``|`` is guaranteed by the parser
+            # to appear only between brackets, so a plain string split is
+            # unambiguous.
+            main_pattern = parsed.main_pattern or ""
+            segments = (
+                main_pattern.split(_HybridSymbols.PIPE)
+                if _HybridSymbols.PIPE in main_pattern
+                else [main_pattern]
+            )
+
+            pp_size = torch.distributed.get_world_size(self.pg_collection.pp) if self.pg_collection.pp is not None else 1
+            pp_rank = torch.distributed.get_rank(self.pg_collection.pp) if self.pg_collection.pp is not None else 0
+
+            if len(segments) > 1 and len(segments) % pp_size != 0:
+                raise ValueError(
+                    f"Number of pipe-delimited bracket segments ({len(segments)}) must "
+                    f"be evenly divisible by pipeline_model_parallel_size ({pp_size})."
+                )
+            if len(segments) == 1 and pp_size > 1:
+                raise ValueError(
+                    "Multi-stage pipeline parallelism with a bracketed "
+                    "hybrid_layer_pattern requires explicit '|' stage separators. "
+                    "Add '|' between bracket groups to define pipeline stage "
+                    "boundaries, or disable overlap_moe_expert_parallel_comm to "
+                    "use the legacy auto-split path."
+                )
+
+            vp_rel = vp_stage if vp_stage is not None else 0
+            segment_index = vp_rel * pp_size + pp_rank
+            if segment_index >= len(segments):
+                raise ValueError(
+                    f"Pipeline segment index {segment_index} (pp_rank={pp_rank}, "
+                    f"vp_stage={vp_rel}) is out of range for {len(segments)} "
+                    f"bracket segments in pattern {main_pattern!r}."
+                )
+
+            # layer_offset: count the standalone-equivalent layers in all
+            # preceding segments, i.e. the number of mixer/attn/mlp submodules
+            # that appear before this segment in the flat standalone pattern.
+            # Each bracket group contributes 2 or 3 standalone layers, so we
+            # reparse the preceding segments and sum.
+            layer_offset = 0
+            for prev_segment in segments[:segment_index]:
+                prev_groups = parse_bracketed_pattern(prev_segment)
+                for g in prev_groups:
+                    layer_offset += len(g.submodule_standalone_indices)
+
+            # Parse the selected segment.
+            combined_layer_groups = parse_bracketed_pattern(segments[segment_index])
+        else:
+            layer_type_list, layer_offset = select_pipeline_segment(
+                parsed.main_pattern or '',
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -234,6 +328,7 @@ class HybridModel(LanguageModule):
             self.config,
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
+            combined_layer_groups=combined_layer_groups,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
@@ -320,40 +415,24 @@ class HybridModel(LanguageModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
-    def forward(
+    def _preprocess(
         self,
         input_ids: Tensor,
         position_ids: Tensor,
-        attention_mask: Tensor,
         decoder_input: Tensor = None,
-        labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
-        runtime_gather_output: Optional[bool] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        loss_mask: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_seq_params: PackedSeqParams = None,
         padding_mask: Optional[Tensor] = None,
-        is_spec_decode: Optional[bool] = None,
-    ) -> Tensor:
-        """Forward function of the Hybrid model. This function passes the input tensors
-        through the embedding layer, and then the decoder and finally into the post
-        processing layer (optional).
+    ):
+        """Compute the decoder-input tensor and any positional encodings.
 
-        It either returns the Loss values if labels are given or the final hidden units
+        Returns a 6-tuple with the same shape as :meth:`GPTModel._preprocess`
+        so the GPT-authored :class:`PreProcessNode` in the shared schedule plan
+        infrastructure can drive a HybridModel without code-path branches.
+        Hybrid does not yet use fused-RoPE flash decode, so
+        ``rotary_pos_cos`` / ``rotary_pos_sin`` are always ``None``.
         """
-        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
-        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
         in_inference_mode = inference_context is not None and not self.training
-
-        if in_inference_mode:
-            assert runtime_gather_output, "Inference must always gather TP logits"
 
         # Decoder embedding.
         if decoder_input is not None:
@@ -361,8 +440,8 @@ class HybridModel(LanguageModule):
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
-            # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
+            # Clear outputs for padding tokens when using dynamic batching with
+            # quantization scales, to avoid corrupting amax calculations.
             if (
                 in_inference_mode
                 and inference_context.is_dynamic_batching()
@@ -370,8 +449,8 @@ class HybridModel(LanguageModule):
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
         else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
+            # intermediate stage of pipeline; decoder will get hidden_states
+            # from encoder.input_tensor.
             decoder_input = None
 
         rotary_pos_emb = None
@@ -385,38 +464,61 @@ class HybridModel(LanguageModule):
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
-        # reference held by this caller function, enabling early garbage collection
-        # for inference.
+        # reference held by this caller function, enabling early garbage
+        # collection for inference.
         if in_inference_mode:
             decoder_input = WrappedTensor(decoder_input)
 
-        # The following assert will currently fail when running inference.
-        # Commented out for now.
-        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
-        #   attention mask is not needed and is ignored by the model in
-        #   inference mode, (2) reduce the size of the externally-generated
-        #   attention mask to prevent CPU OOM (as we did for training), (3)
-        #   force the attention mask passed to the model in inference mode to
-        #   be None, so this assert will succeed.
-        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
+        # Flash-decode fused-RoPE is not wired up for hybrid yet; these slots
+        # stay None to preserve the 6-tuple shape the shared PreProcessNode
+        # expects.
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        sequence_len_offset = None
 
-        # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
+        return (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            padding_mask,
         )
 
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
+    def _postprocess(
+        self,
+        hidden_states,
+        input_ids,
+        position_ids,
+        labels,
+        rotary_pos_emb,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        mtp_in_postprocess=None,
+        loss_mask=None,
+        decoder_input=None,
+        attention_mask=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        runtime_gather_output=None,
+        extra_block_kwargs=None,
+        inference_context=None,
+        is_spec_decode=None,
+    ):
+        """Run MTP + output layer + loss on decoder hidden states.
 
-        # Check if speculative decoding is active. When it is, MTP must be
-        # computed *after* verification so that it is conditioned on verified
-        # tokens rather than stale speculative tokens from the previous step.
+        Signature matches :meth:`GPTModel._postprocess` so the GPT-authored
+        :class:`PostProcessNode` in the shared schedule plan can drive a
+        HybridModel. Args unused by hybrid (``rotary_pos_cos``,
+        ``rotary_pos_sin``) are accepted and ignored.
+        """
+        del rotary_pos_cos  # hybrid uses standard RoPE; unused
+        del rotary_pos_sin
+
+        in_inference_mode = inference_context is not None and not self.training
+
+        # Speculative decoding detection (mirror of GPT).
         if is_spec_decode is None:
             is_spec_decode = (
                 in_inference_mode
@@ -424,8 +526,16 @@ class HybridModel(LanguageModule):
                 and inference_context.num_speculative_tokens > 0
             )
 
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
-        if mtp_forward_ran:
+        if mtp_in_postprocess is None:
+            # When ``mtp_in_postprocess`` isn't supplied (e.g. legacy callers),
+            # fall back to the same condition as the original forward.
+            mtp_in_postprocess = mtp_forward_ran
+        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -435,6 +545,7 @@ class HybridModel(LanguageModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
+                **(extra_block_kwargs or {}),
             )
 
         if not self.post_process:
@@ -459,23 +570,19 @@ class HybridModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
+
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
                 if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
                     hidden_states = gather_from_sequence_parallel_region(
                         hidden_states, group=self.pg_collection.tp
                     )
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S', B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
@@ -484,7 +591,6 @@ class HybridModel(LanguageModule):
         )
         logits = self._scale_logits(logits)
 
-        # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
             assert (
                 in_inference_mode
@@ -497,6 +603,131 @@ class HybridModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        return self.compute_language_model_loss(labels, logits)
 
-        return loss
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
+        is_spec_decode: Optional[bool] = None,
+        extra_block_kwargs: Optional[dict] = None,
+    ) -> Tensor:
+        """Forward pass: embedding -> decoder -> output layer + loss.
+
+        The body is split into :meth:`_preprocess` / decoder / :meth:`_postprocess`
+        so the 1F1B combined schedule plan can drive the same steps on separate
+        CUDA streams when ``overlap_moe_expert_parallel_comm`` is on.
+        """
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        in_inference_mode = inference_context is not None and not self.training
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
+
+        (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            padding_mask,
+        ) = self._preprocess(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            decoder_input=decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        # Run decoder.
+        hidden_states = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        return self._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=self.mtp_process,
+            loss_mask=loss_mask,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            runtime_gather_output=runtime_gather_output,
+            extra_block_kwargs=extra_block_kwargs,
+            inference_context=inference_context,
+            is_spec_decode=is_spec_decode,
+        )
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: Optional[dict] = None,
+        runtime_gather_output: Optional[bool] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        """Build a :class:`TransformerModelChunkSchedulePlan` for 1F1B overlap.
+
+        Mirrors :meth:`GPTModel.build_schedule_plan`. The schedule plan is only
+        meaningful during training; ``overlap_moe_expert_parallel_comm`` must
+        be enabled and ``self.training`` must be True for the schedule plan to
+        be driven by the combined-1f1b scheduler.
+        """
+        assert self.training or not self.config.overlap_moe_expert_parallel_comm, (
+            "HybridModel.build_schedule_plan is a training-only path; "
+            "overlap_moe_expert_parallel_comm must be off during inference."
+        )
+
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
+
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            TransformerModelChunkSchedulePlan,
+        )
+
+        return TransformerModelChunkSchedulePlan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            extra_block_kwargs,
+            runtime_gather_output,
+            loss_mask,
+            padding_mask,
+        )
