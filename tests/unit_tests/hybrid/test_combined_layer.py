@@ -13,12 +13,14 @@ import torch
 
 from megatron.core.models.hybrid.combined_layer import (
     ATTENTION_TYPE_ATTENTION,
+    ATTENTION_TYPE_GATED_DELTA_NET,
     ATTENTION_TYPE_NONE,
-    MAMBA_TYPE_GDN,
     MAMBA_TYPE_MAMBA,
+    MAMBA_TYPE_NONE,
     MLP_TYPE_MLP,
     AttnMoELayer,
     CombinedHybridLayer,
+    GDNMLPLayer,
     MambaGDNMLPLayer,
     MambaMLPLayer,
     MambaMoELayer,
@@ -108,7 +110,33 @@ class TestCombinedHybridLayer:
         assert layer.self_attention is not None
         assert layer.attention_type == ATTENTION_TYPE_ATTENTION
 
-    def test_gdn_mlp_forward_shape(self):
+    def test_pure_gdn_mlp_forward_shape(self):
+        """Pure GDN + MLP (no Mamba) -- GDN in the attention slot."""
+        try:
+            from megatron.core.ssm.gated_delta_net import HAVE_FLA
+        except ImportError:
+            pytest.skip("gated_delta_net module not importable")
+        if not HAVE_FLA:
+            pytest.skip("flash-linear-attention not installed")
+        if not hasattr(self.config, "linear_key_head_dim"):
+            pytest.skip("TransformerConfig lacks GDN fields in this build")
+
+        layer = GDNMLPLayer(
+            self.config,
+            combined_hybrid_layer_submodules,
+            pg_collection=self.pg_collection,
+        ).cuda()
+        hidden_states, attention_mask = self._inputs(self.config.hidden_size)
+        output = layer(hidden_states, attention_mask=attention_mask)
+        assert output.shape == hidden_states.shape
+        # Mamba mixer is absent; GDN sits in the attention slot.
+        assert layer.mamba_type == MAMBA_TYPE_NONE
+        assert layer.mixer is None
+        assert layer.attention_type == ATTENTION_TYPE_GATED_DELTA_NET
+        assert layer.self_attention is not None
+
+    def test_mamba_gdn_stacked_forward_shape(self):
+        """Mamba + GDN stacked in one combined layer (both mixers present)."""
         try:
             from megatron.core.ssm.gated_delta_net import HAVE_FLA
         except ImportError:
@@ -126,10 +154,11 @@ class TestCombinedHybridLayer:
         hidden_states, attention_mask = self._inputs(self.config.hidden_size)
         output = layer(hidden_states, attention_mask=attention_mask)
         assert output.shape == hidden_states.shape
-        assert layer.mamba_type == MAMBA_TYPE_GDN
+        # Both mixers are present.
+        assert layer.mamba_type == MAMBA_TYPE_MAMBA
         assert layer.mixer is not None
-        # GDN replaces Mamba in the mixer slot, not the attention slot.
-        assert layer.self_attention is None
+        assert layer.attention_type == ATTENTION_TYPE_GATED_DELTA_NET
+        assert layer.self_attention is not None
 
     def test_attn_moe_forward_shape(self):
         """Pure Attention + MoE layer (GPT-style) inside the combined-layer API."""

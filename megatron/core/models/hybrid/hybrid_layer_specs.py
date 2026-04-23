@@ -322,25 +322,19 @@ mamba_inference_stack_spec = hybrid_inference_stack_spec
 from megatron.core.models.hybrid.combined_layer import CombinedHybridLayerSubmodules
 
 combined_hybrid_layer_submodules = CombinedHybridLayerSubmodules(
-    # Mamba family. ``attn_norm`` / ``mamba_norm`` intentionally default to
-    # :class:`IdentityOp` (not TENorm) because the default mixer specs use
-    # :class:`TELayerNormColumnParallelLinear`, which fuses the norm into the
-    # first linear -- wrapping an explicit TENorm around that would double-
-    # normalize the input.
+    # Mamba (SSM) mixer. ``mamba_norm`` intentionally defaults to IdentityOp
+    # because the default mixer spec uses :class:`TELayerNormColumnParallelLinear`,
+    # which fuses the norm into the first linear -- wrapping an explicit
+    # TENorm around that would double-normalize the input. Same rationale
+    # below for ``attn_norm`` and ``pre_mlp_layernorm``.
     mamba_mixer=hybrid_stack_spec.submodules.mamba_layer.submodules.mixer,
-    gdn_mixer=ModuleSpec(
-        module=GatedDeltaNet,
-        submodules=GatedDeltaNetSubmodules(
-            in_proj=TELayerNormColumnParallelLinear,
-            out_norm=TENorm,
-            out_proj=TERowParallelLinear,
-        ),
-    ),
     mamba_bda=get_bias_dropout_add,
-    # Attention. Same rationale as mamba_norm: attn_norm stays IdentityOp
-    # because linear_qkv (TELayerNormColumnParallelLinear) owns the norm.
+    # Attention slot (SelfAttention / MLA / GatedDeltaNet). GDN sits beside
+    # SelfAttention and MLA as an attention-slot choice; legacy
+    # ``hybrid_stack_spec`` already places GDN in ``self_attention``.
     self_attention=hybrid_stack_spec.submodules.attention_layer.submodules.self_attention,
-    # mla_attention stays IdentityOp by default; populate it if MLA is needed.
+    # mla_attention stays IdentityOp by default; populate it for MLA.
+    gdn_attention=hybrid_stack_spec.submodules.gdn_layer.submodules.self_attention,
     attn_bda=get_bias_dropout_add,
     # MLP / MoE. pre_mlp_layernorm defaults to IdentityOp for the same
     # reason: the MLP spec uses TELayerNormColumnParallelLinear for linear_fc1.
