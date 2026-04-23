@@ -2,22 +2,24 @@
 
 """Checkpoint interoperability tests for the combined-layer path.
 
-These tests verify that the sharded state dict keys produced by the
-combined-layer path align with the keys produced by the legacy separate-layer
-path, so a checkpoint saved under one can be loaded by the other.
+The combined layer supports two sharded-state-dict layouts:
 
-The full save/load round-trip (writing to disk via MCore's dist_checkpointing)
-needs a distributed process group; the tests here validate the key layout via
-direct ``sharded_state_dict`` invocation.
+1. **Nested** (default): keys live under the combined-layer slot, e.g.
+   ``decoder.layers.0.mixer.*``, ``decoder.layers.0.self_attention.*``, ...
+2. **Legacy-compat** (``legacy_sharded_state_dict=True`` on the layer, plumbed
+   through by :class:`HybridStack`): each submodule's keys are emitted under
+   the standalone layer index it *would* have had in the separate-layer
+   hybrid stack, so checkpoints round-trip between the two paths.
+
+This test file covers the legacy-compat layout against the reference produced
+by the legacy separate-layer path built from the same spec.
 """
 
 import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    hybrid_stack_spec,
-    hybrid_stack_spec_with_combined_layers,
-)
+from megatron.core.models.hybrid.combined_layer import CombinedHybridLayer
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -48,16 +50,15 @@ class TestCombinedCheckpointRoundtrip:
         Utils.destroy_model_parallel()
 
     def _sharded_keys(self, model):
-        """Return the set of sharded-state-dict keys (prefixes of the decoder)."""
         sd = model.sharded_state_dict()
         return {k for k in sd.keys() if k.startswith("decoder.layers.")}
 
-    def test_combined_layer_emits_legacy_compat_keys(self):
-        """Combined-layer ``[M*-]`` emits keys under 3 standalone indices."""
+    def test_nested_layout_uses_combined_slot_indices(self):
+        """Default layout keeps all submodules under the combined-layer slot."""
         config = _tiny_config(num_layers=3)
         model = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec_with_combined_layers,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=1024,
             max_sequence_length=64,
             hybrid_layer_pattern="[M*-]",
@@ -65,34 +66,66 @@ class TestCombinedCheckpointRoundtrip:
             post_process=True,
             pg_collection=self.pg_collection,
         )
+        # [M*-] is a single combined layer at slot 0. Every submodule key
+        # should live under ``decoder.layers.0.``.
+        keys = self._sharded_keys(model)
+        slot_indices = {k.split(".")[2] for k in keys}
+        assert slot_indices == {"0"}
+
+    def test_legacy_layout_emits_standalone_indices(self):
+        """Enabling ``legacy_sharded_state_dict`` spreads keys across 3 slots."""
+        config = _tiny_config(num_layers=3)
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=1024,
+            max_sequence_length=64,
+            hybrid_layer_pattern="[M*-]",
+            pre_process=True,
+            post_process=True,
+            pg_collection=self.pg_collection,
+        )
+        # Flip the combined layer into legacy-compat mode (after construction
+        # because :class:`HybridModel` does not expose the flag as a top-level
+        # argument; downstream training frameworks that need interop set it on
+        # the layer directly).
+        combined_layer = model.decoder.layers[0]
+        assert isinstance(combined_layer, CombinedHybridLayer)
+        # Give each submodule role an explicit standalone index (M=0, *=1, -=2).
+        combined_layer.submodule_layer_numbers = {"mamba": 1, "attention": 2, "mlp": 3}
+        combined_layer.legacy_sharded_state_dict = True
 
         keys = self._sharded_keys(model)
-        # The hybrid_stack_spec fuses norms into ``linear_qkv`` /
-        # ``linear_fc1`` (TELayerNormColumnParallelLinear) and ``in_proj``,
-        # so the standalone ``norm`` / ``input_layernorm`` /
-        # ``pre_mlp_layernorm`` attributes are IdentityOp with no parameters.
-        # The checkpoint key layout therefore tests the weighted submodules:
-        #   Mamba -> decoder.layers.0.mixer.*
-        #   Attn  -> decoder.layers.1.self_attention.*
-        #   MLP   -> decoder.layers.2.mlp.*
-        prefixes_seen = set()
-        for k in keys:
-            parts = k.split(".")
-            # e.g. ['decoder', 'layers', '1', 'self_attention', 'linear_qkv', 'weight']
-            if len(parts) >= 4:
-                prefixes_seen.add((parts[2], parts[3]))
+        slot_indices = {k.split(".")[2] for k in keys}
+        # Submodules now live under slots 0 (mamba), 1 (attention), 2 (mlp).
+        assert {"0", "1", "2"}.issubset(slot_indices)
 
-        expected_subset = {
-            ("0", "mixer"),
-            ("1", "self_attention"),
-            ("2", "mlp"),
-        }
-        missing = expected_subset - prefixes_seen
-        assert not missing, f"missing expected sharded keys for subset {missing}"
+        # The mixer's key should live under the mamba slot (idx 0).
+        mixer_keys = [k for k in keys if ".mixer." in k]
+        assert mixer_keys, "mixer keys missing"
+        for k in mixer_keys:
+            assert k.startswith("decoder.layers.0."), k
 
-    def test_combined_key_layout_matches_legacy(self):
-        """Combined-layer and legacy keys agree for every submodule."""
-        # Use the exact same pattern spelled two ways.
+        # self_attention keys under idx 1.
+        attn_keys = [k for k in keys if ".self_attention." in k]
+        assert attn_keys, "self_attention keys missing"
+        for k in attn_keys:
+            assert k.startswith("decoder.layers.1."), k
+
+        # mlp keys under idx 2.
+        mlp_keys = [k for k in keys if ".mlp." in k and ".mlp_bda" not in k]
+        assert mlp_keys, "mlp keys missing"
+        for k in mlp_keys:
+            assert k.startswith("decoder.layers.2."), k
+
+    def test_legacy_layout_matches_separate_layer_keys(self):
+        """Legacy layout keys are a superset of the separate-layer reference.
+
+        Builds a 3-layer ``"M*-"`` separate-layer model and the equivalent
+        ``"[M*-]"`` combined model; after enabling legacy layout on the
+        combined model, every weighted key in the reference must also appear
+        in the combined model's sharded_state_dict.
+        """
         config = _tiny_config(num_layers=3)
         legacy_model = HybridModel(
             config=config,
@@ -106,7 +139,7 @@ class TestCombinedCheckpointRoundtrip:
         )
         combined_model = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec_with_combined_layers,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=1024,
             max_sequence_length=64,
             hybrid_layer_pattern="[M*-]",
@@ -114,16 +147,14 @@ class TestCombinedCheckpointRoundtrip:
             post_process=True,
             pg_collection=self.pg_collection,
         )
+        cl = combined_model.decoder.layers[0]
+        cl.submodule_layer_numbers = {"mamba": 1, "attention": 2, "mlp": 3}
+        cl.legacy_sharded_state_dict = True
 
         legacy_keys = self._sharded_keys(legacy_model)
         combined_keys = self._sharded_keys(combined_model)
-
-        # Legacy keys are a full ground truth. Combined should be a superset of
-        # the legacy keys (it may emit a few extra due to TE's internal
-        # bookkeeping but the core weight keys must match).
-        missing_in_combined = legacy_keys - combined_keys
-        assert not missing_in_combined, (
-            f"Combined-layer state dict is missing {len(missing_in_combined)} "
-            f"keys present in the legacy state dict. Sample: "
-            f"{list(missing_in_combined)[:5]}"
+        missing = legacy_keys - combined_keys
+        assert not missing, (
+            f"Combined-layer legacy state dict is missing {len(missing)} keys "
+            f"present in the reference. Sample: {sorted(missing)[:5]}"
         )

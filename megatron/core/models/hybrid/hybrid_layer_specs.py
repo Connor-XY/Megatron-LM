@@ -15,12 +15,6 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-from megatron.core.ssm.mamba_attn_mlp_layer import (
-    MambaAttnMLPLayerSubmodules,
-    MambaGDNMLPLayer,
-    MambaMLPLayer,
-    MambaSelfAttnMLPLayer,
-)
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -315,101 +309,42 @@ mamba_inference_stack_spec = hybrid_inference_stack_spec
 
 
 # ---------------------------------------------------------------------------
-# Combined-layer specs for the 1F1B compute/communication overlap path.
+# Combined-hybrid-layer submodules (used by bracket-notation patterns).
 #
-# ``hybrid_stack_spec_with_combined_layers`` mirrors ``hybrid_stack_spec``
-# above, plus populates the ``combined_*_layer`` fields with
-# :class:`MambaAttnMLPLayer` variants whose inner building blocks reuse the
-# same specs that the legacy separate-layer path uses. This guarantees the
-# combined layer is numerically equivalent to a Mamba + (optional attn) + MLP
-# sequence built from the same specs.
+# A single :class:`CombinedHybridLayerSubmodules` instance declares every
+# possible building block; each :class:`CombinedHybridLayer` picks a subset
+# based on its (``mamba_type``, ``attention_type``, ``mlp_type``) selectors.
+# Inner-block specs are pulled from ``hybrid_stack_spec`` where available so
+# the combined path is numerically equivalent to the legacy separate-layer
+# path when both are built from the same base spec.
 # ---------------------------------------------------------------------------
 
-# Submodule specs shared across all three combined-layer variants.
-# Extract the inner specs from the existing hybrid_stack_spec so any future
-# tweaks (e.g. swapping TENorm) propagate to both paths.
-_combined_mamba_norm = hybrid_stack_spec.submodules.mamba_layer.submodules.norm
-_combined_mamba_mixer = hybrid_stack_spec.submodules.mamba_layer.submodules.mixer
-_combined_mamba_bda = hybrid_stack_spec.submodules.mamba_layer.submodules.mamba_bda
+from megatron.core.models.hybrid.combined_layer import CombinedHybridLayerSubmodules
 
-_combined_pre_mlp_layernorm = (
-    hybrid_stack_spec.submodules.mlp_layer.submodules.pre_mlp_layernorm
-)
-_combined_mlp = hybrid_stack_spec.submodules.mlp_layer.submodules.mlp
-_combined_mlp_bda = hybrid_stack_spec.submodules.mlp_layer.submodules.mlp_bda
-
-_combined_attn_norm_self = (
-    hybrid_stack_spec.submodules.attention_layer.submodules.input_layernorm
-)
-_combined_attn_self = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention
-_combined_attn_bda_self = hybrid_stack_spec.submodules.attention_layer.submodules.self_attn_bda
-
-_combined_attn_norm_gdn = hybrid_stack_spec.submodules.gdn_layer.submodules.input_layernorm
-_combined_attn_gdn = hybrid_stack_spec.submodules.gdn_layer.submodules.self_attention
-_combined_attn_bda_gdn = hybrid_stack_spec.submodules.gdn_layer.submodules.self_attn_bda
-
-
-def _mamba_mlp_submods():
-    """Submodules for Mamba + MLP (no attention) combined layer."""
-    return MambaAttnMLPLayerSubmodules(
-        mamba_norm=_combined_mamba_norm,
-        mamba_mixer=_combined_mamba_mixer,
-        mamba_bda=_combined_mamba_bda,
-        pre_mlp_layernorm=_combined_pre_mlp_layernorm,
-        mlp=_combined_mlp,
-        mlp_bda=_combined_mlp_bda,
-    )
-
-
-def _mamba_self_attn_mlp_submods():
-    """Submodules for Mamba + SelfAttention + MLP combined layer."""
-    return MambaAttnMLPLayerSubmodules(
-        mamba_norm=_combined_mamba_norm,
-        mamba_mixer=_combined_mamba_mixer,
-        mamba_bda=_combined_mamba_bda,
-        attn_norm=_combined_attn_norm_self,
-        attention=_combined_attn_self,
-        attn_bda=_combined_attn_bda_self,
-        pre_mlp_layernorm=_combined_pre_mlp_layernorm,
-        mlp=_combined_mlp,
-        mlp_bda=_combined_mlp_bda,
-    )
-
-
-def _mamba_gdn_mlp_submods():
-    """Submodules for Mamba + GatedDeltaNet + MLP combined layer."""
-    return MambaAttnMLPLayerSubmodules(
-        mamba_norm=_combined_mamba_norm,
-        mamba_mixer=_combined_mamba_mixer,
-        mamba_bda=_combined_mamba_bda,
-        attn_norm=_combined_attn_norm_gdn,
-        attention=_combined_attn_gdn,
-        attn_bda=_combined_attn_bda_gdn,
-        pre_mlp_layernorm=_combined_pre_mlp_layernorm,
-        mlp=_combined_mlp,
-        mlp_bda=_combined_mlp_bda,
-    )
-
-
-hybrid_stack_spec_with_combined_layers = ModuleSpec(
-    module=HybridStack,
-    submodules=HybridStackSubmodules(
-        # Legacy separate-layer specs retained for back-compat and for the
-        # non-bracketed path; populated identically to ``hybrid_stack_spec``.
-        mamba_layer=hybrid_stack_spec.submodules.mamba_layer,
-        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
-        attention_layer=hybrid_stack_spec.submodules.attention_layer,
-        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
-        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
-        moe_layer=hybrid_stack_spec.submodules.moe_layer,
-        mtp_block_spec=hybrid_stack_spec.submodules.mtp_block_spec,
-        # Combined-layer specs used by the bracketed pattern path.
-        combined_layer=ModuleSpec(module=MambaMLPLayer, submodules=_mamba_mlp_submods()),
-        combined_attn_layer=ModuleSpec(
-            module=MambaSelfAttnMLPLayer, submodules=_mamba_self_attn_mlp_submods()
-        ),
-        combined_gdn_layer=ModuleSpec(
-            module=MambaGDNMLPLayer, submodules=_mamba_gdn_mlp_submods()
+combined_hybrid_layer_submodules = CombinedHybridLayerSubmodules(
+    # Mamba family. ``attn_norm`` / ``mamba_norm`` intentionally default to
+    # :class:`IdentityOp` (not TENorm) because the default mixer specs use
+    # :class:`TELayerNormColumnParallelLinear`, which fuses the norm into the
+    # first linear -- wrapping an explicit TENorm around that would double-
+    # normalize the input.
+    mamba_mixer=hybrid_stack_spec.submodules.mamba_layer.submodules.mixer,
+    gdn_mixer=ModuleSpec(
+        module=GatedDeltaNet,
+        submodules=GatedDeltaNetSubmodules(
+            in_proj=TELayerNormColumnParallelLinear,
+            out_norm=TENorm,
+            out_proj=TERowParallelLinear,
         ),
     ),
+    mamba_bda=get_bias_dropout_add,
+    # Attention. Same rationale as mamba_norm: attn_norm stays IdentityOp
+    # because linear_qkv (TELayerNormColumnParallelLinear) owns the norm.
+    self_attention=hybrid_stack_spec.submodules.attention_layer.submodules.self_attention,
+    # mla_attention stays IdentityOp by default; populate it if MLA is needed.
+    attn_bda=get_bias_dropout_add,
+    # MLP / MoE. pre_mlp_layernorm defaults to IdentityOp for the same
+    # reason: the MLP spec uses TELayerNormColumnParallelLinear for linear_fc1.
+    mlp=hybrid_stack_spec.submodules.mlp_layer.submodules.mlp,
+    moe=moe,
+    mlp_bda=get_bias_dropout_add,
 )

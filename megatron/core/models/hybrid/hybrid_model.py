@@ -176,10 +176,11 @@ class HybridModel(LanguageModule):
 
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as _HybridSymbols
+        from megatron.core.models.hybrid.combined_layer_pattern import (
+            is_bracket_pattern,
+            parse_bracket_pattern,
+        )
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            is_bracketed_pattern,
-            parse_bracketed_pattern,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
@@ -189,94 +190,51 @@ class HybridModel(LanguageModule):
         self.mtp_num_depths = parsed.mtp_num_depths
 
         # Bracketed grammar triggers the combined-layer path used for 1F1B
-        # compute/communication overlap on hybrid models. Detect it up front
-        # so downstream code can branch on the pattern shape rather than the
-        # config flag alone.
-        self.uses_combined_layers = is_bracketed_pattern(parsed.main_pattern)
-
-        # If the user supplied the legacy ``hybrid_stack_spec`` (combined-
-        # layer fields default to IdentityOp) but wrote a bracketed pattern,
-        # auto-substitute the spec that populates those fields. This avoids a
-        # surprising error at layer-build time and keeps the import surface
-        # small for users who have default specs.
-        if self.uses_combined_layers:
-            from megatron.core.transformer.identity_op import IdentityOp as _IdentityOp
-
-            provided = hybrid_stack_spec.submodules
-            needs_sub = (
-                provided.combined_layer is _IdentityOp
-                and provided.combined_attn_layer is _IdentityOp
-                and provided.combined_gdn_layer is _IdentityOp
-            )
-            if needs_sub:
-                from megatron.core.models.hybrid.hybrid_layer_specs import (
-                    hybrid_stack_spec_with_combined_layers,
-                )
-
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    "HybridModel: bracketed hybrid_layer_pattern detected but the "
-                    "provided hybrid_stack_spec has no combined-layer fields "
-                    "populated. Auto-substituting hybrid_stack_spec_with_combined_layers.",
-                )
-                hybrid_stack_spec = hybrid_stack_spec_with_combined_layers
-                self.hybrid_stack_spec = hybrid_stack_spec
+        # compute/communication overlap on hybrid models.
+        self.uses_combined_layers = is_bracket_pattern(parsed.main_pattern)
 
         layer_type_list: Optional[list] = None
-        combined_layer_groups: Optional[list] = None
+        combined_layer_specs: Optional[list] = None
         if self.uses_combined_layers:
-            # Bracketed pattern: split by '|' at bracket boundaries to pick the
-            # current PP/VPP segment, then parse the selected segment into
-            # ``CombinedLayerGroup`` records. ``|`` is guaranteed by the parser
-            # to appear only between brackets, so a plain string split is
-            # unambiguous.
-            main_pattern = parsed.main_pattern or ""
-            segments = (
-                main_pattern.split(_HybridSymbols.PIPE)
-                if _HybridSymbols.PIPE in main_pattern
-                else [main_pattern]
+            # Bracket grammar: one ``CombinedLayerSpec`` per [...] group, one
+            # inner list per PP segment. ``|`` separators in the main pattern
+            # define pipeline-stage boundaries.
+            all_segments = parse_bracket_pattern(parsed.main_pattern or "")
+
+            pp_rank = (
+                torch.distributed.get_rank(self.pg_collection.pp)
+                if self.pg_collection.pp is not None
+                else 0
             )
-
-            pp_size = torch.distributed.get_world_size(self.pg_collection.pp) if self.pg_collection.pp is not None else 1
-            pp_rank = torch.distributed.get_rank(self.pg_collection.pp) if self.pg_collection.pp is not None else 0
-
-            if len(segments) > 1 and len(segments) % pp_size != 0:
+            pp_size = (
+                torch.distributed.get_world_size(self.pg_collection.pp)
+                if self.pg_collection.pp is not None
+                else 1
+            )
+            if len(all_segments) > 1 and len(all_segments) % pp_size != 0:
                 raise ValueError(
-                    f"Number of pipe-delimited bracket segments ({len(segments)}) must "
-                    f"be evenly divisible by pipeline_model_parallel_size ({pp_size})."
+                    f"Number of pipe-delimited bracket segments ({len(all_segments)}) "
+                    f"must be evenly divisible by pipeline_model_parallel_size ({pp_size})."
                 )
-            if len(segments) == 1 and pp_size > 1:
+            if len(all_segments) == 1 and pp_size > 1:
                 raise ValueError(
                     "Multi-stage pipeline parallelism with a bracketed "
-                    "hybrid_layer_pattern requires explicit '|' stage separators. "
-                    "Add '|' between bracket groups to define pipeline stage "
-                    "boundaries, or disable overlap_moe_expert_parallel_comm to "
-                    "use the legacy auto-split path."
+                    "hybrid_layer_pattern requires explicit '|' stage separators."
                 )
 
             vp_rel = vp_stage if vp_stage is not None else 0
             segment_index = vp_rel * pp_size + pp_rank
-            if segment_index >= len(segments):
+            if segment_index >= len(all_segments):
                 raise ValueError(
                     f"Pipeline segment index {segment_index} (pp_rank={pp_rank}, "
-                    f"vp_stage={vp_rel}) is out of range for {len(segments)} "
-                    f"bracket segments in pattern {main_pattern!r}."
+                    f"vp_stage={vp_rel}) is out of range for {len(all_segments)} "
+                    f"bracket segments in pattern {parsed.main_pattern!r}."
                 )
 
-            # layer_offset: count the standalone-equivalent layers in all
-            # preceding segments, i.e. the number of mixer/attn/mlp submodules
-            # that appear before this segment in the flat standalone pattern.
-            # Each bracket group contributes 2 or 3 standalone layers, so we
-            # reparse the preceding segments and sum.
-            layer_offset = 0
-            for prev_segment in segments[:segment_index]:
-                prev_groups = parse_bracketed_pattern(prev_segment)
-                for g in prev_groups:
-                    layer_offset += len(g.submodule_standalone_indices)
-
-            # Parse the selected segment.
-            combined_layer_groups = parse_bracketed_pattern(segments[segment_index])
+            combined_layer_specs = all_segments[segment_index]
+            # Layer offset (for FP8 per-layer contexts etc.) = total combined
+            # layers in all preceding PP segments.
+            layer_offset = sum(len(s) for s in all_segments[:segment_index])
         else:
             layer_type_list, layer_offset = select_pipeline_segment(
                 parsed.main_pattern or '',
@@ -323,17 +281,27 @@ class HybridModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
-        self.decoder = build_module(
-            hybrid_stack_spec,
-            self.config,
+        decoder_kwargs = dict(
             pre_process=self.pre_process,
-            layer_type_list=layer_type_list,
-            combined_layer_groups=combined_layer_groups,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
         )
+        if self.uses_combined_layers:
+            # Pull the shared combined-layer submodules spec. Users who supply
+            # a custom ``hybrid_stack_spec`` can still get the default
+            # combined-layer submodules without explicit wiring.
+            from megatron.core.models.hybrid.hybrid_layer_specs import (
+                combined_hybrid_layer_submodules,
+            )
+
+            decoder_kwargs["combined_layer_specs"] = combined_layer_specs
+            decoder_kwargs["combined_layer_submodules"] = combined_hybrid_layer_submodules
+        else:
+            decoder_kwargs["layer_type_list"] = layer_type_list
+
+        self.decoder = build_module(hybrid_stack_spec, self.config, **decoder_kwargs)
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:

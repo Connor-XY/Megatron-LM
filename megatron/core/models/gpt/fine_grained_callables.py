@@ -374,17 +374,12 @@ class _BackwardDWWrapper:
         assert isinstance(
             layer, GraphableMegatronModule
         ), "cuda graphed ep overlap only supports GraphableMegatronModule."
+        assert isinstance(
+            layer, TransformerLayer
+        ), "cuda graphed ep overlap only supports TransformerLayer for now."
         self.layer = layer
         self.graphed_backward_dw_callable = None
-        # TransformerLayer exposes the attention module as `self_attention`;
-        # MambaAttnMLPLayer (the hybrid combined layer) exposes it as `attention`.
-        # Support both so the wrapper doesn't need to know the architecture.
-        attn_module = getattr(layer, "self_attention", None) or getattr(layer, "attention", None)
-        assert attn_module is not None and hasattr(attn_module, "backward_dw"), (
-            "_BackwardDWWrapper requires a .self_attention or .attention "
-            "submodule with a .backward_dw method."
-        )
-        self.attn_dw_callable = attn_module.backward_dw
+        self.attn_dw_callable = layer.self_attention.backward_dw
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
                 layer.mlp.backward_dw, routed_experts=False, shared_experts=True
@@ -742,7 +737,7 @@ def build_layer_callables(layer):
     """
     Builds the callable functions(forward and dw) for the given layer.
     Supports GPT's TransformerLayer / MultiTokenPredictionLayer and the hybrid
-    combined-layer MambaAttnMLPLayer.
+    combined-layer :class:`CombinedHybridLayer`.
 
     Args:
         layer: The layer to build callables for.
@@ -752,15 +747,15 @@ def build_layer_callables(layer):
         backward_dw: dict of weight gradient functions for the layer.
     """
     # Local import to avoid a circular dependency: the hybrid callables module
-    # imports from this file for the MoE helpers' shape.
-    from megatron.core.ssm.mamba_attn_mlp_layer import MambaAttnMLPLayer
+    # imports ``ScheduleNode`` from here.
+    from megatron.core.models.hybrid.combined_layer import CombinedHybridLayer
 
-    if isinstance(layer, MambaAttnMLPLayer):
-        from megatron.core.models.hybrid.fine_grained_callables import (
-            build_mamba_attn_mlp_layer_callables,
+    if isinstance(layer, CombinedHybridLayer):
+        from megatron.core.models.hybrid.combined_layer_callables import (
+            build_combined_hybrid_layer_callables,
         )
 
-        return build_mamba_attn_mlp_layer_callables(layer)
+        return build_combined_hybrid_layer_callables(layer)
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
     elif isinstance(layer, MultiTokenPredictionLayer):

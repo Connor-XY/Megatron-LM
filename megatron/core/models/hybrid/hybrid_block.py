@@ -19,17 +19,10 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    ATTENTION_TYPE_DS_ATTENTION,
-    ATTENTION_TYPE_GATED_DELTA_NET,
-    ATTENTION_TYPE_NONE,
-    ATTENTION_TYPE_SELF_ATTENTION,
-    CombinedLayerGroup,
-)
+from megatron.core.models.hybrid.combined_layer import CombinedHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_attn_mlp_layer import MambaAttnMLPLayer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
@@ -53,13 +46,6 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
-    # Combined-layer specs used when ``overlap_moe_expert_parallel_comm`` is
-    # on and the pattern uses bracketed grammar. Each combined layer bundles
-    # a Mamba mixer, an optional attention (SelfAttention or GatedDeltaNet),
-    # and an MLP/MoE block into a single :class:`MambaAttnMLPLayer`.
-    combined_layer: Union[ModuleSpec, type] = IdentityOp
-    combined_attn_layer: Union[ModuleSpec, type] = IdentityOp
-    combined_gdn_layer: Union[ModuleSpec, type] = IdentityOp
 
 
 class HybridStack(GraphableMegatronModule, MegatronModule):
@@ -100,7 +86,8 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
-        combined_layer_groups: Optional[list] = None,
+        combined_layer_specs: Optional[list] = None,
+        combined_layer_submodules: Optional[object] = None,
     ) -> None:
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -117,20 +104,33 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        # Either the legacy flat ``layer_type_list`` path or the combined-layer
-        # bracketed path must be chosen; exactly one is required.
-        assert (layer_type_list is not None) != (combined_layer_groups is not None), (
-            "Provide exactly one of layer_type_list (legacy separate-layer path) "
-            "or combined_layer_groups (bracketed combined-layer path)."
-        )
+        # Exactly one of (layer_type_list, combined_layer_specs) must be set.
+        # - layer_type_list: legacy path, one module per single-char symbol.
+        # - combined_layer_specs: new path, one CombinedHybridLayer per bracket
+        #   group (requires ``combined_layer_submodules`` as well).
+        use_combined = combined_layer_specs is not None
+        if use_combined:
+            assert layer_type_list is None, (
+                "Cannot pass both layer_type_list and combined_layer_specs; pick one."
+            )
+            assert combined_layer_submodules is not None, (
+                "combined_layer_submodules must be provided when using bracket patterns."
+            )
+        else:
+            assert layer_type_list is not None, (
+                "layer_type_list must be provided. It should be pre-computed from "
+                "--hybrid-layer-pattern by HybridModel."
+            )
         self.layer_type_list = layer_type_list
-        self.combined_layer_groups = combined_layer_groups
-        self.uses_combined_layers = combined_layer_groups is not None
+        self.combined_layer_specs = combined_layer_specs
+        self.uses_combined_layers = use_combined
 
         # Build layers.
         self.layers = nn.ModuleList()
-        if self.uses_combined_layers:
-            self._build_combined_layers(submodules, combined_layer_groups, pp_layer_offset)
+        if use_combined:
+            self._build_combined_layers(
+                combined_layer_submodules, combined_layer_specs, pp_layer_offset
+            )
         else:
             self._build_legacy_layers(
                 submodules, layer_type_list, pp_layer_offset, is_mtp_layer, pg_collection
@@ -224,56 +224,19 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
 
     def _build_combined_layers(
         self,
-        submodules: HybridStackSubmodules,
-        combined_layer_groups: list,
+        combined_layer_submodules: object,
+        combined_layer_specs: list,
         pp_layer_offset: int,
     ):
-        """Build one :class:`MambaAttnMLPLayer` per bracketed combined-layer group.
+        """Build one :class:`CombinedHybridLayer` per bracketed combined-layer spec.
 
-        Each group gets a ``layer_number`` equal to its 1-indexed position in
-        the stack (plus ``pp_layer_offset``). Per-submodule standalone indices
-        are plumbed into the layer via ``submodule_layer_numbers`` so
-        FP8 per-layer contexts and checkpoint interop with the legacy
-        separate-layer path continue to work.
+        Each spec's ``.kwargs`` (``mamba_type``/``attention_type``/``mlp_type``)
+        is unpacked into the layer constructor; the single
+        ``combined_layer_submodules`` dataclass supplies every possible
+        building block and the layer's constructor ignores unused ones.
         """
-        for i, group in enumerate(combined_layer_groups):
-            # Per-combined-layer position (1-indexed, pp-offset-aware).
+        for i, spec in enumerate(combined_layer_specs):
             layer_number = i + 1 + pp_layer_offset
-
-            # Pick the right combined-layer spec by attention type.
-            if group.attention_type == ATTENTION_TYPE_NONE:
-                spec = submodules.combined_layer
-            elif group.attention_type == ATTENTION_TYPE_SELF_ATTENTION:
-                spec = submodules.combined_attn_layer
-            elif group.attention_type == ATTENTION_TYPE_GATED_DELTA_NET:
-                spec = submodules.combined_gdn_layer
-            elif group.attention_type == ATTENTION_TYPE_DS_ATTENTION:
-                raise ValueError(
-                    "DSA (MLA) is not supported as the attention choice of a "
-                    "combined MambaAttnMLPLayer in this release. Drop the 'D' "
-                    "from the bracketed hybrid_layer_pattern, or disable "
-                    "overlap_moe_expert_parallel_comm to use the legacy "
-                    "separate-layer path."
-                )
-            else:
-                raise ValueError(
-                    f"Unknown attention_type {group.attention_type!r} on combined-layer "
-                    f"group #{i} (symbols: {group.raw_symbols})."
-                )
-            if isinstance(spec, type) and spec is IdentityOp:
-                raise ValueError(
-                    f"Combined-layer spec for attention_type={group.attention_type!r} "
-                    f"is IdentityOp. Populate HybridStackSubmodules.combined_layer / "
-                    f"combined_attn_layer / combined_gdn_layer (see "
-                    f"hybrid_stack_spec_with_combined_layers)."
-                )
-
-            # Shift the per-submodule standalone indices by pp_layer_offset so
-            # each submodule's ``layer_number`` is unique across all PP stages.
-            submodule_layer_numbers = {
-                role: idx + pp_layer_offset
-                for role, idx in group.submodule_standalone_indices.items()
-            }
 
             if self.config.fp8:
                 quant_init_context = get_fp8_context(
@@ -287,13 +250,13 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 quant_init_context = nullcontext()
 
             with quant_init_context:
-                layer = build_module(
-                    spec,
+                layer = CombinedHybridLayer(
                     config=self.config,
+                    submodules=combined_layer_submodules,
                     layer_number=layer_number,
-                    pp_layer_offset=pp_layer_offset,
                     pg_collection=self.pg_collection,
-                    submodule_layer_numbers=submodule_layer_numbers,
+                    pp_layer_offset=pp_layer_offset,
+                    **spec.kwargs,
                 )
             self.layers.append(layer)
 
@@ -458,10 +421,10 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
                 with inner_quant_context:
-                    if isinstance(layer, MambaAttnMLPLayer):
-                        # Combined Mamba + optional Attention + MLP layer used
-                        # by the 1F1B overlap path. ``forward`` returns a plain
-                        # Tensor (not a tuple) so no unwrap is needed.
+                    if isinstance(layer, CombinedHybridLayer):
+                        # Combined Mamba + optional Attention + MLP/MoE layer
+                        # used by the 1F1B overlap path. ``forward`` returns a
+                        # plain Tensor (not a tuple) so no unwrap is needed.
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -533,14 +496,15 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
 
         for local_layer_idx, layer in enumerate(self.layers):
 
-            if isinstance(layer, MambaAttnMLPLayer):
-                # Combined layer: the layer's own sharded_state_dict emits keys
-                # keyed by the per-submodule *standalone* layer index so the
-                # checkpoint interoperates with the legacy separate-layer path.
-                # We pass a prefix that is equivalent to the combined slot's
-                # global position for the stem extraction inside the layer,
-                # then skip the outer prefix-replace (the keys are already in
-                # their final form).
+            if (
+                isinstance(layer, CombinedHybridLayer)
+                and layer.legacy_sharded_state_dict
+            ):
+                # Opt-in path for checkpoint interop with the legacy
+                # separate-layer hybrid format. The combined layer's own
+                # ``sharded_state_dict`` emits keys under the per-submodule
+                # standalone layer indices, so skip the outer prefix-replace
+                # that would otherwise collapse them onto the combined slot.
                 combined_prefix = f'{layer_prefix}{layer.layer_number - 1}.'
                 sharded_state_dict.update(
                     layer.sharded_state_dict(combined_prefix, [], metadata)
