@@ -1815,20 +1815,31 @@ class TECudaGraphHelper:
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
+                from megatron.core.models.hybrid.hybrid_block import HybridStack
+
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
+
+                def _collect(layer, is_mtp):
+                    nonlocal num_graphable_layers
+                    # Grouped HybridStack: recurse into the inner per-symbol layers so each
+                    # captureable inner TransformerLayer / MambaLayer is registered with
+                    # make_graphed_callables. The grouped HybridStack itself is not graphable.
+                    if isinstance(layer, HybridStack):
+                        for inner in layer.layers:
+                            _collect(inner, is_mtp)
+                        return
+                    if _layer_is_graphable(layer, self.config):
+                        num_graphable_layers += 1
+                        callables.append(layer)
+                        callables_is_mtp.append(is_mtp)
+
                 for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
+                    _collect(chunk_with_decoder.decoder.layers[layer_number], False)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    _collect(
+                        chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer, True
+                    )
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,

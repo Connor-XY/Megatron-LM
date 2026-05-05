@@ -11,12 +11,12 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LayerPatternItem,
-    Symbols as LayerSymbols,
-    is_layer_group,
-)
+from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
 from megatron.core.pipeline_parallel.utils import ScheduleNode
+from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 
 
@@ -37,11 +37,37 @@ def _as_hybrid_layers(layer, layer_type: Optional[LayerPatternItem]):
     return [(layer_type, layer)]
 
 
+def _layer_has_cuda_graph(layer):
+    """True if ``layer`` is registered with TE make_graphed_callables and has graphs ready."""
+    return (
+        isinstance(layer, GraphableMegatronModule)
+        and hasattr(layer, 'cuda_graphs')
+        and layer.cuda_graphs
+    )
+
+
 def _apply_attention_layer(
     layer: TransformerLayer,
     node: ScheduleNode,
     hidden_states: Tensor,
 ):
+    if _layer_has_cuda_graph(layer):
+        # Mirror GPT submodule_attn_forward: prime the dw wrapper, then replay.
+        # In EP-overlap mode TransformerLayer._te_cuda_graph_replay returns a 4-tuple
+        # ``(residual, hidden_states, probs, shared_expert_output)``. For an attention-only
+        # half-layer the last three are None; we only need the residual.
+        layer.set_te_cuda_graph_backward_dw_wrapper()
+        residual, _, _, _ = layer._te_cuda_graph_replay(
+            hidden_states=hidden_states,
+            attention_mask=node.chunk_state.attention_mask,
+            rotary_pos_emb=node.chunk_state.rotary_pos_emb,
+            rotary_pos_cos=node.chunk_state.rotary_pos_cos,
+            rotary_pos_sin=node.chunk_state.rotary_pos_sin,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+            sequence_len_offset=node.chunk_state.sequence_len_offset,
+        )
+        return residual
+
     hidden_states, _ = layer._forward_attention(
         hidden_states=hidden_states,
         attention_mask=node.chunk_state.attention_mask,
@@ -55,6 +81,13 @@ def _apply_attention_layer(
 
 
 def _apply_mamba_layer(layer, node: ScheduleNode, hidden_states: Tensor):
+    if _layer_has_cuda_graph(layer):
+        return layer._te_cuda_graph_replay(
+            hidden_states=hidden_states,
+            attention_mask=node.chunk_state.attention_mask,
+            inference_context=getattr(node.chunk_state, "inference_context", None),
+            packed_seq_params=node.chunk_state.packed_seq_params,
+        )
     return layer(
         hidden_states=hidden_states,
         attention_mask=node.chunk_state.attention_mask,
@@ -83,41 +116,78 @@ def _get_moe_padding_mask(node: ScheduleNode):
 
 
 class _SharedExpertBackwardDWWrapper:
-    """Backward weight-gradient wrapper for MoE-only hybrid terminal layers."""
+    """Backward weight-gradient wrapper for MoE-only hybrid terminal layers.
+
+    The terminal layer in a grouped HybridStack has ``self_attention=IdentityOp`` (the
+    real attention lives in a preceding pre-layer), so the GPT ``_BackwardDWWrapper``
+    cannot be reused as-is — it would dereference ``self_attention.backward_dw``. This
+    wrapper covers the shared-expert wgrad and the cuda-graph backward hook only.
+    """
 
     def __init__(self, layer):
         self.layer = layer
+        self.graphed_backward_dw_callable = None
         self.shared_expert_dw_callable = None
         if layer.mlp.use_shared_expert:
             self.shared_expert_dw_callable = partial(
                 layer.mlp.backward_dw, routed_experts=False, shared_experts=True
             )
+        self.cuda_graph_scope = layer.config.cuda_graph_scope
 
     def backward_dw(self):
-        if self.shared_expert_dw_callable is not None:
+        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
+        # When moe_router is captured by cudagraph, the shared-expert wgrad is part of
+        # the captured backward graph; running it again here would double-count.
+        if self.shared_expert_dw_callable is not None and (
+            not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
+        ):
             self.shared_expert_dw_callable()
+        if is_replay and self.graphed_backward_dw_callable is not None:
+            self.graphed_backward_dw_callable()
         self.layer = None
         self.shared_expert_dw_callable = None
+        self.graphed_backward_dw_callable = None
+
+    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
+        """Hook used by ``set_te_cuda_graph_backward_dw_wrapper`` on the terminal layer."""
+        self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
 
 def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
-    pre_mlp_layernorm_output = layer._forward_pre_mlp_layernorm(hidden_states)
-    if isinstance(pre_mlp_layernorm_output, tuple):
-        if len(pre_mlp_layernorm_output) != 2:
-            raise ValueError(
-                f"When the output of pre_mlp_layernorm is a tuple, it is expected to have "
-                f"2 elements (output, residual), but got {len(pre_mlp_layernorm_output)}"
-            )
-        pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+    if _layer_has_cuda_graph(layer):
+        # Mirror GPT submodule_attn_forward: capture covers attention only (Identity
+        # for grouped hybrid terminal). pre_mlp_layernorm + shared_experts + route +
+        # preprocess run eagerly inside _te_cuda_graph_replay's post-graph block.
+        layer.set_te_cuda_graph_backward_dw_wrapper()
+        residual, local_tokens, probs, shared_expert_output = layer._te_cuda_graph_replay(
+            hidden_states=hidden_states,
+            attention_mask=node.chunk_state.attention_mask,
+            rotary_pos_emb=node.chunk_state.rotary_pos_emb,
+            rotary_pos_cos=node.chunk_state.rotary_pos_cos,
+            rotary_pos_sin=node.chunk_state.rotary_pos_sin,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+            sequence_len_offset=node.chunk_state.sequence_len_offset,
+        )
     else:
-        residual = hidden_states
+        pre_mlp_layernorm_output = layer._forward_pre_mlp_layernorm(hidden_states)
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_mlp_layernorm is a tuple, it is expected to have "
+                    f"2 elements (output, residual), but got {len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            residual = hidden_states
 
-    if layer.config.fp32_residual_connection:
-        residual = residual.float()
+        if layer.config.fp32_residual_connection:
+            residual = residual.float()
 
-    shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-    probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, _get_moe_padding_mask(node))
-    local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+        shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+        probs, routing_map = layer.mlp.route(
+            pre_mlp_layernorm_output, _get_moe_padding_mask(node)
+        )
+        local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
     node.layer_state.residual = node.detach(residual)
     if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
@@ -157,6 +227,10 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
     output = layer.mlp.combine(output)
     output = layer.mlp.postprocess(output, shared_expert_output)
+    if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
+        # Mirror GPT submodule_combine_forward: cudagraph_tensor_store holds replay-time
+        # references to router outputs; clear them before BDA so they can be freed.
+        layer.mlp.cudagraph_tensor_store.clear()
     output = layer._forward_post_mlp((output, None), residual)
 
     node.layer_state.residual.record_stream(torch.cuda.current_stream())
@@ -269,7 +343,14 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             pre_bwd_dw.append(item_layer.backward_dw_wrapper)
     if is_moe:
         shared_expert_dw = _SharedExpertBackwardDWWrapper(terminal_layer)
-        if shared_expert_dw.shared_expert_dw_callable is not None:
+        # Make set_te_cuda_graph_backward_dw_wrapper() findable for the cuda-graph
+        # replay path in _run_moe_preprocess. The wrapper also covers the
+        # shared-expert wgrad when it's not part of the captured backward.
+        terminal_layer.backward_dw_wrapper = shared_expert_dw
+        if (
+            shared_expert_dw.shared_expert_dw_callable is not None
+            or _layer_has_cuda_graph(terminal_layer)
+        ):
             pre_bwd_dw.append(shared_expert_dw)
         backward_dw["mlp"] = terminal_layer.mlp
     elif terminal_type == LayerSymbols.MLP:
