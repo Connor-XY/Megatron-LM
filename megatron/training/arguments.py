@@ -83,6 +83,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_persistent_cache_args(parser)
 
     return parser
 
@@ -3401,4 +3402,36 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    return parser
+
+
+def _add_persistent_cache_args(parser):
+    """Persistent cache for first-iteration acceleration across job restarts.
+
+    The bash bootstrap (tools/persistent_cache/bootstrap.sh) seeds /tmp from
+    cache_read/<scope>.tar.zst before this Python process starts. These flags
+    only control the in-process validation, save-hook writeback throttle, and
+    atexit final flush. See tools/persistent_cache/README.md.
+    """
+    group = parser.add_argument_group(title='persistent cache')
+    group.add_argument(
+        '--persistent-cache-read-dir', type=str, default=None,
+        help='Lustre dir holding cache_read/<scope>.tar.zst tarballs for warm-start '
+             'seeding. Set up by tools/persistent_cache/bootstrap.sh before Python starts.')
+    group.add_argument(
+        '--persistent-cache-write-dir', type=str, default=None,
+        help='Lustre dir for writeback of newly compiled artifacts. Sidecar and '
+             'save-hook rsync NODE_CACHE_BASE/<scope>/ -> <this>/<scope>/.')
+    group.add_argument(
+        '--persistent-cache-scopes', nargs='+',
+        default=['triton', 'inductor', 'cuda_ptx', 'hybrid_ep',
+                 'cudnn_fe', 'nccl_topo', 'dataset_idx'],
+        help='Cache scopes to validate and write back.')
+    group.add_argument(
+        '--persistent-cache-writeback-every-n-saves', type=int, default=8,
+        help='Trigger a writeback every N successful checkpoint saves '
+             '(in addition to the bash sidecar and atexit). Set to 1 for every save.')
+    group.add_argument(
+        '--persistent-cache-skip-validation', action='store_true',
+        help='Skip post-bootstrap env-var validation. For tests.')
     return parser

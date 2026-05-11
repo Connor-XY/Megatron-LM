@@ -191,6 +191,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
+from megatron.training import persistent_cache
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
@@ -909,6 +910,10 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    # Persistent cache: validate env from bash bootstrap and register atexit
+    # for final writeback. No-op if --persistent-cache-*-dir flags are unset.
+    persistent_cache.init(args)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import (
