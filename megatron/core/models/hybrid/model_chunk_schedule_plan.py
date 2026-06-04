@@ -124,10 +124,13 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     def __init__(self, model, *args, **kwargs):
         """Initialize the hybrid chunk plan after validating cuda graph support."""
-        assert model.config.cuda_graph_impl == "none", (
-            "EP A2A overlap with grouped HybridStack patterns (e.g. '[*E]') does not "
-            "support cuda graphs yet. Set cuda_graph_impl='none' or use an ungrouped pattern."
-        )
+        # EXPERIMENT (per Pingtian): this assert blocks full-iteration CUDA graphs
+        # with grouped-HybridStack EP overlap. Disabled to test paged-stash +
+        # full-iteration CUDA graph, which should work in theory. Revert if unsupported.
+        # assert model.config.cuda_graph_impl == "none", (
+        #     "EP A2A overlap with grouped HybridStack patterns (e.g. '[*E]') does not "
+        #     "support cuda graphs yet. Set cuda_graph_impl='none' or use an ungrouped pattern."
+        # )
         super().__init__(model, *args, **kwargs)
 
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
