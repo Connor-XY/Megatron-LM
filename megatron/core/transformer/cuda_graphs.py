@@ -1757,6 +1757,25 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _graphable_leaves(module):
+    """Yield graphable leaf layers, descending into grouped HybridStack modules.
+
+    The hybrid EP-overlap pattern wraps inner Mamba/Transformer layers inside
+    HybridStack(MegatronModule), which is not a GraphableMegatronModule, so the
+    direct decoder.layers iteration finds 0 graphable layers. Descend into the
+    stack to reach the inner graphable layers.
+    """
+    try:
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+    except Exception:
+        HybridStack = ()
+    if isinstance(module, HybridStack):
+        for inner in module.layers:
+            yield from _graphable_leaves(inner)
+    else:
+        yield module
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1840,11 +1859,11 @@ class TECudaGraphHelper:
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
+                    for layer in _graphable_leaves(chunk_with_decoder.decoder.layers[layer_number]):
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
                     if _layer_is_graphable(layer, self.config):
@@ -1971,8 +1990,17 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            assert (
+                layer in chunk_of_the_layer.decoder.layers
+                or any(
+                    layer is mtp_layer.mtp_model_layer
+                    for mtp_layer in chunk_of_the_layer.mtp.layers
+                )
+                or any(
+                    layer is leaf
+                    for top in chunk_of_the_layer.decoder.layers
+                    for leaf in _graphable_leaves(top)
+                )
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):

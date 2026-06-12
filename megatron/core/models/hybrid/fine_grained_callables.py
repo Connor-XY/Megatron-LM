@@ -19,6 +19,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
 
@@ -273,35 +274,62 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                     LayerSymbols.DS_ATTENTION,
                     LayerSymbols.GDN,
                 ):
-                    # Use _forward_attention rather than __call__: an attention half-layer has
-                    # mlp=IdentityOp / mlp_bda=IdentityFuncOp by default, and TransformerLayer's
-                    # __call__ would route through _forward_mlp + mlp_bda, double-applying the
-                    # post-attention residual.
-                    hidden_states, _ = item_layer._forward_attention(
-                        hidden_states=hidden_states,
-                        attention_mask=node.chunk_state.attention_mask,
-                        rotary_pos_emb=node.chunk_state.rotary_pos_emb,
-                        rotary_pos_cos=node.chunk_state.rotary_pos_cos,
-                        rotary_pos_sin=node.chunk_state.rotary_pos_sin,
-                        packed_seq_params=node.chunk_state.packed_seq_params,
-                        sequence_len_offset=node.chunk_state.sequence_len_offset,
-                    )
-                    # _forward_attention returns the bias_dropout_add output which can be a
-                    # view tensor (the mlp_bda's add into the post-attention residual produces
-                    # a view from a fused/JIT kernel). Downstream cuBLAS matmuls — including
-                    # the terminal MLP/MoE's pre_mlp_layernorm and the next attention's QKV
-                    # projection in a multi-pre-layer group — pick algorithms based on input
-                    # strides; a view's non-canonical strides can lead to different algo
-                    # selection across processes and produce ~1e-5 bit drift on the forward
-                    # output. TransformerLayer's full forward() inserts this exact call at the
-                    # MLP exit (transformer_layer.py:895) for the same reason; the
-                    # _forward_attention shortcut here doesn't get that cleanup, so we add it
-                    # explicitly. Same idea as the make_viewless_tensor in _maybe_apply_final_norm.
-                    hidden_states = make_viewless_tensor(
-                        inp=hidden_states,
-                        requires_grad=hidden_states.requires_grad,
-                        keep_graph=True,
-                    )
+                    if (
+                        isinstance(item_layer, GraphableMegatronModule)
+                        and getattr(item_layer, "cuda_graphs", None)
+                    ):
+                        # TE CUDA-graph replay of this attention leaf. Mirrors GPTModel's
+                        # submodule_pre_dispatch_forward CG branch (gpt/fine_grained_callables.py):
+                        # the _graphable_leaves patch (cuda_graphs.py) captures the HybridStack's
+                        # inner attention/GDN leaves, so each carries .cuda_graphs and a captured
+                        # graph. set_te_cuda_graph_backward_dw_wrapper() arms the delay-wgrad
+                        # backward for that graph (companion to --delay-wgrad-compute under EP
+                        # overlap). For a non-MoE attention half-layer with cuda-graph-scope=attn +
+                        # overlap, _te_cuda_graph_replay returns (residual, None, None, None)
+                        # (transformer_layer.py: "if not self.is_moe_layer: return residual, ...");
+                        # take the residual. inference_context / packed_seq_params are omitted —
+                        # the replay asserts they are None (graph accepts only Tensor inputs); both
+                        # are None in training. The graph output buffer has canonical strides, so
+                        # the make_viewless_tensor cleanup the eager path needs is unnecessary here.
+                        item_layer.set_te_cuda_graph_backward_dw_wrapper()
+                        hidden_states, _, _, _ = item_layer._te_cuda_graph_replay(
+                            hidden_states=hidden_states,
+                            attention_mask=node.chunk_state.attention_mask,
+                            rotary_pos_emb=node.chunk_state.rotary_pos_emb,
+                            rotary_pos_cos=node.chunk_state.rotary_pos_cos,
+                            rotary_pos_sin=node.chunk_state.rotary_pos_sin,
+                            sequence_len_offset=node.chunk_state.sequence_len_offset,
+                        )
+                    else:
+                        # Use _forward_attention rather than __call__: an attention half-layer has
+                        # mlp=IdentityOp / mlp_bda=IdentityFuncOp by default, and TransformerLayer's
+                        # __call__ would route through _forward_mlp + mlp_bda, double-applying the
+                        # post-attention residual.
+                        hidden_states, _ = item_layer._forward_attention(
+                            hidden_states=hidden_states,
+                            attention_mask=node.chunk_state.attention_mask,
+                            rotary_pos_emb=node.chunk_state.rotary_pos_emb,
+                            rotary_pos_cos=node.chunk_state.rotary_pos_cos,
+                            rotary_pos_sin=node.chunk_state.rotary_pos_sin,
+                            packed_seq_params=node.chunk_state.packed_seq_params,
+                            sequence_len_offset=node.chunk_state.sequence_len_offset,
+                        )
+                        # _forward_attention returns the bias_dropout_add output which can be a
+                        # view tensor (the mlp_bda's add into the post-attention residual produces
+                        # a view from a fused/JIT kernel). Downstream cuBLAS matmuls — including
+                        # the terminal MLP/MoE's pre_mlp_layernorm and the next attention's QKV
+                        # projection in a multi-pre-layer group — pick algorithms based on input
+                        # strides; a view's non-canonical strides can lead to different algo
+                        # selection across processes and produce ~1e-5 bit drift on the forward
+                        # output. TransformerLayer's full forward() inserts this exact call at the
+                        # MLP exit (transformer_layer.py:895) for the same reason; the
+                        # _forward_attention shortcut here doesn't get that cleanup, so we add it
+                        # explicitly. Same idea as the make_viewless_tensor in _maybe_apply_final_norm.
+                        hidden_states = make_viewless_tensor(
+                            inp=hidden_states,
+                            requires_grad=hidden_states.requires_grad,
+                            keep_graph=True,
+                        )
                 else:
                     raise ValueError(
                         f"HybridStack overlap does not support layer type '{item_type}' before "
