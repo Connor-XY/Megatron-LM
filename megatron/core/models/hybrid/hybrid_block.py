@@ -80,15 +80,29 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     keeping all base keys stable.
 
     CUDA graphs: this wrapper subclasses ``GraphableMegatronModule`` so that, with
-    ``cuda_graph_impl="transformer_engine"``, the whole wrapper forward (mHC
-    aggregate + inner layer + n-stream BDA) is captured as one per-layer graph —
-    mirroring ``HyperConnectionTransformerLayer`` on the GPT path. Without this,
-    the TE graph discovery (``_layer_is_graphable``) only inspects the top-level
-    layer type and silently skips every wrapped layer, so an mHC-enabled
-    HybridStack would run entirely eager. The inner layer's own ``__call__`` graph
-    routing is bypassed during capture (see ``_call_inner_layer``) to avoid nested
-    capture; the inner layer's params are still covered by the wrapper graph's
-    manual hooks because ``_get_submodules_under_cudagraphs`` returns ``[self]``.
+    ``cuda_graph_impl="transformer_engine"``, wrapped layers are captured per-layer —
+    mirroring ``HyperConnectionTransformerLayer`` on the GPT path. Without this, the TE
+    graph discovery (``_layer_is_graphable``) only inspects the top-level layer type and
+    silently skips every wrapped layer, so an mHC-enabled HybridStack would run entirely
+    eager. Two capture modes:
+
+    * Non-MoE inner layers (attention variants, Mamba): the whole wrapper forward
+      (mHC aggregate + inner layer + n-stream BDA) is captured as one graph. The inner
+      layer's own ``__call__`` graph routing is bypassed during capture (see
+      ``_call_inner_layer``) to avoid nested capture.
+    * MoE inner layers, when ``moe_router`` is in ``cuda_graph_modules``: the expert
+      all-to-all is not graph-safe, so only the deterministic prefix is graphed (mHC
+      ``compute_mappings``/``aggregate`` + the inner layer's router/preprocess). The graph
+      outputs the router intermediates, the mHC state (``h_post``, ``h_res``) and the
+      n-stream residual; on replay the experts run eagerly and the n-stream BDA (eager)
+      consumes the inner's raw ``mlp_output_with_bias`` as the layer delta. Routing the
+      residual *through the graph* (not reusing the layer input directly in the eager BDA)
+      keeps the backward gradient flowing into the captured graph, which is required for
+      bit-identical training — again mirroring ``HyperConnectionTransformerLayer``.
+
+    ``_get_submodules_under_cudagraphs`` returns the submodules whose params the wrapper
+    graph's manual hooks must drive: ``[self]`` for whole-wrapper capture, or the mHC module
+    + the inner router/preprocess submodules for partial MoE capture (experts stay eager).
     """
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
@@ -119,15 +133,72 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         )
         return static_inputs
 
-    def _te_cuda_graph_capture(self, *args, **kwargs):
-        """Capture the whole wrapper forward as one graph.
+    def _inner_is_moe(self) -> bool:
+        """True when the inner layer is an MoE ``TransformerLayer``. Such layers use the
+        GPT-style raw-delta path (feed the inner's ``mlp_output_with_bias`` straight to the
+        n-stream BDA) in both the eager forward and the CUDA-graph replay."""
+        from megatron.core.transformer.moe.moe_layer import MoELayer
 
-        The wrapper forward returns ``(hidden_states, context)``; ``context`` is
-        ``None`` for the hybrid layer types that participate in graphing (no
-        cross-attention), so it is dropped from the captured outputs — a tuple
-        containing ``None`` cannot be a CUDA-graph output. Mirrors the
-        ``context is not None`` handling in ``TransformerLayer._te_cuda_graph_capture``.
+        return isinstance(self.inner_layer, TransformerLayer) and isinstance(
+            getattr(self.inner_layer, 'mlp', None), MoELayer
+        )
+
+    def _inner_is_partial_moe_capture(self) -> bool:
+        """True when the inner layer is MoE and the configured ``cuda_graph_modules`` request
+        partial MoE capture (``moe_router``).
+
+        In that case the wrapper does NOT capture the whole forward as one graph (the expert
+        all-to-all is not graph-safe). Instead it graphs the deterministic prefix (mHC aggregate
+        + the inner layer's router/preprocess) and runs the experts + mHC BDA eagerly — mirroring
+        how ``HyperConnectionTransformerLayer`` graphs MoE layers on the GPT path. Whole-wrapper
+        capture is still used for non-MoE inner layers (attention variants, Mamba).
         """
+        return (
+            self._inner_is_moe()
+            and bool(self.config.cuda_graph_modules)
+            and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+        )
+
+    def _moe_raw_delta(self, aggregated: Tensor):
+        """Eager raw MoE delta: run the inner layer's attention prefix (identity for MoE-only
+        "E" layers) + pre-MLP layernorm + experts, returning ``mlp_output_with_bias`` WITHOUT
+        the inner's residual-add. The mHC n-stream BDA owns the residual. Mirrors the graph
+        path's ``resume_moe_experts_after_partial_cudagraph`` so eager == replay bit-identically.
+        """
+        inner = self.inner_layer
+        hidden_a, _ = inner._forward_attention(aggregated, attention_mask=None)
+        pre = inner._forward_pre_mlp_layernorm(hidden_a)
+        if isinstance(pre, tuple):
+            pre = pre[0]
+        return inner.mlp(pre)
+
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        """Capture the graph-safe portion of the wrapper forward.
+
+        For non-MoE inner layers the whole wrapper forward (mHC aggregate + inner layer +
+        n-stream BDA) is captured as one graph. For MoE inner layers under ``moe_router``
+        partial capture, only the deterministic prefix is graphed: the mHC
+        ``compute_mappings``/``aggregate`` followed by the inner layer's router/preprocess.
+        The captured outputs are the inner router/preprocess intermediates plus the mHC
+        state (``h_post``, ``h_res``) and the aggregated single-stream input needed to
+        reconstruct the layer delta on replay. ``context`` is ``None`` for the graphed
+        hybrid layer types, so it is dropped (a tuple containing ``None`` cannot be a
+        CUDA-graph output).
+        """
+        if self._inner_is_partial_moe_capture():
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            aggregated, h_res, h_post = self.hyper_connection(hidden_states)
+            inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated))
+            # inner_out = router/preprocess intermediates ending in the inner residual;
+            # append the mHC state AND the n-stream residual. Routing `residual` through
+            # the graph as an output (rather than reusing args[0] directly in the eager BDA)
+            # mirrors HyperConnectionTransformerLayer: it keeps the residual's backward grad
+            # flowing into the graph's backward, instead of creating a second autograd path
+            # on the graph INPUT (args[0]) that the captured backward does not account for.
+            # The experts' raw mlp_output_with_bias (produced on replay) is the layer delta,
+            # so `aggregated` need not be captured.
+            return tuple(inner_out) + (h_post, h_res, hidden_states)
+
         hidden_states, context = self.forward(*args, **kwargs)
         cuda_graph_outputs = [hidden_states]
         if context is not None:
@@ -135,15 +206,57 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
-        """Replay the captured wrapper graph and restore the (hidden_states, context) contract.
+        """Replay the captured graph and restore the (hidden_states, context) contract.
 
-        The whole wrapper forward is captured as one graph whose only output is the
-        layer's n-stream hidden_states (``context`` is ``None`` for the graphed
-        hybrid layer types, so it was dropped at capture). The HybridStack forward
-        loop unpacks ``hidden_states, _ = layer(...)``, so re-append ``None`` here.
+        Non-MoE inner layers: the whole wrapper forward was captured, so the only graph
+        output is the layer's n-stream hidden_states; re-append ``None`` for context.
+
+        MoE inner layers (partial capture): replay the graphed prefix, then run the
+        experts eagerly and apply the mHC n-stream BDA — reproducing exactly the eager
+        wrapper tail (``layer_delta = layer_output - aggregated`` then
+        ``fused_h_res_h_post_bda``), just with the deterministic prefix graphed.
         """
+        if self._inner_is_partial_moe_capture():
+            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
+            residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
+            h_res = out.pop()
+            h_post = out.pop()
+            # Resume the inner MoE experts eagerly to the raw delta (mlp_output_with_bias),
+            # then let the n-stream BDA own the residual — identical to the eager forward
+            # (`_moe_raw_delta` → fused_h_res_h_post_bda), just with the prefix graphed.
+            mlp_output_with_bias = self.inner_layer.resume_moe_experts_after_partial_cudagraph(out)
+            hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
+                h_res,
+                residual,
+                h_post,
+                mlp_output_with_bias,
+                dropout_prob=0.0,
+                training=self.training,
+                fused=False,
+                manager=None,
+            )
+            if (
+                self.config.fp32_residual_connection
+                and self.config.params_dtype is not None
+                and hidden_states.dtype != self.config.params_dtype
+            ):
+                hidden_states = hidden_states.to(self.config.params_dtype)
+            return hidden_states, None
+
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
         return cuda_graph_output[0], None
+
+    def _get_submodules_under_cudagraphs(self):
+        """Submodules whose params are driven by the wrapper graph's manual hooks.
+
+        Whole-wrapper capture covers the entire wrapper (``[self]``, the base default).
+        For partial MoE capture only the graphed prefix is covered — the mHC module plus
+        the inner layer's router/preprocess submodules — so the experts (run eagerly)
+        keep their normal forward hooks.
+        """
+        if self._inner_is_partial_moe_capture():
+            return [self.hyper_connection] + self.inner_layer._get_submodules_under_cudagraphs()
+        return super()._get_submodules_under_cudagraphs()
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
@@ -223,37 +336,6 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         aggregated, h_res, h_post = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
-        layer_output, context = self._call_inner_layer(
-            aggregated,
-            attention_mask,
-            inference_context,
-            rotary_pos_emb,
-            sequence_len_offset,
-            packed_seq_params,
-            padding_mask,
-        )
-        # The inner hybrid layer already applied its own local residual/dropout, so
-        # it returns `aggregated + f(aggregated)`. We feed only the function
-        # delta `f(aggregated)` into the n-stream BDA so it does not double-count
-        # the residual that mHC owns. The temporary [s, b, C] tensor here is the
-        # simplest correct form; a future optimization could fuse the subtraction
-        # into `fused_h_res_h_post_bda` to avoid the allocation.
-        # Sanity check: this contract requires the inner layer to preserve shape;
-        # any mismatch indicates a future layer type is breaking the residual
-        # assumption and would silently corrupt the n-stream state.
-        if layer_output.shape != aggregated.shape:
-            raise RuntimeError(
-                "HyperConnectionHybridLayer requires inner layers to preserve "
-                f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
-                f"vs {tuple(aggregated.shape)} input; layer must add its own residual."
-            )
-        # `fp32_residual_connection=True` may cause some inner layers (e.g.,
-        # MambaLayer) to return `layer_output` in fp32 while `aggregated` is in
-        # compute dtype; explicitly upcast `aggregated` so the subtraction stays
-        # in fp32 instead of relying on PyTorch's implicit promotion.
-        if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
-            aggregated = aggregated.to(layer_output.dtype)
-        layer_delta = layer_output - aggregated
         # `dropout_prob=0.0` already disables dropout regardless of training mode;
         # `training=self.training` is more semantically accurate than hard-coding
         # False during a training-mode forward.
@@ -263,11 +345,46 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         )
         mhc_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
 
+        if self._inner_is_moe():
+            # GPT-style (mirrors HyperConnectionTransformerLayer): feed the inner MoE's raw
+            # `mlp_output_with_bias` straight into the n-stream BDA, which owns the residual
+            # combine. This avoids the lossy `layer_output - aggregated` bf16 subtraction and
+            # keeps eager bit-identical to the CUDA-graph replay path
+            # (resume_moe_experts_after_partial_cudagraph), which produces the same delta.
+            layer_output_with_bias = self._moe_raw_delta(aggregated)
+            context = None
+        else:
+            layer_output, context = self._call_inner_layer(
+                aggregated,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+            )
+            # The inner hybrid layer already applied its own local residual/dropout, so it
+            # returns `aggregated + f(aggregated)`. Feed only the function delta `f(aggregated)`
+            # into the n-stream BDA so it does not double-count the residual that mHC owns.
+            # Sanity check: this contract requires the inner layer to preserve shape.
+            if layer_output.shape != aggregated.shape:
+                raise RuntimeError(
+                    "HyperConnectionHybridLayer requires inner layers to preserve "
+                    f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
+                    f"vs {tuple(aggregated.shape)} input; layer must add its own residual."
+                )
+            # `fp32_residual_connection=True` may cause some inner layers (e.g., MambaLayer)
+            # to return `layer_output` in fp32 while `aggregated` is in compute dtype; upcast
+            # `aggregated` so the subtraction stays in fp32.
+            if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
+                aggregated = aggregated.to(layer_output.dtype)
+            layer_output_with_bias = (layer_output - aggregated, None)
+
         hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
             h_res,
             residual,
             h_post,
-            (layer_delta, None),
+            layer_output_with_bias,
             dropout_prob=0.0,
             training=self.training,
             fused=False,
