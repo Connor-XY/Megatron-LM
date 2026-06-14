@@ -144,6 +144,47 @@ def _ensure_dsa_namespace():
             "`pip install nvidia-cudnn-frontend[cutedsl]`."
         ) from e
     _DSA = _ns
+    _patch_dense_indexer_backward_capture_safe()
+
+
+def _patch_dense_indexer_backward_capture_safe():
+    """Make cuDNN ``DenseIndexerBackward.execute`` CUDA-graph-capturable.
+
+    The stock execute computes ``grad_loss_value = float(_as_grad_loss_tensor(grad_loss,
+    dev).item())`` — an ``.item()`` D2H sync that raises ``cudaErrorStreamCaptureUnsupported``
+    during CUDA-graph stream capture. The fused-indexer forward always passes a *constant*
+    ``grad_loss`` (1.0; the real loss scaling is applied later in backward), so the scalar can
+    be read directly without a device round-trip. This rewrites that single line to use a
+    Python scalar ``grad_loss`` as-is, falling back to the original tensor path otherwise.
+    Idempotent and version-guarded (no-op if the cuDNN source line changed)."""
+    try:
+        import inspect
+        import textwrap
+
+        import cudnn.deepseek_sparse_attention.indexer_backward.api as _api
+    except Exception:
+        return
+    cls = getattr(_api, "DenseIndexerBackward", None)
+    if cls is None or getattr(cls.execute, "_capture_safe_patched", False):
+        return
+    old = "grad_loss_value = float(_as_grad_loss_tensor(grad_loss, index_q.device).item())"
+    new = (
+        "grad_loss_value = (float(grad_loss) if isinstance(grad_loss, (int, float)) "
+        "else float(_as_grad_loss_tensor(grad_loss, index_q.device).item()))"
+    )
+    try:
+        src = textwrap.dedent(inspect.getsource(cls.execute))
+    except Exception:
+        return
+    if old not in src:
+        return  # cuDNN version changed; keep stock behavior
+    ns = dict(_api.__dict__)
+    exec(src.replace(old, new), ns)  # noqa: S102 - intentional source patch of vendored cuDNN
+    patched = ns.get("execute")
+    if patched is None:
+        return
+    patched._capture_safe_patched = True
+    cls.execute = patched
 
 
 # ---------------------------------------------------------------------------
@@ -848,7 +889,12 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     index_lse,
                     sm_scale=indexer_softmax_scale,
                     loss_coeff=indexer_loss_coeff,
-                    grad_loss=unit_grad_loss,
+                    # Pass the unit grad_loss as a Python scalar (not a device tensor) so
+                    # cuDNN's DenseIndexerBackward.execute reads it without an .item() D2H
+                    # sync — the sync is illegal under CUDA-graph capture. The real grad_loss
+                    # scaling is applied later in backward. See
+                    # _patch_dense_indexer_backward_capture_safe().
+                    grad_loss=1.0,
                     ratio=ratio,
                     block_I=128,
                 )
