@@ -1992,9 +1992,12 @@ class TECudaGraphHelper:
             """
             assert (
                 layer in chunk_of_the_layer.decoder.layers
-                or any(
-                    layer is mtp_layer.mtp_model_layer
-                    for mtp_layer in chunk_of_the_layer.mtp.layers
+                or (
+                    hasattr(chunk_of_the_layer, 'mtp')
+                    and any(
+                        layer is mtp_layer.mtp_model_layer
+                        for mtp_layer in chunk_of_the_layer.mtp.layers
+                    )
                 )
                 or any(
                     layer is leaf
