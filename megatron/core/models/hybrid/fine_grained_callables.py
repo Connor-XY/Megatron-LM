@@ -263,6 +263,15 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         for item_type, item_layer in pre_layers:
             with _get_inner_quant_context(item_layer):
                 if item_type == LayerSymbols.MAMBA:
+                    # When `mamba` is in the cuda-graph scope the captured graph is replayed
+                    # via __call__ (GraphableMegatronModule._should_call_te_cudagraph) and its
+                    # wgrad lives in the graph. Arm the graphed backward_dw so the schedule's
+                    # pre_dispatch backward_dw runs the captured wgrad instead of the eager
+                    # mixer.backward_dw (which would pop an empty wgrad queue on replay).
+                    if isinstance(item_layer, GraphableMegatronModule) and getattr(
+                        item_layer, "cuda_graphs", None
+                    ):
+                        item_layer.set_te_cuda_graph_backward_dw_wrapper()
                     hidden_states = item_layer(
                         hidden_states=hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
@@ -394,12 +403,13 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             item_layer.init_backward_dw_wrapper()
             pre_bwd_dw.append(item_layer.backward_dw_wrapper)
         elif item_type == LayerSymbols.MAMBA:
-            # MambaLayer is not a TransformerLayer, so init_backward_dw_wrapper
-            # would assert. MambaLayer.backward_dw delegates to its mixer, which
-            # in turn calls backward_dw on the in_proj / out_proj linears. The
-            # schedule node iterates this list and calls .backward_dw() on each;
-            # registering the layer directly is sufficient.
-            pre_bwd_dw.append(item_layer)
+            # MambaLayer.backward_dw delegates to its mixer in/out_proj linears.
+            # Route through _BackwardDWWrapper (now MambaLayer-aware) so under cuda-graph
+            # replay with `mamba` in scope the eager mixer wgrad is skipped and the graphed
+            # wgrad runs instead (avoids "Pop empty queue"); when Mamba is eager the wrapper
+            # runs the eager mixer.backward_dw unchanged.
+            item_layer.init_backward_dw_wrapper()
+            pre_bwd_dw.append(item_layer.backward_dw_wrapper)
     if is_moe:
         # MoELayer.backward_dw default kwargs (routed_experts=True, shared_experts=False)
         # handle the routed-experts wgrad in the mlp slot. The shared-experts wgrad goes

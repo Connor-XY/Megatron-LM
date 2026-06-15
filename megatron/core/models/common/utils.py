@@ -383,25 +383,37 @@ class _BackwardDWWrapper:
     """
 
     def __init__(self, layer):
+        from megatron.core.ssm.mamba_layer import MambaLayer
+
         assert isinstance(
             layer, GraphableMegatronModule
         ), "cuda graphed ep overlap only supports GraphableMegatronModule."
-        assert isinstance(
-            layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
         self.layer = layer
         self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
-        self.submodules = [layer.self_attention]
-        if layer.is_moe_layer:
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
-            if layer.mlp.use_shared_expert:
-                self.submodules.append(layer.mlp.shared_experts)
-        else:
-            self.shared_expert_dw_callable = None
         self.cuda_graph_modules = layer.config.cuda_graph_modules
+        if isinstance(layer, MambaLayer):
+            # Mamba pre-layer: backward_dw delegates to the mixer's in/out_proj
+            # linears. Under cuda-graph replay with `mamba` in scope the wgrad is
+            # captured in the graph, so the eager dw is skipped (see backward_dw).
+            self.attn_dw_callable = layer.backward_dw
+            self.submodules = [layer.mixer]
+            self._eager_dw_scope = CudaGraphModule.mamba
+            self.shared_expert_dw_callable = None
+        else:
+            assert isinstance(
+                layer, TransformerLayer
+            ), "cuda graphed ep overlap only supports TransformerLayer or MambaLayer."
+            self.attn_dw_callable = layer.self_attention.backward_dw
+            self.submodules = [layer.self_attention]
+            self._eager_dw_scope = CudaGraphModule.attn
+            if layer.is_moe_layer:
+                self.shared_expert_dw_callable = partial(
+                    layer.mlp.backward_dw, routed_experts=False, shared_experts=True
+                )
+                if layer.mlp.use_shared_expert:
+                    self.submodules.append(layer.mlp.shared_experts)
+            else:
+                self.shared_expert_dw_callable = None
 
     def backward_dw(self):
         """Run eager or graphed backward wgrad callables for the wrapped layer."""
@@ -410,7 +422,7 @@ class _BackwardDWWrapper:
             not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
+        if not is_replay or self._eager_dw_scope not in self.cuda_graph_modules:
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()
