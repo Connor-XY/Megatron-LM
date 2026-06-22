@@ -134,7 +134,7 @@ cp ${SCRIPT_PATH} ${RUN_DIR}/scripts 2>/dev/null || true
 
 SEQ_LEN=${SEQ_LEN:-8192}
 TRAIN_SAMPLES=$(( ${GBS:-128} * (${EXIT_INTERVAL:-40} + 3) ))
-LR_WARMUP_SAMPLES=2000
+LR_WARMUP_SAMPLES=${LR_WARMUP_SAMPLES:-2000}
 LR_DECAY_SAMPLES=$((TRAIN_SAMPLES-LR_WARMUP_SAMPLES))
 LR_WSD_DECAY_SAMPLES=40000
 
@@ -215,7 +215,8 @@ case "${CUDA_GRAPH:-none}" in
     full_iteration)
         export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,graph_capture_record_stream_reuse:True"
         export NCCL_GRAPH_REGISTER=0
-        PERF_OPTIONS=" --cuda-graph-impl full_iteration --no-check-for-nan-in-loss-and-grad"
+        export TIMING_LOG_LEVEL=0
+        PERF_OPTIONS=" --cuda-graph-impl full_iteration --no-check-for-nan-in-loss-and-grad --no-barrier-with-level-1-timing"
         # Fine-grained activation offloading needs extra flags under full-iteration
         # graphs; drop it (Pingtian's config doesn't offload).
         offload_options=""
@@ -262,8 +263,8 @@ fi
 options=" \
         --moe-router-score-function sigmoid \
         --moe-grouped-gemm \
-        --num-experts 512 \
-        --moe-router-topk 22 \
+        --num-experts ${NUM_EXPERTS:-512} \
+        --moe-router-topk ${TOPK:-22} \
         --moe-aux-loss-coeff 1e-4 \
         --moe-router-topk-scaling-factor 2.5 \
         --moe-router-enable-expert-bias \
@@ -340,7 +341,7 @@ options=" \
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --log-interval ${LOG_INTERVAL:-10} \
-        --timing-log-level 2 \
+        --timing-log-level ${TIMING_LOG_LEVEL:-2} \
         --log-params-norm \
         --log-num-zeros-in-grad \
         --log-throughput \
