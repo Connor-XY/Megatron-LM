@@ -61,13 +61,18 @@ The trace records determinism-relevant runtime configuration, forward/backward
 and optimizer boundaries, Megatron activation-checkpoint forward/recompute
 identities, and semantic MoE expert-parallel all-to-all boundaries. With
 `--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
-parameter, checkpoint, all-to-all, and pipeline P2P input/output hashes. Async
-P2P outputs are recorded only after the schedule's existing `Work.wait()` call;
-the tracer does not add a wait. Exact hashing copies device tensors to the CPU
-and synchronizes execution; use it only for targeted debug iterations because
-those synchronizations can perturb communication overlap. Without that flag,
-phase, checkpoint, and collective tensor metadata remain available without the
-byte copies; optimizer boundary tensors are omitted.
+parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
+distributed-optimizer parameter-gather hashes. Async outputs are recorded only
+after their existing completion boundary; the tracer does not add a collective
+or distributed wait. Exact hashing copies device tensors to the CPU and
+synchronizes execution; use it only for targeted debug iterations because those
+synchronizations can perturb communication overlap. Without that flag, phase,
+checkpoint, and collective tensor metadata remain available without the byte
+copies; optimizer boundary tensors are omitted.
+
+An `iteration.end` event reports `pending_collectives`. A nonzero value means a
+collective launched inside the selected window but completed after it; the late
+completion is intentionally not written into the closed iteration trace.
 
 Run the same launch into a second directory, then align events by semantic
 identity rather than arrival order:
@@ -80,10 +85,11 @@ python tools/determinism/compare_traces.py \
 Exit codes match `compare_dumps.py`: 0 is a match, 1 is a divergence, and 2 is
 invalid input. Use `--json` for automation. The current integration covers the
 Megatron tensor-parallel activation-checkpoint implementation, optimizer
-inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, and
-pipeline P2P sends/receives. TP/DP reduction and gather payloads, TE FP8/FP4
-recompute, optimizer moment state, and actual selected kernel identities remain
-follow-up instrumentation surfaces.
+inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, pipeline
+P2P sends/receives, DP all-reduce/reduce-scatter, and distributed-optimizer
+parameter all-gather. TP reduction/gather payloads, TE FP8/FP4 recompute,
+optimizer moment state, and actual selected kernel identities remain follow-up
+instrumentation surfaces.
 
 ## Maintenance
 

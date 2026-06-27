@@ -57,11 +57,13 @@ def get_model_and_buffers(
     num_distributed_optimizer_instances: int = 1,
     grad_reduce_in_fp32: bool = True,
     param_name_patterns_for_fp32_local_accumulation: tuple = (),
+    overlap_param_gather: bool = False,
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather=overlap_param_gather,
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
         num_distributed_optimizer_instances=num_distributed_optimizer_instances,

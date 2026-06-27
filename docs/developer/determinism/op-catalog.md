@@ -94,8 +94,9 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py:201-231` | NCCL collective | 🟡 | fixed NCCL ring order | — | env | doc | — | bf16 FP non-assoc but reproducible run-to-run. |
+| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | NCCL collective | 🟡 | fixed NCCL ring order | — | env | doc+**test** | hash tracing is debug-only | bf16 FP non-assoc but reproducible run-to-run; structured trace fingerprints every bucket before launch and after existing sync/wait/stream completion. |
 | fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | ordered fp32 sum | bf16 RS | `ddp_config.reduce_scatter_with_fp32_accumulation` | code | small | Accuracy + determinism friendly; 1-bucket only. |
+| Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | NCCL all-gather | 🟡 | fixed NCCL ring order | — | env | code+**test** | hash tracing is debug-only | Structured trace fingerprints sync and overlapped bucket gathers without adding a collective or wait. |
 | Distributed optimizer param order | `optimizer/distrib_optimizer.py:1094` | shard mapping | 🟢 | "preserving deterministic ordering across ranks" | — | always | code | — | — |
 | Grad clip global norm | `optimizer/clip_grads.py` | all-reduce | 🟡 | fixed NCCL algo | — | env | doc | — | — |
 
@@ -318,6 +319,13 @@ rank in AWS-DFW GB200 job `517022`, AWS-CMH GB300 job `696943`, and Draco H100
 job `10430851`. AWS-DFW job `517040` matched 2,320/2,320 events across two
 independent DSV3-style PP2×VPP2×EP2 runs; 384 were synchronous or overlapped P2P
 boundary events completed through the schedule's existing waits.
+
+**Verified (structured DP reduction and parameter-gather trace):** the expanded
+29-test suite passed per rank in AWS-DFW GB200 job `517130`, AWS-CMH GB300 job
+`697037`, and Draco H100 job `10431044`. AWS-DFW job `517136` matched
+1,352/1,352 events across two independent DSV3-style TP2×EP2 distributed-
+optimizer runs. The comparison included 48 DP reduction/gather boundary events,
+24 completed output hashes, and zero pending collectives.
 
 **Still open:** EP all-to-all at **EP>16** (proxies cap at EP4 — needs the Tier-B
 mbridge e2e recipe to reach the scale where DSV3 empirically diverges) and the

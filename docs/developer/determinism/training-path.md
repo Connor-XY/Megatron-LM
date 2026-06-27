@@ -94,9 +94,10 @@ Legend for the "Determinism" column:
 
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
-| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py:201-231` | 🟡 | bf16 collective has FP non-associativity but a **fixed NCCL ring order makes it reproducible** run-to-run. |
+| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | 🟡 | bf16 collective has FP non-associativity but a **fixed NCCL ring order makes it reproducible** run-to-run. The structured trace can hash each bucket before launch and after the existing completion boundary. |
 | fp32-accumulation reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` (enabled via `ddp_config.reduce_scatter_with_fp32_accumulation`) | 🟢 | All-to-all then **ordered `torch.sum(..., dtype=fp32)`** — a deterministic, higher-precision reduction. Primarily an accuracy feature; also determinism-friendly. |
-| Async param gather / grad reduce overlap | `param_and_grad_buffer.py:349+`, `tensor_parallel/layers.py:544/565/577` (`async_op=True`) | 🟡 | Async completion order can vary; determinism relies on `wait()` barriers re-imposing order before use. `tp_comm_overlap` is force-disabled in det mode. |
+| Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | 🟡 | Sync and overlapped paths are reproducible under fixed NCCL ordering. The structured trace hashes each bucket before launch and after the existing completion boundary. |
+| Async param gather / grad reduce overlap | `distributed/param_and_grad_buffer.py`, `tensor_parallel/layers.py:544/565/577` (`async_op=True`) | 🟡 | Async completion order can vary; determinism relies on existing `wait()` or stream barriers before use. The trace adds no wait and reports operations that outlive its window through `iteration.end.pending_collectives`. `tp_comm_overlap` is force-disabled in det mode. |
 
 ## Stage 5 — Optimizer
 
@@ -115,7 +116,7 @@ Legend for the "Determinism" column:
 | TE non-deterministic algos | `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | 🟡 | Forces TE deterministic attention/norm kernels. |
 | CUDA caching allocator | (none) | 🟡 | Allocation pattern can influence kernel autotuning/selection; flagged in the roadmap as worth investigating. |
 | PP / VPP microbatch interleave | schedules and `p2p_communication.py` in `core/pipeline_parallel/` | 🟢→🟡 | Schedule is deterministic, but interleaving scrambles observed event order. Rank-local P2P trace events are semantically named and complete at existing waits, so comparison does not depend on cross-kind arrival order. |
-| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py`, `tensor_parallel/mappings.py`, `pipeline_parallel/p2p_communication.py` | 🟢 | Opt-in rank-local events add no collectives or waits. Semantic comparison can hash recompute outputs, MoE EP all-to-all and pipeline P2P inputs/outputs, and optimizer boundary tensors on selected iterations. |
+| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py`, `tensor_parallel/mappings.py`, `pipeline_parallel/p2p_communication.py`, `distributed/param_and_grad_buffer.py` | 🟢 | Opt-in rank-local events add no collectives or waits. Semantic comparison can hash recompute outputs, MoE EP all-to-all, pipeline P2P, DP gradient-reduction, distributed-optimizer parameter-gather, and optimizer boundary tensors on selected iterations. |
 
 ---
 

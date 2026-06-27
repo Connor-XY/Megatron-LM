@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 
 import pytest
 import torch
@@ -22,6 +23,7 @@ from megatron.core.parallel_state import get_pipeline_model_parallel_group
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.tensor_parallel.random import checkpoint
+from tests.unit_tests.distributed.test_param_and_grad_buffer import get_model_and_buffers
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -113,6 +115,7 @@ def test_collective_trace_records_semantic_input_and_output(tmp_path):
             "test.collective", "all_reduce", input_tensor, metadata={"async_op": False}
         )
         record_collective_result(handle, output_tensor)
+        record_collective_result(handle, output_tensor)
 
     events = _read_events(_trace_path(tmp_path, 8))
     collective = [event for event in events if event["kind"] == "collective"]
@@ -122,6 +125,24 @@ def test_collective_trace_records_semantic_input_and_output(tmp_path):
     ]
     assert collective[0]["payload"]["inputs"][0]["sha256"]
     assert collective[1]["payload"]["outputs"][0]["sha256"]
+    assert events[-1]["payload"]["pending_collectives"] == 0
+
+
+def test_process_trace_records_worker_threads_and_pending_collectives(tmp_path):
+    with trace_iteration(tmp_path, 14, hash_tensors=True):
+        worker = threading.Thread(
+            target=lambda: record_event(EventKind.PHASE, "worker.thread.event")
+        )
+        worker.start()
+        worker.join()
+        pending = begin_collective_trace(
+            "test.pending_collective", "all_reduce", torch.tensor([1.0])
+        )
+
+    events = _read_events(_trace_path(tmp_path, 14))
+    assert any(event["name"] == "worker.thread.event" for event in events)
+    assert events[-1]["payload"]["pending_collectives"] == 1
+    record_collective_result(pending, torch.tensor([1.0]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -289,5 +310,87 @@ def test_pipeline_p2p_trace_records_after_existing_wait(tmp_path):
         collective = [event for event in events if event["kind"] == "collective"]
         assert len(collective) == 4
         assert all(event["payload"]["batched"] is True for event in collective)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_data_parallel_grad_collective_trace(
+    tmp_path, use_distributed_optimizer, overlap_grad_reduce
+):
+    Utils.initialize_model_parallel()
+    try:
+        model, buffer, _ = get_model_and_buffers(
+            input_dim=16,
+            output_dim=16,
+            num_layers=2,
+            bias=True,
+            shared_embedding=False,
+            bucket_size=None,
+            use_distributed_optimizer=use_distributed_optimizer,
+            overlap_grad_reduce=overlap_grad_reduce,
+            average_in_collective=False,
+        )
+        buffer.grad_data.fill_(torch.distributed.get_rank() + 1)
+        with trace_iteration(tmp_path, 15, hash_tensors=True):
+            model.finish_grad_sync()
+
+        events = _read_events(_trace_path(tmp_path, 15))
+        collective = [
+            event
+            for event in events
+            if event["kind"] == "collective"
+            and event["name"].startswith("data_parallel.grad_reduce")
+        ]
+        assert len(collective) == 2
+        expected_operation = "reduce_scatter_tensor" if use_distributed_optimizer else "all_reduce"
+        assert all(event["payload"]["operation"] == expected_operation for event in collective)
+        assert collective[0]["payload"]["inputs"][0]["sha256"]
+        assert collective[1]["payload"]["outputs"][0]["sha256"]
+        assert events[-1]["payload"]["pending_collectives"] == 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("force_sync", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_distributed_optimizer_param_gather_trace(tmp_path, force_sync):
+    Utils.initialize_model_parallel()
+    try:
+        _, _, bucket_groups = get_model_and_buffers(
+            input_dim=16,
+            output_dim=16,
+            num_layers=2,
+            bias=True,
+            shared_embedding=False,
+            bucket_size=None,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            average_in_collective=False,
+        )
+        with trace_iteration(tmp_path, 16, hash_tensors=True):
+            for bucket_group in bucket_groups:
+                bucket_group.start_param_sync(force_sync=force_sync)
+            if not force_sync:
+                for bucket_group in bucket_groups:
+                    bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
+
+        events = _read_events(_trace_path(tmp_path, 16))
+        collective = [
+            event
+            for event in events
+            if event["kind"] == "collective"
+            and event["name"].startswith("data_parallel.param_gather")
+        ]
+        assert len(collective) == 2
+        assert all(
+            event["payload"]["operation"] == "all_gather_into_tensor" for event in collective
+        )
+        assert collective[0]["payload"]["inputs"][0]["sha256"]
+        assert collective[1]["payload"]["outputs"][0]["sha256"]
+        assert events[-1]["payload"]["pending_collectives"] == 0
     finally:
         Utils.destroy_model_parallel()

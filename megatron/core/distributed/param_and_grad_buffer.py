@@ -16,6 +16,11 @@ from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
+from megatron.core.determinism_trace import (
+    active_trace,
+    begin_collective_trace,
+    record_collective_result,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
@@ -250,6 +255,8 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+        self._param_gather_trace_results = []
+        self._grad_reduce_trace_results = []
         # Per-iteration flag: True once finish_grad_sync has run this step. Lets a successor
         # bucket group early-drain its predecessor without the end-of-step finalize loop
         # double-waiting. Reset by `reset()`.
@@ -262,6 +269,29 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+
+    def _trace_bucket_collective(
+        self, results, name, operation, inputs, outputs, group, bucket, **metadata
+    ):
+        """Track one bucket collective while a process-wide trace is active."""
+        if active_trace() is None:
+            return
+        handle = begin_collective_trace(
+            f"{name}.bucket_{bucket.bucket_id}",
+            operation,
+            inputs,
+            group=group,
+            metadata={"bucket_id": bucket.bucket_id, "numel": bucket.grad_data.numel(), **metadata},
+        )
+        if handle is not None:
+            results.append((handle, outputs))
+
+    @staticmethod
+    def _record_trace_results(results):
+        """Record completed bucket collectives and release their tensor references."""
+        for handle, outputs in results:
+            record_collective_result(handle, outputs)
+        results.clear()
 
     def reset(self):
         """
@@ -366,6 +396,7 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._record_trace_results(self._param_gather_trace_results)
                 self._post_param_sync()
                 return
         else:
@@ -429,6 +460,18 @@ class _ParamAndGradBucketGroup:
                     local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
+                self._trace_bucket_collective(
+                    self._param_gather_trace_results,
+                    "data_parallel.param_gather",
+                    "all_gather",
+                    local_slot_view,
+                    gather_list,
+                    group,
+                    bucket,
+                    async_op=async_op,
+                    layerwise=True,
+                )
+
                 work = torch.distributed.all_gather(
                     gather_list, local_slot_view, group=group, async_op=async_op
                 )
@@ -438,6 +481,7 @@ class _ParamAndGradBucketGroup:
             if async_op:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
+                self._record_trace_results(self._param_gather_trace_results)
                 # Synchronous: unflatten and copy gathered params immediately.
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
@@ -472,6 +516,17 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+                    self._trace_bucket_collective(
+                        self._param_gather_trace_results,
+                        "data_parallel.param_gather",
+                        "all_gather_into_tensor",
+                        local_data_view,
+                        bucket.param_data,
+                        self.intra_distributed_optimizer_instance_group,
+                        bucket,
+                        async_op=async_op,
+                        layerwise=False,
+                    )
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
@@ -481,6 +536,7 @@ class _ParamAndGradBucketGroup:
             if async_op:
                 self.param_gather_handle = cm
             else:
+                self._record_trace_results(self._param_gather_trace_results)
                 # When using `_coalescing_manager`, even if a synchronous op
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
@@ -514,6 +570,7 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+            self._record_trace_results(self._param_gather_trace_results)
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
@@ -655,6 +712,18 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+                    self._trace_bucket_collective(
+                        self._grad_reduce_trace_results,
+                        "data_parallel.grad_reduce",
+                        "reduce_scatter_tensor",
+                        bucket.grad_data,
+                        local_data_view,
+                        communication_group,
+                        bucket,
+                        async_op=async_op,
+                        force_all_reduce=force_all_reduce,
+                        reduce_op=str(reduce_op),
+                    )
                     grad_reduce_handle = dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
@@ -667,6 +736,18 @@ class _ParamAndGradBucketGroup:
                         logger.info(
                             f"Performing reduction using all_reduce because {force_all_reduce=}"
                         )
+                    self._trace_bucket_collective(
+                        self._grad_reduce_trace_results,
+                        "data_parallel.grad_reduce",
+                        "all_reduce",
+                        bucket.grad_data,
+                        bucket.grad_data,
+                        communication_group,
+                        bucket,
+                        async_op=async_op,
+                        force_all_reduce=force_all_reduce,
+                        reduce_op=str(reduce_op),
+                    )
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
@@ -693,12 +774,27 @@ class _ParamAndGradBucketGroup:
                         self.intra_distributed_optimizer_instance_rank
                     ]
 
+                    self._trace_bucket_collective(
+                        self._grad_reduce_trace_results,
+                        "data_parallel.grad_reduce.inter_instance",
+                        "all_reduce",
+                        local_data_view,
+                        local_data_view,
+                        self.inter_distributed_optimizer_instance_group,
+                        bucket,
+                        async_op=async_op,
+                        force_all_reduce=force_all_reduce,
+                        reduce_op=str(reduce_op),
+                    )
                     torch.distributed.all_reduce(
                         local_data_view,
                         op=reduce_op,
                         group=self.inter_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
+
+        if not self.ddp_config.overlap_grad_reduce:
+            self._record_trace_results(self._grad_reduce_trace_results)
 
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
@@ -753,6 +849,7 @@ class _ParamAndGradBucketGroup:
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
+            self._record_trace_results(self._grad_reduce_trace_results)
             self._copy_back_extra_main_grads()
             self.grad_reduce_finished = True
             return
@@ -763,6 +860,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        self._record_trace_results(self._grad_reduce_trace_results)
         self._copy_back_extra_main_grads()
         self.grad_reduce_finished = True
 
@@ -777,6 +875,7 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+            self._record_trace_results(self._param_gather_trace_results)
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
 

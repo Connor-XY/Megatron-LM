@@ -182,7 +182,11 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   dispatch/combine inputs and outputs in original forward, activation
   recompute, and backward. Pipeline P2P tracing records sends and completed
   receives at the schedule's existing synchronous, batched, or overlapped wait
-  boundary without adding communication or an extra wait.
+  boundary without adding communication or an extra wait. DP bucket tracing
+  covers synchronous/overlapped all-reduce and reduce-scatter plus synchronous/
+  overlapped distributed-optimizer parameter all-gather. Rank-process visibility
+  captures autograd-worker launches; `iteration.end.pending_collectives` reports
+  operations that outlive the selected window instead of writing to a closed trace.
   `tools/determinism/compare_traces.py` aligns rank traces by semantic event
   identity instead of PP/VPP arrival order. The final 22-test focused suite
   passed on every rank in AWS-DFW GB200 job `517022`, AWS-CMH GB300 job `696943`,
@@ -191,8 +195,11 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   (`10430682`), including exact all-to-all fingerprints in forward, recompute,
   and backward. AWS-DFW job `517040` then exercised PP2×VPP2×EP2 with overlapped
   P2P and matched all 2,320 events across 8 rank/iteration shards, including 384
-  P2P boundary events. Every completed model run reported byte-identical
-  recompute outputs.
+  P2P boundary events. The expanded 29-test suite passed on every rank in GB200
+  job `517130`, GB300 job `697037`, and H100 job `10431044`. AWS-DFW job `517136`
+  matched 1,352/1,352 events across two distributed-optimizer runs, including 48
+  DP boundary events and zero pending collectives. Every completed model run
+  reported byte-identical recompute outputs.
 - **E2E full-recipe (WS2 Tier B — pending):** the real nemotron-3-ultra recipe
   lives in **Megatron-Bridge** (`zhiyul/nemotron-3-ultra-perf-recipe`); the
   weekly multi-node e2e + wandb dashboard is the remaining tier — it is the only
@@ -209,11 +216,13 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    the structured runtime trace now covers phase ordering, Megatron recompute
    identity, optimizer boundary scalars, exact wgrad/parameter hashes, runtime
    library/env settings, allocator backend, and MoE EP all-to-all inputs and
-   outputs plus pipeline P2P sends/receives. TP/DP reduction/gather payloads,
-   optimizer moment state, TE FP8/FP4 recompute, and actual selected kernel
-   identities are still missing. DSV3's known EP>16 + PP/VPP divergence
-   therefore still needs the scaled e2e recipe plus the remaining collective
-   instrumentation to localize fully.
+   outputs, pipeline P2P sends/receives, DP gradient reduction, and distributed-
+   optimizer parameter gather. TP reduction/gather payloads, optimizer moment
+   state, TE FP8/FP4 recompute, and actual selected kernel identities are still
+   missing. DSV3's known EP>16 + PP/VPP divergence therefore still needs the
+   scaled e2e recipe plus the remaining collective instrumentation to localize
+   fully.
+
 ## 9. References
 
 - Determinism roadmap & meeting notes (internal Google Docs).

@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -82,6 +83,7 @@ class CollectiveTraceHandle:
     name: str
     operation: str
     metadata: dict[str, Any]
+    completed: bool = False
 
 
 class _CollectiveTraceWork:
@@ -107,6 +109,7 @@ class _CollectiveTraceWork:
 _ACTIVE_TRACE: ContextVar[DeterminismTrace | None] = ContextVar(
     "megatron_determinism_trace", default=None
 )
+_PROCESS_ACTIVE_TRACE: DeterminismTrace | None = None
 _COLLECTIVE_PHASE: ContextVar[str] = ContextVar(
     "megatron_determinism_collective_phase", default="forward"
 )
@@ -231,48 +234,96 @@ class DeterminismTrace:
         self._checkpoint_sequence = 0
         self._file = None
         self._token: Token | None = None
+        self._previous_process_trace: DeterminismTrace | None = None
+        self._pending_collectives = 0
+        self._lock = threading.RLock()
 
     def __enter__(self) -> DeterminismTrace:
+        global _PROCESS_ACTIVE_TRACE
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("w", encoding="utf-8")
         self._token = _ACTIVE_TRACE.set(self)
-        self.record(EventKind.RUNTIME, "runtime", _runtime_payload())
-        self.record(EventKind.PHASE, "iteration.begin")
+        try:
+            self.record(EventKind.RUNTIME, "runtime", _runtime_payload())
+            self.record(EventKind.PHASE, "iteration.begin")
+        except Exception:
+            _ACTIVE_TRACE.reset(self._token)
+            self._token = None
+            self._file.close()
+            self._file = None
+            raise
+        self._previous_process_trace = _PROCESS_ACTIVE_TRACE
+        _PROCESS_ACTIVE_TRACE = self
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        if exc_type is not None:
-            self.record(EventKind.PHASE, "iteration.error", {"exception_type": exc_type.__name__})
-        self.record(EventKind.PHASE, "iteration.end")
-        if self._token is not None:
-            _ACTIVE_TRACE.reset(self._token)
-            self._token = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+        global _PROCESS_ACTIVE_TRACE
+        with self._lock:
+            try:
+                if exc_type is not None:
+                    self.record(
+                        EventKind.PHASE, "iteration.error", {"exception_type": exc_type.__name__}
+                    )
+                self.record(
+                    EventKind.PHASE,
+                    "iteration.end",
+                    {"pending_collectives": self._pending_collectives},
+                )
+            finally:
+                if self._token is not None:
+                    _ACTIVE_TRACE.reset(self._token)
+                    self._token = None
+                if _PROCESS_ACTIVE_TRACE is self:
+                    _PROCESS_ACTIVE_TRACE = self._previous_process_trace
+                self._previous_process_trace = None
+                if self._file is not None:
+                    self._file.close()
+                    self._file = None
 
     def record(self, kind: EventKind, name: str, payload: Mapping[str, Any] | None = None) -> None:
         """Write one event and flush it so a failed job leaves a usable prefix."""
-        if self._file is None:
+        if not self.record_if_open(kind, name, payload):
             raise RuntimeError("DeterminismTrace must be entered before recording events")
-        event = TraceEvent(
-            schema_version=TRACE_SCHEMA_VERSION,
-            sequence=self._sequence,
-            rank=self.rank,
-            iteration=self.iteration,
-            kind=kind.value,
-            name=name,
-            payload=_json_safe(dict(payload or {})),
-        )
-        self._sequence += 1
-        self._file.write(json.dumps(asdict(event), sort_keys=True, allow_nan=False) + "\n")
-        self._file.flush()
+
+    def record_if_open(
+        self, kind: EventKind, name: str, payload: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Write one event if the trace is open, returning whether it was recorded."""
+        with self._lock:
+            if self._file is None:
+                return False
+            event = TraceEvent(
+                schema_version=TRACE_SCHEMA_VERSION,
+                sequence=self._sequence,
+                rank=self.rank,
+                iteration=self.iteration,
+                kind=kind.value,
+                name=name,
+                payload=_json_safe(dict(payload or {})),
+            )
+            self._sequence += 1
+            self._file.write(json.dumps(asdict(event), sort_keys=True, allow_nan=False) + "\n")
+            self._file.flush()
+            return True
 
     def next_checkpoint_id(self) -> int:
         """Return a stable per-iteration checkpoint occurrence number."""
-        checkpoint_id = self._checkpoint_sequence
-        self._checkpoint_sequence += 1
-        return checkpoint_id
+        with self._lock:
+            checkpoint_id = self._checkpoint_sequence
+            self._checkpoint_sequence += 1
+            return checkpoint_id
+
+    @property
+    def is_open(self) -> bool:
+        """Return whether events can still be appended to this trace."""
+        with self._lock:
+            return self._file is not None
+
+    @property
+    def pending_collectives(self) -> int:
+        """Return the number of collective begin events without an in-window end."""
+        with self._lock:
+            return self._pending_collectives
 
 
 @contextmanager
@@ -289,7 +340,7 @@ def trace_iteration(
 
 def active_trace() -> DeterminismTrace | None:
     """Return the trace active in the current execution context, if any."""
-    return _ACTIVE_TRACE.get()
+    return _ACTIVE_TRACE.get() or _PROCESS_ACTIVE_TRACE
 
 
 def collective_trace_phase() -> str:
@@ -325,7 +376,7 @@ def record_event(kind: EventKind, name: str, payload: Mapping[str, Any] | None =
     """Record an event when tracing is active; otherwise do nothing."""
     trace = active_trace()
     if trace is not None:
-        trace.record(kind, name, payload)
+        trace.record_if_open(kind, name, payload)
 
 
 def record_tensor(name: str, tensor: torch.Tensor, **payload: Any) -> None:
@@ -333,11 +384,13 @@ def record_tensor(name: str, tensor: torch.Tensor, **payload: Any) -> None:
     trace = active_trace()
     if trace is None:
         return
-    trace.record(
-        EventKind.TENSOR,
-        name,
-        {**payload, **asdict(fingerprint_tensor(tensor, include_hash=trace.hash_tensors))},
-    )
+    with trace._lock:
+        if trace.is_open:
+            trace.record(
+                EventKind.TENSOR,
+                name,
+                {**payload, **asdict(fingerprint_tensor(tensor, include_hash=trace.hash_tensors))},
+            )
 
 
 def begin_collective_trace(
@@ -362,15 +415,19 @@ def begin_collective_trace(
                 "backend": str(torch.distributed.get_backend(group)),
             }
         )
-    trace.record(
-        EventKind.COLLECTIVE,
-        f"{name}.begin",
-        {
-            "operation": operation,
-            **event_metadata,
-            "inputs": _tensor_tree(inputs, include_hash=trace.hash_tensors),
-        },
-    )
+    with trace._lock:
+        if not trace.is_open:
+            return None
+        trace.record(
+            EventKind.COLLECTIVE,
+            f"{name}.begin",
+            {
+                "operation": operation,
+                **event_metadata,
+                "inputs": _tensor_tree(inputs, include_hash=trace.hash_tensors),
+            },
+        )
+        trace._pending_collectives += 1
     return CollectiveTraceHandle(
         trace=trace, name=name, operation=operation, metadata=event_metadata
     )
@@ -380,15 +437,23 @@ def record_collective_result(handle: CollectiveTraceHandle | None, outputs: Any)
     """Record collective outputs after the caller has made them ready."""
     if handle is None:
         return
-    handle.trace.record(
-        EventKind.COLLECTIVE,
-        f"{handle.name}.end",
-        {
-            "operation": handle.operation,
-            **handle.metadata,
-            "outputs": _tensor_tree(outputs, include_hash=handle.trace.hash_tensors),
-        },
-    )
+    trace = handle.trace
+    with trace._lock:
+        if handle.completed:
+            return
+        if trace.is_open:
+            trace.record(
+                EventKind.COLLECTIVE,
+                f"{handle.name}.end",
+                {
+                    "operation": handle.operation,
+                    **handle.metadata,
+                    "outputs": _tensor_tree(outputs, include_hash=trace.hash_tensors),
+                },
+            )
+            assert trace._pending_collectives > 0
+            trace._pending_collectives -= 1
+        handle.completed = True
 
 
 def trace_collective_work(work: Any, handle: CollectiveTraceHandle | None, outputs: Any) -> Any:
@@ -413,12 +478,16 @@ def begin_recompute_trace(function: Any, inputs: Any) -> RecomputeTraceHandle | 
     trace = active_trace()
     if trace is None:
         return None
-    return RecomputeTraceHandle(
-        trace=trace,
-        checkpoint_id=trace.next_checkpoint_id(),
-        callable_name=_callable_name(function),
-        input_fingerprints=_tensor_tree(inputs, include_hash=trace.hash_tensors),
-    )
+    with trace._lock:
+        if not trace.is_open:
+            return None
+        checkpoint_id = trace.next_checkpoint_id()
+        return RecomputeTraceHandle(
+            trace=trace,
+            checkpoint_id=checkpoint_id,
+            callable_name=_callable_name(function),
+            input_fingerprints=_tensor_tree(inputs, include_hash=trace.hash_tensors),
+        )
 
 
 def record_recompute_phase(handle: RecomputeTraceHandle | None, phase: str, outputs: Any) -> None:
@@ -426,15 +495,20 @@ def record_recompute_phase(handle: RecomputeTraceHandle | None, phase: str, outp
     if handle is None:
         return
     trace = handle.trace
-    fingerprints = _tensor_tree(outputs, include_hash=trace.hash_tensors)
-    payload: dict[str, Any] = {
-        "checkpoint_id": handle.checkpoint_id,
-        "callable": handle.callable_name,
-        "inputs": handle.input_fingerprints,
-        "outputs": fingerprints,
-    }
-    if phase == "forward":
-        handle.forward_fingerprints = fingerprints
-    elif trace.hash_tensors and handle.forward_fingerprints is not None:
-        payload["matches_forward"] = _same_tensor_values(fingerprints, handle.forward_fingerprints)
-    trace.record(EventKind.RECOMPUTE, f"checkpoint.{phase}", payload)
+    with trace._lock:
+        if not trace.is_open:
+            return
+        fingerprints = _tensor_tree(outputs, include_hash=trace.hash_tensors)
+        payload: dict[str, Any] = {
+            "checkpoint_id": handle.checkpoint_id,
+            "callable": handle.callable_name,
+            "inputs": handle.input_fingerprints,
+            "outputs": fingerprints,
+        }
+        if phase == "forward":
+            handle.forward_fingerprints = fingerprints
+        elif trace.hash_tensors and handle.forward_fingerprints is not None:
+            payload["matches_forward"] = _same_tensor_values(
+                fingerprints, handle.forward_fingerprints
+            )
+        trace.record(EventKind.RECOMPUTE, f"checkpoint.{phase}", payload)
