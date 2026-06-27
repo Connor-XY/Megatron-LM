@@ -84,6 +84,26 @@ class CollectiveTraceHandle:
     metadata: dict[str, Any]
 
 
+class _CollectiveTraceWork:
+    """Delegate a distributed work handle and record its result after ``wait``."""
+
+    def __init__(self, work: Any, results: list[tuple[CollectiveTraceHandle, Any]]) -> None:
+        self._work = work
+        self._results = results
+        self._recorded = False
+
+    def wait(self, *args, **kwargs):
+        result = self._work.wait(*args, **kwargs)
+        if result is not False and not self._recorded:
+            for handle, outputs in self._results:
+                record_collective_result(handle, outputs)
+            self._recorded = True
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._work, name)
+
+
 _ACTIVE_TRACE: ContextVar[DeterminismTrace | None] = ContextVar(
     "megatron_determinism_trace", default=None
 )
@@ -369,6 +389,23 @@ def record_collective_result(handle: CollectiveTraceHandle | None, outputs: Any)
             "outputs": _tensor_tree(outputs, include_hash=handle.trace.hash_tensors),
         },
     )
+
+
+def trace_collective_work(work: Any, handle: CollectiveTraceHandle | None, outputs: Any) -> Any:
+    """Return a work handle that records outputs after its existing wait call."""
+    if handle is None:
+        return work
+    return _CollectiveTraceWork(work, [(handle, outputs)])
+
+
+def trace_collective_work_group(
+    work: Any, results: list[tuple[CollectiveTraceHandle | None, Any]]
+) -> Any:
+    """Record several collective outputs completed by one grouped work handle."""
+    active_results = [(handle, outputs) for handle, outputs in results if handle is not None]
+    if not active_results:
+        return work
+    return _CollectiveTraceWork(work, active_results)
 
 
 def begin_recompute_trace(function: Any, inputs: Any) -> RecomputeTraceHandle | None:

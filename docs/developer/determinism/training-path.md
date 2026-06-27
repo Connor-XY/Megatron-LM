@@ -114,8 +114,8 @@ Legend for the "Determinism" column:
 | NCCL collective algorithm | `NCCL_ALGO=Ring` | 🟡 | Pins reduction topology/order. `Tree` excluded by PR #5041. |
 | TE non-deterministic algos | `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | 🟡 | Forces TE deterministic attention/norm kernels. |
 | CUDA caching allocator | (none) | 🟡 | Allocation pattern can influence kernel autotuning/selection; flagged in the roadmap as worth investigating. |
-| PP / VPP microbatch interleave | schedules in `core/pipeline_parallel/` | 🟢→🟡 | Schedule is deterministic, but interleaving **scrambles observed event order** — the key reason a naive "first divergence" hook is hard (Workstream 4). |
-| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py`, `tensor_parallel/mappings.py` | 🟢 | Opt-in rank-local events add no collectives. Semantic comparison ignores arrival order and can hash recompute outputs, MoE EP all-to-all inputs/outputs, and optimizer boundary tensors on selected iterations. |
+| PP / VPP microbatch interleave | schedules and `p2p_communication.py` in `core/pipeline_parallel/` | 🟢→🟡 | Schedule is deterministic, but interleaving scrambles observed event order. Rank-local P2P trace events are semantically named and complete at existing waits, so comparison does not depend on cross-kind arrival order. |
+| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py`, `tensor_parallel/mappings.py`, `pipeline_parallel/p2p_communication.py` | 🟢 | Opt-in rank-local events add no collectives or waits. Semantic comparison can hash recompute outputs, MoE EP all-to-all and pipeline P2P inputs/outputs, and optimizer boundary tensors on selected iterations. |
 
 ---
 

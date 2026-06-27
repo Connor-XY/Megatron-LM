@@ -17,6 +17,9 @@ from megatron.core.determinism_trace import (
     record_tensor,
     trace_iteration,
 )
+from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.parallel_state import get_pipeline_model_parallel_group
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.tensor_parallel.random import checkpoint
 from tests.unit_tests.test_utilities import Utils
@@ -213,5 +216,78 @@ def test_all_to_all_autograd_records_forward_and_backward(tmp_path):
         assert all(event["payload"]["async_op"] is True for event in async_collective)
         torch.testing.assert_close(async_output, expected)
         torch.testing.assert_close(async_values.grad, torch.ones_like(async_values))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_pipeline_p2p_trace_records_after_existing_wait(tmp_path):
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=Utils.world_size)
+    try:
+        pp_group = get_pipeline_model_parallel_group()
+        rank = pp_group.rank()
+        world_size = pp_group.size()
+        config = ModelParallelConfig(
+            pipeline_dtype=torch.float32,
+            pipeline_model_parallel_size=world_size,
+            batch_p2p_comm=False,
+        )
+        communicator = P2PCommunicator(pp_group, config)
+
+        send = torch.tensor([rank], dtype=torch.float32, device="cuda")
+        with trace_iteration(tmp_path, 12, hash_tensors=True):
+            recv, _, requests = communicator._communicate(
+                tensor_send_next=send,
+                tensor_send_prev=None,
+                recv_prev=True,
+                recv_next=False,
+                tensor_shape=(1,),
+                wait_on_reqs=False,
+            )
+            before_wait = _read_events(_trace_path(tmp_path, 12))
+            before_names = [event["name"] for event in before_wait if event["kind"] == "collective"]
+            assert set(before_names) == {
+                "pipeline.forward.send_next.begin",
+                "pipeline.forward.recv_prev.begin",
+            }
+            for request in requests.values():
+                request.wait()
+
+        expected_prev = (rank - 1) % world_size
+        torch.testing.assert_close(
+            recv, torch.tensor([expected_prev], dtype=torch.float32, device="cuda")
+        )
+        events = _read_events(_trace_path(tmp_path, 12))
+        collective = [event for event in events if event["kind"] == "collective"]
+        assert {event["name"] for event in collective} == {
+            "pipeline.forward.send_next.begin",
+            "pipeline.forward.send_next.end",
+            "pipeline.forward.recv_prev.begin",
+            "pipeline.forward.recv_prev.end",
+        }
+        recv_end = next(
+            event for event in collective if event["name"] == "pipeline.forward.recv_prev.end"
+        )
+        assert recv_end["payload"]["outputs"][0]["sha256"]
+
+        config.batch_p2p_comm = True
+        send = torch.tensor([rank + 1], dtype=torch.float32, device="cuda")
+        with trace_iteration(tmp_path, 13, hash_tensors=True):
+            recv, _, requests = communicator._communicate(
+                tensor_send_next=send,
+                tensor_send_prev=None,
+                recv_prev=True,
+                recv_next=False,
+                tensor_shape=(1,),
+                wait_on_reqs=True,
+            )
+        assert requests is None
+        torch.testing.assert_close(
+            recv, torch.tensor([expected_prev + 1], dtype=torch.float32, device="cuda")
+        )
+        events = _read_events(_trace_path(tmp_path, 13))
+        collective = [event for event in events if event["kind"] == "collective"]
+        assert len(collective) == 4
+        assert all(event["payload"]["batched"] is True for event in collective)
     finally:
         Utils.destroy_model_parallel()

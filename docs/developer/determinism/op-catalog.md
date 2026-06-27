@@ -81,6 +81,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | RoPE / position emb | `models/common/embeddings/rotary_pos_embedding.py` | trig | 🟢 | — | — | — | doc | — | — |
 | Column/Row parallel linear (GEMM) | `tensor_parallel/layers.py` | cuBLAS GEMM | 🟡 | fixed cuBLAS workspace | — | `CUBLAS_WORKSPACE_CONFIG` | doc | — | — |
 | Async TP all-gather/all-reduce | `tensor_parallel/layers.py:544/565/577`, `mappings.py:452` | `async_op=True` | 🟡 | `wait()` re-imposes order | overlap | `tp_comm_overlap` | doc | — | `tp_comm_overlap` force-off in det mode. |
+| Pipeline P2P send/receive | `pipeline_parallel/p2p_communication.py` | `isend` / `irecv` / batched P2P | 🟡 | existing wait pins readiness before use | overlap / VPP | schedule | code+**test** | hash tracing is debug-only | Structured trace fingerprints sends and completed receives without adding waits; PP2×VPP2×EP2 passed two-run comparison. |
 
 ### Loss
 
@@ -311,6 +312,12 @@ AWS-CMH GB300 job `696891` passed the same final suite per rank. AWS-DFW job
 `516924` matched 984/984 events across two independent DSV3-style TP2×EP2 runs;
 288 were hashed collective boundary events spanning original forward, recompute,
 and backward.
+
+**Verified (structured pipeline P2P trace):** the final 22-test suite passed per
+rank in AWS-DFW GB200 job `517022`, AWS-CMH GB300 job `696943`, and Draco H100
+job `10430851`. AWS-DFW job `517040` matched 2,320/2,320 events across two
+independent DSV3-style PP2×VPP2×EP2 runs; 384 were synchronous or overlapped P2P
+boundary events completed through the schedule's existing waits.
 
 **Still open:** EP all-to-all at **EP>16** (proxies cap at EP4 — needs the Tier-B
 mbridge e2e recipe to reach the scale where DSV3 empirically diverges) and the

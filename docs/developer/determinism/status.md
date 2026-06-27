@@ -180,20 +180,19 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   records paired forward/recompute fingerprints and reports their within-run
   identity. The shared MoE all-to-all wrapper records semantically named
   dispatch/combine inputs and outputs in original forward, activation
-  recompute, and backward.
+  recompute, and backward. Pipeline P2P tracing records sends and completed
+  receives at the schedule's existing synchronous, batched, or overlapped wait
+  boundary without adding communication or an extra wait.
   `tools/determinism/compare_traces.py` aligns rank traces by semantic event
-  identity instead of PP/VPP arrival order. AWS-DFW job `516965` passed all 21
-  focused trace/dump tests on every GB200 rank, including synchronous,
-  NCCL-stream, recomputed, and backward all-to-all paths; AWS-CMH job `696891`
-  passed the same final suite on every GB300 rank. AWS-DFW job `516924` then ran
-  two independent deterministic DSV3-style TP2×EP2 training launches with full
-  activation recompute and matched all 984 events across 8 rank/iteration shards,
-  including 16 checkpoint pairs and 288 collective events spanning all three
-  execution phases. The base tracer was also validated on H100: Draco job
-  `10430400` passed 19/19 focused tests per rank and job `10430403` matched all
-  1,392 events across 16 shards, including 32 checkpoint pairs. Exact H100
-  confirmation of the collective extension remains pending. Every completed
-  model run reported byte-identical recompute outputs.
+  identity instead of PP/VPP arrival order. The final 22-test focused suite
+  passed on every rank in AWS-DFW GB200 job `517022`, AWS-CMH GB300 job `696943`,
+  and Draco H100 job `10430851`. Two independent DSV3-style TP2×EP2 launches
+  matched all 984 events on GB200 (`516924`) and all 1,968 events on H100
+  (`10430682`), including exact all-to-all fingerprints in forward, recompute,
+  and backward. AWS-DFW job `517040` then exercised PP2×VPP2×EP2 with overlapped
+  P2P and matched all 2,320 events across 8 rank/iteration shards, including 384
+  P2P boundary events. Every completed model run reported byte-identical
+  recompute outputs.
 - **E2E full-recipe (WS2 Tier B — pending):** the real nemotron-3-ultra recipe
   lives in **Megatron-Bridge** (`zhiyul/nemotron-3-ultra-perf-recipe`); the
   weekly multi-node e2e + wandb dashboard is the remaining tier — it is the only
@@ -210,11 +209,11 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    the structured runtime trace now covers phase ordering, Megatron recompute
    identity, optimizer boundary scalars, exact wgrad/parameter hashes, runtime
    library/env settings, allocator backend, and MoE EP all-to-all inputs and
-   outputs. Pipeline P2P and TP/DP reduction/gather payloads, optimizer moment
-   state, TE FP8/FP4 recompute, and actual selected kernel identities are still
-   missing. DSV3's known EP>16 + PP/VPP divergence therefore still needs the
-   scaled e2e recipe plus the remaining collective instrumentation to localize
-   fully.
+   outputs plus pipeline P2P sends/receives. TP/DP reduction/gather payloads,
+   optimizer moment state, TE FP8/FP4 recompute, and actual selected kernel
+   identities are still missing. DSV3's known EP>16 + PP/VPP divergence
+   therefore still needs the scaled e2e recipe plus the remaining collective
+   instrumentation to localize fully.
 ## 9. References
 
 - Determinism roadmap & meeting notes (internal Google Docs).
