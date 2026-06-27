@@ -60,6 +60,9 @@ class TrainingConfig:
     determinism_trace_tensor_hashes: bool = False
     """Include exact tensor byte hashes in determinism traces. This synchronizes device tensors."""
 
+    determinism_trace_optimizer_state: bool = False
+    """Include exact local optimizer parameter and state hashes before and after each traced step."""
+
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 

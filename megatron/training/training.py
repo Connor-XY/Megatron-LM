@@ -138,6 +138,7 @@ from megatron.core.determinism_trace import (
     EventKind,
     active_trace,
     record_event,
+    record_optimizer_state,
     record_tensor,
     trace_iteration,
     trace_tensor_hashes_enabled,
@@ -2358,9 +2359,13 @@ def _train_step(
 
     record_event(EventKind.OPTIMIZER, "optimizer.begin")
     _record_optimizer_boundary_tensors(model, "main_grad", "optimizer.input.wgrad")
+    if getattr(args, "determinism_trace_optimizer_state", False):
+        record_optimizer_state("optimizer.input.state", optimizer)
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     _record_optimizer_boundary_tensors(model, "data", "optimizer.output.param")
+    if getattr(args, "determinism_trace_optimizer_state", False):
+        record_optimizer_state("optimizer.output.state", optimizer)
     if active_trace() is not None:
         record_event(
             EventKind.OPTIMIZER,

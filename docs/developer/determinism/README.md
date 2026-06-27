@@ -86,7 +86,8 @@ tool adds no collectives or cross-rank ordering constraints:
 pretrain_gpt.py ... \
   --determinism-trace-dir /path/to/run-a \
   --determinism-trace-interval 100 \
-  --determinism-trace-tensor-hashes
+  --determinism-trace-tensor-hashes \
+  --determinism-trace-optimizer-state
 ```
 
 The trace records determinism-relevant runtime configuration, forward/backward
@@ -100,7 +101,12 @@ or distributed wait. Exact hashing copies device tensors to the CPU and
 synchronizes execution; use it only for targeted debug iterations because those
 synchronizations can perturb communication overlap. Without that flag, phase,
 checkpoint, and collective tensor metadata remain available without the byte
-copies; optimizer boundary tensors are omitted.
+copies; optimizer boundary tensors are omitted. The additional
+`--determinism-trace-optimizer-state` flag records local main parameters and
+direct tensor/scalar optimizer state entries before and after the step, keyed by
+stable optimizer, parameter-group, and parameter ordinals. It requires exact
+tensor hashes and is deliberately separate because hashing Adam moments roughly
+triples the optimizer-state bytes copied to the CPU.
 
 An `iteration.end` event reports `pending_collectives`. A nonzero value means a
 collective launched inside the selected window but completed after it; the late
@@ -119,9 +125,9 @@ invalid input. Use `--json` for automation. The current integration covers the
 Megatron tensor-parallel activation-checkpoint implementation, optimizer
 inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, pipeline
 P2P sends/receives, DP all-reduce/reduce-scatter, and distributed-optimizer
-parameter all-gather. TP reduction/gather payloads, TE FP8/FP4 recompute,
-optimizer moment state, and actual selected kernel identities remain follow-up
-instrumentation surfaces.
+parameter all-gather, plus opt-in local optimizer main parameters and moment
+state. TP reduction/gather payloads, TE FP8/FP4 recompute, and actual selected
+kernel identities remain follow-up instrumentation surfaces.
 
 For a scaled model run, use the stricter certifier instead of relying on a trace
 comparison alone:

@@ -1314,9 +1314,15 @@ def validate_args(args, defaults={}):
     if args.determinism_trace_dir is not None:
         assert args.determinism_trace_interval is not None
         assert args.determinism_trace_interval > 0
+        if args.determinism_trace_optimizer_state:
+            assert args.determinism_trace_tensor_hashes, (
+                "--determinism-trace-optimizer-state requires "
+                "--determinism-trace-tensor-hashes"
+            )
     else:
         assert args.determinism_trace_interval is None
         assert not args.determinism_trace_tensor_hashes
+        assert not args.determinism_trace_optimizer_state
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.

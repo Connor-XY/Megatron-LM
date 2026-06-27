@@ -213,7 +213,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
 - **Typed runtime trace (added):** `megatron/core/determinism_trace.py` writes a
   versioned, rank-sharded semantic event stream for selected iterations.
   `train_step` records forward/backward and optimizer boundaries plus optional
-  exact named wgrad/updated-parameter hashes; Megatron activation checkpointing
+  exact named wgrad/updated-parameter hashes. An additional opt-in records local
+  main parameters and direct tensor/scalar optimizer state before and after the
+  step using stable optimizer/group/parameter ordinals, localizing Adam moment
+  divergence without adding communication. Megatron activation checkpointing
   records paired forward/recompute fingerprints and reports their within-run
   identity. The shared MoE all-to-all wrapper records semantically named
   dispatch/combine inputs and outputs in original forward, activation
@@ -240,7 +243,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
   job `517130`, GB300 job `697037`, and H100 job `10431044`. AWS-DFW job `517136`
   matched 1,352/1,352 events across two distributed-optimizer runs, including 48
   DP boundary events and zero pending collectives. Every completed model run
-  reported byte-identical recompute outputs.
+  reported byte-identical recompute outputs. HSG job `3616865` passed the
+  expanded 18-test trace file on every rank, including CUDA hashing of optimizer
+  parameters and moments (log SHA256 `305373558100…`); final chained-optimizer
+  coverage passed 2/2 focused tests per rank in job `3616898` (log SHA256
+  `d9ff9c57175a…`).
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by
@@ -479,10 +486,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
    identity, optimizer boundary scalars, exact wgrad/parameter hashes, runtime
    library/env settings, allocator backend, and MoE EP all-to-all inputs and
    outputs, pipeline P2P sends/receives, DP gradient reduction, and distributed-
-   optimizer parameter gather. TP reduction/gather payloads, optimizer moment
-   state, TE FP8/FP4 recompute, and actual selected kernel identities are still
-   missing. Native floating-point TP reductions and the non-distributed-optimizer
-   DP all-reduce also lack topology-independent paths.
+   optimizer parameter gather, and opt-in local optimizer parameters and moment
+   state. TP reduction/gather payloads, TE FP8/FP4 recompute, and actual selected
+   kernel identities are still missing. Native floating-point TP reductions and
+   the non-distributed-optimizer DP all-reduce also lack topology-independent
+   paths.
 
 ## 9. References
 

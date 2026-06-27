@@ -393,6 +393,40 @@ def record_tensor(name: str, tensor: torch.Tensor, **payload: Any) -> None:
             )
 
 
+def record_optimizer_state(name: str, optimizer: Any) -> None:
+    """Record exact local optimizer parameters and state using stable ordinals."""
+    trace = active_trace()
+    if trace is None or not trace.hash_tensors:
+        return
+
+    optimizer_instances = getattr(optimizer, "chained_optimizers", None) or [optimizer]
+    for optimizer_index, optimizer_instance in enumerate(optimizer_instances):
+        if getattr(optimizer_instance, "is_stub_optimizer", False):
+            continue
+        param_groups = getattr(optimizer_instance, "param_groups", None)
+        optimizer_state = getattr(optimizer_instance, "state", None)
+        if param_groups is None or optimizer_state is None:
+            continue
+        for group_index, param_group in enumerate(param_groups):
+            for param_index, param in enumerate(param_group["params"]):
+                if not isinstance(param, torch.Tensor):
+                    continue
+                prefix = (
+                    f"{name}/optimizer{optimizer_index}/group{group_index}/param{param_index}"
+                )
+                record_tensor(f"{prefix}/main_param", param)
+                scalar_state = {}
+                for state_name, state_value in sorted(
+                    optimizer_state.get(param, {}).items(), key=lambda item: str(item[0])
+                ):
+                    if isinstance(state_value, torch.Tensor):
+                        record_tensor(f"{prefix}/{state_name}", state_value)
+                    elif state_value is None or isinstance(state_value, (bool, int, float, str)):
+                        scalar_state[str(state_name)] = state_value
+                if scalar_state:
+                    record_event(EventKind.OPTIMIZER, f"{prefix}/scalars", scalar_state)
+
+
 def begin_collective_trace(
     name: str,
     operation: str,

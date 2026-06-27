@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from megatron.core.determinism_trace import (
     begin_recompute_trace,
     record_collective_result,
     record_event,
+    record_optimizer_state,
     record_recompute_phase,
     record_tensor,
     trace_iteration,
@@ -105,6 +107,46 @@ def test_nonfinite_payloads_remain_valid_json(tmp_path):
     events = _read_events(_trace_path(tmp_path, 5))
     optimizer = next(event for event in events if event["name"] == "optimizer.end")
     assert optimizer["payload"]["grad_norm"] == "nan"
+
+
+def test_optimizer_state_trace_records_exact_tensor_state(tmp_path):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0], device=device))
+    optimizer = torch.optim.Adam([parameter], lr=0.1)
+    parameter.grad = torch.tensor([0.25, 0.5], device=device)
+    optimizer.step()
+    optimizer.state[parameter]["integer_step"] = 1
+    chained_optimizer = SimpleNamespace(chained_optimizers=[optimizer])
+
+    with trace_iteration(tmp_path, 15, hash_tensors=True):
+        record_optimizer_state("optimizer.output.state", chained_optimizer)
+
+    events = _read_events(_trace_path(tmp_path, 15))
+    tensor_state_events = [
+        event
+        for event in events
+        if event["kind"] == "tensor"
+        and event["name"].startswith("optimizer.output.state/")
+    ]
+    assert {event["name"].rsplit("/", 1)[-1] for event in tensor_state_events} == {
+        "main_param",
+        "step",
+        "exp_avg",
+        "exp_avg_sq",
+    }
+    assert all(len(event["payload"]["sha256"]) == 64 for event in tensor_state_events)
+    scalar_event = next(event for event in events if event["name"].endswith("/scalars"))
+    assert scalar_event["payload"] == {"integer_step": 1}
+
+
+def test_optimizer_state_trace_requires_tensor_hashes(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    with trace_iteration(tmp_path, 16):
+        record_optimizer_state("optimizer.output.state", optimizer)
+
+    events = _read_events(_trace_path(tmp_path, 16))
+    assert not any(event["name"].startswith("optimizer.output.state/") for event in events)
 
 
 def test_collective_trace_records_semantic_input_and_output(tmp_path):
