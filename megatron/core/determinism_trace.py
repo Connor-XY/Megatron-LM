@@ -95,6 +95,7 @@ class _CollectiveTraceWork:
         self._recorded = False
 
     def wait(self, *args, **kwargs):
+        """Wait for the underlying work and record completed outputs once."""
         result = self._work.wait(*args, **kwargs)
         if result is not False and not self._recorded:
             for handle, outputs in self._results:
@@ -122,6 +123,7 @@ def _distributed_rank() -> int:
 
 
 def _callable_name(function: Any) -> str:
+    """Return a stable module-qualified name for a traced callable."""
     module = getattr(function, "__module__", None)
     name = getattr(function, "__qualname__", type(function).__qualname__)
     return f"{module}.{name}" if module else name
@@ -131,7 +133,10 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     value = tensor.detach()
     if value.layout != torch.strided:
         value = value.to_dense()
-    value = value.cpu().contiguous()
+    # A size-one expanded tensor can report contiguous while retaining a zero
+    # stride, which prevents byte reinterpretation. Materialize canonical dense
+    # storage before hashing every strided layout.
+    value = value.cpu().clone(memory_format=torch.contiguous_format)
     return value.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
@@ -411,9 +416,7 @@ def record_optimizer_state(name: str, optimizer: Any) -> None:
             for param_index, param in enumerate(param_group["params"]):
                 if not isinstance(param, torch.Tensor):
                     continue
-                prefix = (
-                    f"{name}/optimizer{optimizer_index}/group{group_index}/param{param_index}"
-                )
+                prefix = f"{name}/optimizer{optimizer_index}/group{group_index}/param{param_index}"
                 record_tensor(f"{prefix}/main_param", param)
                 scalar_state = {}
                 for state_name, state_value in sorted(

@@ -23,7 +23,15 @@ from megatron.core.determinism_trace import (
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_pipeline_model_parallel_group
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.tensor_parallel.mappings import all_to_all
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+    all_to_all,
+    copy_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_last_dim_to_tensor_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.tensor_parallel.random import checkpoint
 from tests.unit_tests.distributed.test_param_and_grad_buffer import get_model_and_buffers
 from tests.unit_tests.test_utilities import Utils
@@ -69,6 +77,18 @@ def test_trace_writes_versioned_rank_local_events_and_tensor_hash(tmp_path):
     assert len(tensor_event["payload"]["sha256"]) == 64
     assert events[-1]["name"] == "iteration.end"
     assert active_trace() is None
+
+
+def test_trace_hashes_size_one_zero_stride_tensor(tmp_path):
+    tensor = torch.as_strided(torch.tensor([1.0]), size=(1,), stride=(0,))
+    assert tensor.stride() == (0,)
+
+    with trace_iteration(tmp_path, 19, hash_tensors=True):
+        record_tensor("zero_stride", tensor)
+
+    events = _read_events(_trace_path(tmp_path, 19))
+    tensor_event = next(event for event in events if event["name"] == "zero_stride")
+    assert len(tensor_event["payload"]["sha256"]) == 64
 
 
 def test_recompute_trace_reports_forward_identity(tmp_path):
@@ -125,8 +145,7 @@ def test_optimizer_state_trace_records_exact_tensor_state(tmp_path):
     tensor_state_events = [
         event
         for event in events
-        if event["kind"] == "tensor"
-        and event["name"].startswith("optimizer.output.state/")
+        if event["kind"] == "tensor" and event["name"].startswith("optimizer.output.state/")
     ]
     assert {event["name"].rsplit("/", 1)[-1] for event in tensor_state_events} == {
         "main_param",
@@ -279,6 +298,152 @@ def test_all_to_all_autograd_records_forward_and_backward(tmp_path):
         assert all(event["payload"]["async_op"] is True for event in async_collective)
         torch.testing.assert_close(async_output, expected)
         torch.testing.assert_close(async_values.grad, torch.ones_like(async_values))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_tensor_parallel_collective_trace_records_forward_and_backward(tmp_path):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+    try:
+        group = torch.distributed.group.WORLD
+        world_size = group.size()
+        rank = group.rank()
+
+        with trace_iteration(tmp_path, 17, hash_tensors=True):
+            reduce_values = torch.tensor(
+                [rank + 1], dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            reduced = reduce_from_tensor_model_parallel_region(reduce_values, group=group)
+            reduced.sum().backward()
+
+            copy_values = torch.tensor(
+                [rank + 1], dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            copied = copy_to_tensor_model_parallel_region(copy_values, group=group)
+            copied.sum().backward()
+
+            gather_last_values = (
+                torch.tensor([rank, rank + world_size], dtype=torch.float32, device="cuda")
+                .reshape(2, 1)
+                .requires_grad_()
+            )
+            gathered_last = all_gather_last_dim_from_tensor_parallel_region(
+                gather_last_values, group=group
+            )
+            gathered_last.sum().backward()
+
+            reduce_scatter_last_values = (
+                torch.arange(2 * world_size, dtype=torch.float32, device="cuda")
+                .reshape(2, world_size)
+                .requires_grad_()
+            )
+            reduced_scatter_last = reduce_scatter_last_dim_to_tensor_parallel_region(
+                reduce_scatter_last_values, group=group
+            )
+            reduced_scatter_last.sum().backward()
+
+            gather_first_values = torch.tensor(
+                [[rank, rank + world_size]], dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            gathered_first = gather_from_sequence_parallel_region(gather_first_values, group=group)
+            gathered_first.sum().backward()
+
+            reduce_scatter_first_values = (
+                torch.arange(2 * world_size, dtype=torch.float32, device="cuda")
+                .reshape(world_size, 2)
+                .requires_grad_()
+            )
+            reduced_scatter_first = reduce_scatter_to_sequence_parallel_region(
+                reduce_scatter_first_values, group=group
+            )
+            reduced_scatter_first.sum().backward()
+
+        expected_sum = world_size * (world_size + 1) / 2
+        torch.testing.assert_close(reduced, torch.tensor([expected_sum], device="cuda"))
+        torch.testing.assert_close(copy_values.grad, torch.full_like(copy_values, world_size))
+        expected_gather_last = torch.stack(
+            (
+                torch.arange(world_size, dtype=torch.float32, device="cuda"),
+                torch.arange(world_size, dtype=torch.float32, device="cuda") + world_size,
+            )
+        )
+        torch.testing.assert_close(gathered_last, expected_gather_last)
+        torch.testing.assert_close(
+            gather_last_values.grad, torch.full_like(gather_last_values, world_size)
+        )
+        torch.testing.assert_close(
+            reduce_scatter_last_values.grad, torch.ones_like(reduce_scatter_last_values)
+        )
+        expected_gather_first = torch.stack(
+            (
+                torch.arange(world_size, dtype=torch.float32, device="cuda"),
+                torch.arange(world_size, dtype=torch.float32, device="cuda") + world_size,
+            ),
+            dim=1,
+        )
+        torch.testing.assert_close(gathered_first, expected_gather_first)
+        torch.testing.assert_close(
+            gather_first_values.grad, torch.full_like(gather_first_values, world_size)
+        )
+        torch.testing.assert_close(
+            reduce_scatter_first_values.grad, torch.ones_like(reduce_scatter_first_values)
+        )
+
+        events = _read_events(_trace_path(tmp_path, 17))
+        collective = [event for event in events if event["kind"] == "collective"]
+        expected_names = [
+            "tensor_parallel.all_reduce.forward",
+            "tensor_parallel.all_reduce.backward",
+            "tensor_parallel.all_gather_last_dim.forward",
+            "tensor_parallel.reduce_scatter_last_dim.backward",
+            "tensor_parallel.reduce_scatter_last_dim.forward",
+            "tensor_parallel.all_gather_last_dim.backward",
+            "tensor_parallel.all_gather_first_dim.forward",
+            "tensor_parallel.reduce_scatter_first_dim.backward",
+            "tensor_parallel.reduce_scatter_first_dim.forward",
+            "tensor_parallel.all_gather_first_dim.backward",
+        ]
+        assert [event["name"] for event in collective] == [
+            f"{name}.{edge}" for name in expected_names for edge in ("begin", "end")
+        ]
+        assert all(event["payload"]["group_size"] == world_size for event in collective)
+        assert all(event["payload"]["group_rank"] == rank for event in collective)
+        assert all(
+            (event["payload"].get("inputs") or event["payload"].get("outputs"))[0]["sha256"]
+            for event in collective
+        )
+        assert events[-1]["payload"]["pending_collectives"] == 0
+
+        checkpointed_values = torch.tensor(
+            [rank], dtype=torch.float32, device="cuda", requires_grad=True
+        )
+        with trace_iteration(tmp_path, 18, hash_tensors=True):
+            checkpointed_output = checkpoint(
+                lambda tensor: all_gather_last_dim_from_tensor_parallel_region(tensor, group=group),
+                False,
+                checkpointed_values,
+            )
+            checkpointed_output.sum().backward()
+
+        checkpointed_events = _read_events(_trace_path(tmp_path, 18))
+        checkpointed_collective = [
+            event for event in checkpointed_events if event["kind"] == "collective"
+        ]
+        assert [event["name"] for event in checkpointed_collective] == [
+            "tensor_parallel.all_gather_last_dim.forward.begin",
+            "tensor_parallel.all_gather_last_dim.forward.end",
+            "tensor_parallel.all_gather_last_dim.recompute.begin",
+            "tensor_parallel.all_gather_last_dim.recompute.end",
+            "tensor_parallel.reduce_scatter_last_dim.backward.begin",
+            "tensor_parallel.reduce_scatter_last_dim.backward.end",
+        ]
+        torch.testing.assert_close(
+            checkpointed_output, torch.arange(world_size, dtype=torch.float32, device="cuda")
+        )
+        torch.testing.assert_close(
+            checkpointed_values.grad, torch.full_like(checkpointed_values, world_size)
+        )
     finally:
         Utils.destroy_model_parallel()
 

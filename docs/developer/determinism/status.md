@@ -224,9 +224,12 @@ small set of reductions and dispatch choices. They are fully enumerated in
   receives at the schedule's existing synchronous, batched, or overlapped wait
   boundary without adding communication or an extra wait. DP bucket tracing
   covers synchronous/overlapped all-reduce and reduce-scatter plus synchronous/
-  overlapped distributed-optimizer parameter all-gather. Rank-process visibility
-  captures autograd-worker launches; `iteration.end.pending_collectives` reports
-  operations that outlive the selected window instead of writing to a closed trace.
+  overlapped distributed-optimizer parameter all-gather. Standard synchronous TP
+  mapping collectives now fingerprint all-reduce and first/last-dimension
+  all-gather/reduce-scatter payloads with explicit forward, recompute, and
+  backward identities. Rank-process visibility captures autograd-worker
+  launches; `iteration.end.pending_collectives` reports operations that outlive
+  the selected window instead of writing to a closed trace.
   `tools/determinism/compare_traces.py` aligns rank traces by semantic event
   identity instead of PP/VPP arrival order. `certify_traces.py` additionally
   enforces rank/iteration coverage, deterministic runtime state, recompute
@@ -247,7 +250,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
   expanded 18-test trace file on every rank, including CUDA hashing of optimizer
   parameters and moments (log SHA256 `305373558100…`); final chained-optimizer
   coverage passed 2/2 focused tests per rank in job `3616898` (log SHA256
-  `d9ff9c57175a…`).
+  `d9ff9c57175a…`). HSG job `3617018` then passed the focused synchronous TP
+  collective trace on all four ranks (log SHA256 `7a02f8827841…`), and job
+  `3617133` passed the final-source 20-test trace file on every rank (log SHA256
+  `fcd4b95dcd5b…`). Two-node job `3617143` also passed all seven legacy TP
+  mapping tests on all eight ranks (log SHA256 `68688420008b…`).
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by
@@ -486,11 +493,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
    identity, optimizer boundary scalars, exact wgrad/parameter hashes, runtime
    library/env settings, allocator backend, and MoE EP all-to-all inputs and
    outputs, pipeline P2P sends/receives, DP gradient reduction, and distributed-
-   optimizer parameter gather, and opt-in local optimizer parameters and moment
-   state. TP reduction/gather payloads, TE FP8/FP4 recompute, and actual selected
-   kernel identities are still missing. Native floating-point TP reductions and
-   the non-distributed-optimizer DP all-reduce also lack topology-independent
-   paths.
+   optimizer parameter gather, synchronous TP mapping reduction/gather payloads,
+   and opt-in local optimizer parameters and moment state. Async TP overlap
+   payloads, TE FP8/FP4 recompute, and actual selected kernel identities are
+   still missing. Native floating-point TP reductions and the non-distributed-
+   optimizer DP all-reduce also lack topology-independent paths.
 
 ## 9. References
 
