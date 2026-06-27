@@ -515,13 +515,11 @@ def unpermute(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
+        # index_add accumulates into the already-zeroed output_tokens above; it is
+        # deterministic when torch.use_deterministic_algorithms(True) is set and is
+        # CUDA graph compatible unlike scatter_add. The allocation above already
+        # covers both branches, so a second torch.zeros would redundantly allocate
+        # and fill the destination in deterministic mode.
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
         # Scatter add the permuted_input back to the original positions
