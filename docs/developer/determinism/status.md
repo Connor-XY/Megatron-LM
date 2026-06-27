@@ -255,7 +255,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
   current-source profile `521407`, the fused CE backward removes both CE
   backward indexed writes and improves `_VocabParallelCrossEntropyBackward`
   from 1.257 to 0.749 ms (-40.4%). The six residual writes are four small CE
-  forward masks and two gather-backward writes.
+  forward masks and two gather-backward writes. The attribution tool now also
+  canonicalizes sequence/operator IDs and aggregates large match sets by a
+  selectable parent depth. On the same profile it reduces 802 `aten::fill_`
+  events (16.767 ms) to ranked groups; at depth 2 the leading groups are
+  `empty_like` (14.0%), `_to_copy` (12.0%), and `zeros` (8.6%), showing that the
+  aggregate fill delta is distributed rather than one removable allocation.
+  AWS-DFW job `522195` passes all six attribution-tool tests.
 - **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
   `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
   two-launch comparison matched 6,080/6,080 semantic events, and the two
@@ -328,6 +334,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
   improves the median-of-leg medians 66.475→64.675 ms (-2.7%); both order pairs
   improve and all loss, sequence-aux-loss, and grad-norm values match. The
   measured-slower forward `where` candidate is not applied.
+- **Vocab-embedding backward experiment (rejected):** AWS-DFW job `521744`
+  compares the current deterministic direct-index backward with a stable-sort,
+  fixed-order segmented reduction across 12 shape, dtype, and duplicate-token
+  cells. Every output and weight gradient is byte-exact, but the candidate is
+  only 0.61–0.69× as fast. The source remains `weight[masked_input]`; the older
+  dense/Hopper `IndexBackward0` hotspot should be refreshed before another
+  implementation is attempted.
 - **Full Megatron-Bridge evidence (not yet a gate):** branch
   `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus

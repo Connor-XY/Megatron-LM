@@ -154,6 +154,21 @@ Parents are listed nearest-first. Containing ranges overlap by definition, so
 their durations are attribution context and must not be added together. Use
 `--json` to retain the complete machine-readable report.
 
+Broad operators such as allocator fills can match hundreds of ranges. Aggregate
+them by a canonicalized enclosing range, select the useful ancestor level, and
+print only the largest groups:
+
+```bash
+python tools/determinism/attribute_nsys_ranges.py \
+  /shared/profiles/nemotron-rank0.sqlite 'aten::fill_' \
+  --summary --parent-depth 2 --top 20
+```
+
+`--parent-depth 1` is the nearest enclosing range. Sequence and operator IDs
+are removed before grouping, so repeated invocations share one row. Every
+matched range contributes to exactly one group; unlike nested parent durations,
+the grouped matched durations can be compared and summed.
+
 ## Benchmark the deterministic data-parallel reduction
 
 Use the distributed microbenchmark to compare the native NCCL reduce-scatter
