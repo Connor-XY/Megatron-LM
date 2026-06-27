@@ -81,6 +81,16 @@ class DistributedDataParallel(_BaseDataParallel):
         # Assign all required process groups
         self.dp_group = process_group_dict['dp_group']
         self.dp_cp_group = process_group_dict['dp_cp_group']
+        self.det_dp_hierarchy = process_group_dict['det_dp_hierarchy']
+        if self.ddp_config.reduce_scatter_hierarchical_group_size is not None:
+            assert self.det_dp_hierarchy is not None and len(self.det_dp_hierarchy) == 2
+            assert (
+                self.det_dp_hierarchy[0].size()
+                == self.ddp_config.reduce_scatter_hierarchical_group_size
+            )
+            assert self.det_dp_hierarchy[0].size() * self.det_dp_hierarchy[1].size() == (
+                self.dp_cp_group.size()
+            )
         self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
         self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
@@ -250,6 +260,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                hierarchical_reduce_scatter_groups=(
+                    None if buffer_key.is_expert_parallel else self.det_dp_hierarchy
+                ),
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)

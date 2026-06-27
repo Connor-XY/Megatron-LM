@@ -60,10 +60,15 @@ Profiling attributes most of the gap to a handful of ops — see
 [`op-catalog.md`](./op-catalog.md) "Hotspots". The headline offenders from the
 det-vs-nondet nsys leaderboard are `aten::fill_`, `aten::empty`,
 `aten::index_put_`, `scatter_add`, and `cub::DeviceRadixSort` (MoE top-k path).
-On this branch, a same-allocation Nemotron EP32 proxy now measures **+10.2%**
-(79.9 vs 72.5 ms median): ordered fp32 DP reduction contributes +3.6%, while
-the remaining deterministic TE/MoE branches contribute about +6.4%. Paired
-Mamba workspace/config attribution shows no measurable Mamba slowdown.
+An earlier same-allocation Nemotron EP32 proxy measured **+10.2%** (79.9 vs
+72.5 ms median): ordered fp32 DP reduction contributed +3.6%. With the
+production hierarchy, job `520235` measures 55.4 ms for hierarchical-DP-only
+versus 55.6 ms native and 57.8 ms flat-DP-only, closing the measured DP penalty.
+Full deterministic mode with the hierarchy is 66.4 ms (**+19.4%**) on that
+allocation, so the remaining and currently allocation-sensitive gap is in the
+deterministic TE/MoE branches rather than Mamba or DP reduction. Direct
+full-mode A/B job `520311` confirms that conclusion: flat deterministic is
+66.5 ms and hierarchical deterministic is 66.7 ms on the same placement.
 
 ## 4. Control plane — how determinism is turned on
 
@@ -230,6 +235,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
   early `pretrain_hybrid.py` bootstrap. The final 48-test focused suite passed
   on every rank in AWS-DFW GB200 job `519253` and AWS-CMH GB300 job `697567`.
   HSG login timed out during both verification attempts.
+- **Production hierarchical DP certification:** the fixed-logical-rank hierarchy
+  is now wired through production DDP and exercised with asynchronous gradient
+  overlap. DSV3 EP32 jobs `520170`/`520203` matched 6,080/6,080 events across
+  independent allocations; Nemotron EP32 jobs `520171`/`520204` matched
+  9,664/9,664. The strict reports require the hierarchical fp32 path for every
+  multi-rank DP reduction and report zero missing reductions, zero pending
+  collectives, and zero semantic divergences. Single-rank expert-DP reductions
+  remain on the flat path because they perform no inter-rank reduction.
 - **Full Megatron-Bridge evidence (not yet a gate):** branch
   `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
@@ -243,17 +256,18 @@ small set of reductions and dispatch choices. They are fully enumerated in
 1. **Scaled evidence is not yet CI-gated.** The EP32 MCore certificates close the
    immediate coverage gap, but the full Bridge recipe still needs a weekly gate,
    retained artifacts, and a same-mode control at 192/3,072 GPUs.
-2. **The production perf target is not fully closed.** The paired Nemotron EP32
-   proxy is now +10.2%, with +3.6% from cross-domain ordered DP reduction and
-   about +6.4% from the remaining TE/MoE deterministic branches. Mamba's fixed
-   config/workspaces show no measurable slowdown in the paired attribution. A
-   fixed-logical-rank hierarchical reduction prototype halves the isolated
-   cross-domain ordered latency (1.117 ms versus 2.249 ms in the exact-hash
-   run). It matches exact output hashes across single- and cross-domain
-   allocations on all 32 ranks; native NCCL differs on 32/32. The tradeoff is
-   0.605 ms versus 0.452 ms for the current ordered path on one NVL72 domain.
-   It is not yet wired into DDP or certified end to end. Each optimization must
-   retain the two-allocation certificate.
+2. **The production perf target is not fully closed.** The production
+   fixed-logical-rank hierarchy removes the measured DP penalty in job `520235`:
+   hierarchical-DP-only is 55.4 ms versus 55.6 ms native and 57.8 ms flat
+   ordered. It is exact across independent DSV3 and Nemotron allocations. Full
+   deterministic mode remains +16–19% in jobs `520235`/`520311`; the direct
+   full-mode A/B is 66.5 ms flat versus 66.7 ms hierarchical. The exposed DP
+   improvement is hidden by communication overlap, which moves the primary
+   target to the deterministic TE/MoE kernel set. Mamba's fixed
+   config/workspaces show no measurable slowdown in the paired attribution. The
+   hierarchy also increases peak allocated memory in this proxy by about 140
+   MiB because it materializes the locally permuted send buffer. Each further
+   optimization must retain the two-allocation certificate.
 3. **First-divergence tooling still has uncovered runtime surfaces.**
    `compare_dumps.py` localizes existing activation/param/wgrad/dgrad dumps, and
    the structured runtime trace now covers phase ordering, Megatron recompute

@@ -101,16 +101,19 @@ python tools/determinism/certify_traces.py \
   --expected-iterations 2 \
   --require-collective-prefix moe.ep_ \
   --require-collective-prefix data_parallel. \
-  --require-dp-fp32-accumulation
+  --require-dp-fp32-accumulation \
+  --require-dp-hierarchical-fp32-accumulation
 ```
 
 `certify_traces.py` checks both trees independently before comparing them. It
 requires deterministic runtime state, the requested rank/iteration/file counts,
 matching activation recomputes, completed collective output hashes, zero pending
 collectives, the requested semantic collective surfaces, and (optionally) the
-ordered fp32 data-parallel reduction path. Exit code 0 is a certificate, 1 is a
-failed invariant or cross-run divergence, and 2 is invalid input. Use `--json`
-to retain the complete evidence report.
+ordered fp32 and hierarchical multi-rank data-parallel reduction paths.
+Single-rank reductions are excluded from the hierarchy requirement because they
+perform no inter-rank reduction. Exit code 0 is a certificate, 1 is a failed
+invariant or cross-run divergence, and 2 is invalid input. Use `--json` to retain
+the complete evidence report.
 
 ## Benchmark the deterministic data-parallel reduction
 
@@ -136,12 +139,13 @@ SHA-256 hashes by rank. The benchmark synchronizes each sample and reports the
 slowest rank, so it measures isolated collective latency rather than
 communication/computation overlap in a training step.
 
-`--hierarchical-group-size` additionally evaluates a two-level deterministic
-candidate. It first sums fixed contiguous logical-rank groups, then sums those
-partials in fixed group order; it does not choose a tree from measured timing.
-The candidate is currently a profiling tool, not the production DDP path. Its
-group size must divide the world size and should map the target recipe's logical
-DP ranks onto fast local communication domains.
+`--hierarchical-group-size` evaluates the same two-level deterministic path
+available to production DDP through
+`--ddp-reduce-scatter-hierarchical-group-size`. It first sums fixed contiguous
+logical-rank groups, then exchanges fp32 partials and sums them in fixed group
+order; it does not choose a tree from measured timing. The group size must
+divide the world size and should map the target recipe's logical DP ranks onto
+fast local communication domains. Keep that logical size fixed across runs.
 
 ## Maintenance
 

@@ -180,9 +180,13 @@ class _ParamAndGradBucketGroup:
         ddp_config: DistributedDataParallelConfig,
         collective_group: torch.distributed.ProcessGroup,
         collective_group_size: int,
+        hierarchical_reduce_scatter_groups: Optional[
+            Tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]
+        ] = None,
     ):
         self.buckets = buckets
         self.ddp_config = ddp_config
+        self.hierarchical_reduce_scatter_groups = hierarchical_reduce_scatter_groups
 
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
@@ -227,13 +231,21 @@ class _ParamAndGradBucketGroup:
             f"{self.ddp_config.use_distributed_optimizer=}",
         )
 
-        global dist_reduce_scatter_func
+        self._custom_dist_reduce_scatter_func = None
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
-            dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+            self._custom_dist_reduce_scatter_func = partial(
+                reduce_scatter_with_fp32_accumulation,
+                hierarchical_groups=self.hierarchical_reduce_scatter_groups,
+            )
             log_single_rank(
                 logger,
                 logging.INFO,
-                "Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation",
+                "Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation"
+                + (
+                    " with a fixed hierarchy"
+                    if self.hierarchical_reduce_scatter_groups is not None
+                    else ""
+                ),
             )
 
         # per_param_grad_ready_counts is a dict mapping parameters to number of times
@@ -702,7 +714,12 @@ class _ParamAndGradBucketGroup:
 
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
-        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
+        coalescing_context = (
+            nullcontext()
+            if self.hierarchical_reduce_scatter_groups is not None and not force_all_reduce
+            else _coalescing_manager(communication_group, async_ops=async_op)
+        )
+        with stream_context, coalescing_context as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
@@ -723,9 +740,15 @@ class _ParamAndGradBucketGroup:
                         async_op=async_op,
                         force_all_reduce=force_all_reduce,
                         fp32_accumulation=self.ddp_config.reduce_scatter_with_fp32_accumulation,
+                        hierarchical_fp32_accumulation=(
+                            self.hierarchical_reduce_scatter_groups is not None
+                        ),
                         reduce_op=str(reduce_op),
                     )
-                    grad_reduce_handle = dist_reduce_scatter_func(
+                    reduce_scatter_func = (
+                        self._custom_dist_reduce_scatter_func or dist_reduce_scatter_func
+                    )
+                    grad_reduce_handle = reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
@@ -1071,6 +1094,9 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         param_layout: Optional['PerBufferParamLayout'] = None,
+        hierarchical_reduce_scatter_groups: Optional[
+            Tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]
+        ] = None,
     ):
 
         if pg_collection is None:
@@ -1101,6 +1127,7 @@ class _ParamAndGradBuffer:
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
+        self.hierarchical_reduce_scatter_groups = hierarchical_reduce_scatter_groups
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -1674,7 +1701,11 @@ def partition_buckets(
             buckets.extend(buffer.buckets)
 
         bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
+            buckets,
+            ddp_config,
+            data_parallel_group,
+            data_parallel_world_size,
+            buffers[0].hierarchical_reduce_scatter_groups,
         )
         return [bucket_group]
 
@@ -1690,6 +1721,7 @@ def partition_buckets(
                         buffer.ddp_config,
                         buffer.data_parallel_group,
                         buffer.data_parallel_world_size,
+                        buffer.hierarchical_reduce_scatter_groups,
                     )
                 )
         return bucket_groups
@@ -1713,9 +1745,10 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
-                            buffer.data_parallel_group,
-                            buffer.data_parallel_world_size,
+                            fp8_buffer.ddp_config,
+                            fp8_buffer.data_parallel_group,
+                            fp8_buffer.data_parallel_world_size,
+                            fp8_buffer.hierarchical_reduce_scatter_groups,
                         )
                     )
                     if non_fp8_buckets:
@@ -1723,9 +1756,10 @@ def partition_buckets(
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
-                                    buffer.data_parallel_group,
-                                    buffer.data_parallel_world_size,
+                                    fp8_buffer.ddp_config,
+                                    fp8_buffer.data_parallel_group,
+                                    fp8_buffer.data_parallel_world_size,
+                                    fp8_buffer.hierarchical_reduce_scatter_groups,
                                 )
                             )
 
@@ -1738,9 +1772,10 @@ def partition_buckets(
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
-                    buffer.data_parallel_group,
-                    buffer.data_parallel_world_size,
+                    fp8_buffer.ddp_config,
+                    fp8_buffer.data_parallel_group,
+                    fp8_buffer.data_parallel_world_size,
+                    fp8_buffer.hierarchical_reduce_scatter_groups,
                 )
             )
         return bucket_groups

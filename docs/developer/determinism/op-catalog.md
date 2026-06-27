@@ -95,7 +95,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | floating-point NCCL collective | 🔵 | ordered fp32 reduce-scatter for deterministic distributed optimizer | native NCCL | deterministic args | code+**test** | hash tracing is debug-only | Native floating-point collectives are allocation-topology-sensitive even with Ring. Non-distributed-optimizer all-reduce remains a gap. |
-| fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | rank-indexed ordered fp32 sum | native RS | forced in deterministic distributed optimizer | code+**test** | isolated 32×GB200: single-domain **35–37% faster**, cross-domain **1.94–2.24× slower**; paired Nemotron proxy: **+3.6% step time** | One optimizer instance and no collective AVG are enforced. Final DSV3 EP32 jobs `518849`/`518850` matched across allocations. A fixed-rank hierarchical prototype halves cross-domain latency and preserves exact cross-topology hashes; production integration/end-to-end certification is pending. |
+| fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | flat rank order or fixed two-level logical-rank tree | native RS | forced in deterministic distributed optimizer; hierarchy is explicit | code+**test** | production hierarchy 1.324–1.346 ms vs flat ordered 3.110–3.118 ms and native 1.364–1.374 ms on 32×GB200 cross-domain | One optimizer instance and no collective AVG are enforced. With logical group size 4, DSV3 jobs `520170`/`520203` and Nemotron jobs `520171`/`520204` match exactly across allocations. Single-rank expert-DP reductions remain flat because no inter-rank reduction exists. |
 | Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | NCCL all-gather | 🟢 | rank-indexed byte copies | — | always | code+**test** | hash tracing is debug-only | No floating-point reduction; structured trace fingerprints sync and overlapped gathers without adding a collective or wait. |
 | Distributed optimizer param order | `optimizer/distrib_optimizer.py:1094` | shard mapping | 🟢 | "preserving deterministic ordering across ranks" | — | always | code | — | — |
 | Grad clip global norm | `optimizer/clip_grads.py`, `distributed/deterministic_collectives.py` | SUM reduction | 🔵 | rank-ordered all-gather + local sum | native all-reduce | deterministic algorithms | code+**test** | TBD | Closed a one-ulp scalar divergence that otherwise changed every optimizer parameter. Intended only for small statistics. |
@@ -152,6 +152,11 @@ script. Cluster-local artifacts are retained under:
 | hierarchical ordered RS, reverse order (GB200) | `519967`, 32 GPUs across `nvl72d036`/`nvl72d070` | `bench-det-rs-hier-rev-519967.out`, SHA256 `c8025fb9aa0f…` | hierarchical 1.144 ms; current ordered 2.329 ms; native 1.191 ms; same 9.54e-6 max delta to native |
 | hierarchical RS exact-hash cross-domain (GB200) | `520019`, 32 GPUs across `nvl72d039`/`nvl72d070` | `bench-det-rs-hier-rev-520019.out`, SHA256 `b5ce2fa2422f…` | hierarchical 1.117 ms; current ordered 2.249 ms; native 1.140 ms |
 | hierarchical RS exact-hash single-domain (GB200) | `520022`, 32 GPUs in `nvl72d039` | `bench-det-rs-hier-hash-520022.out`, SHA256 `de84be49e350…` | hierarchical 0.605 ms; current ordered 0.452 ms; native 0.801 ms; ordered and hierarchical hashes match `520019` on all ranks, native differs on 32/32 |
+| production hierarchical RS, both A/B orders (GB200) | `520160`, 32 GPUs across `nvl72d034`/`nvl72d039` | `bench-det-rs-prod-520160.out`, SHA256 `4ae4f06124c4…` | hierarchy 1.324–1.346 ms; flat ordered 3.110–3.118 ms; native 1.364–1.374 ms. Hierarchy and flat hashes each match independent job `520019` on 32/32 ranks; native differs on 32/32. |
+| production DSV3 hierarchy cross-allocation certificate | `520170` / `520203`, 32 GPUs each | `dsv3-hier-cross-allocation-520170-520203.json`, SHA256 `b782753fe098…` | 6,080/6,080 events exact; zero divergences; 64 multi-rank hierarchical DP reductions and zero missing per trace tree |
+| production Nemotron hierarchy cross-allocation certificate | `520171` / `520204`, 32 GPUs each | `nemotron-hier-cross-allocation-520171-520204.json`, SHA256 `c93842d47013…` | 9,664/9,664 events exact; zero divergences; 128 multi-rank hierarchical DP reductions and zero missing per trace tree |
+| production Nemotron hierarchy attribution (GB200) | `520235`, 32 GPUs across four NVL72 domains | `perf-nemotron-hierarchy-520235.out`, SHA256 `1e83b9582b2d…` | native 55.6 ms; flat-DP-only 57.8 ms (+4.0%); hierarchical-DP-only 55.4 ms (-0.4%); full deterministic with hierarchy 66.4 ms (+19.4%). Steady medians use iterations 6–14. |
+| full-deterministic flat/hierarchy A/B (GB200) | `520311`, same 32-GPU placement as `520235` | `perf-nemotron-full-pair-520311.out`, SHA256 `47fa84b65289…` | native 57.2 ms; full deterministic flat 66.5 ms (+16.3%); full deterministic hierarchy 66.7 ms (+16.6%, +0.3% vs flat). The exposed DP win is hidden by overlap in the full stack. |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -286,19 +291,45 @@ job's unused full-deterministic leg correctly rejected an intentionally retained
 `NVTE_ALLOW_NONDETERMINISTIC_ALGO=1`; the three completed Mamba legs precede
 that launcher error.
 
+### Measured — production hierarchical DP attribution (32×GB200)
+
+Job `520235` ran four 14-iteration modes serially on one four-domain
+allocation. Medians use steady iterations 6–14. The DP-only modes keep the fast
+kernel settings and change only the gradient reduce-scatter; the final mode
+enables the complete deterministic stack plus the production hierarchy.
+
+| mode | median step | delta vs native | attribution |
+| --- | --- | --- | --- |
+| fast kernels + native DP reduce-scatter | 55.6 ms | — | paired baseline |
+| fast kernels + flat ordered fp32 DP | 57.8 ms | **+4.0%** | previous deterministic DP path |
+| fast kernels + hierarchical ordered fp32 DP | 55.4 ms | **-0.4%** | production hierarchy closes the DP penalty within run noise |
+| full deterministic + hierarchical DP | 66.4 ms | **+19.4%** | remaining deterministic TE/MoE kernel cost |
+
+The hierarchy increases peak allocated memory from 3,284 to 3,424 MiB in this
+proxy because it materializes a locally permuted send buffer. The cross-
+allocation DSV3 and Nemotron certificates above verify that this speedup does
+not change the training trace across placements.
+
+Job `520311` then compared the full deterministic flat and hierarchical paths
+directly on the same node placement: native was 57.2 ms, flat deterministic was
+66.5 ms (+16.3%), and hierarchical deterministic was 66.7 ms (+16.6%). Thus the
+hierarchy removes the exposed DP-only penalty but does not improve full-stack
+step time in this proxy; gradient communication is overlapped beneath the
+remaining deterministic TE/MoE work.
+
 ### WS3 targets, by measured impact
 
-1. **Remaining deterministic TE/MoE kernel set** — about +4.8 ms in the paired
-   Nemotron proxy. Split grouped-GEMM/attention from scatter-add with GPU kernel
-   timing before changing another branch.
-2. **Cross-domain ordered fp32 reduce-scatter** — about +2.6 ms (+3.6% step
-   time) in the paired proxy and 1.94–2.24× native latency in isolated 32-GPU
-   tests. A fixed-logical-rank hierarchical candidate repeated at 1.117–1.153
-   ms cross-domain versus 2.249–2.329 ms for the current ordered path. Its
-   single-domain cost is 0.605 ms versus 0.452 ms current ordered. Across those
-   two topologies, both deterministic variants matched exact output hashes on
-   all 32 ranks while native NCCL differed on 32/32. Production DDP integration
-   and end-to-end certification are next.
+1. **Remaining deterministic TE/MoE kernel set** — about +9.5–10.8 ms
+   (+16–19%) in the paired Nemotron proxies after the DP penalty is removed.
+   Split grouped-GEMM/attention from scatter-add with GPU kernel timing before
+   changing another branch.
+2. **Cross-domain ordered fp32 reduce-scatter — closed for the EP32 proxies.**
+   The production fixed-logical-rank hierarchy reduces isolated latency from
+   3.110–3.118 ms to 1.324–1.346 ms in job `520160`, removes the paired step-time
+   penalty in the DP-only modes of job `520235`, and remains exact across
+   independent DSV3 and Nemotron allocations. Job `520311` shows no full-stack
+   speedup because communication is hidden by other deterministic kernels.
+   Retain the hierarchy as a performance and correctness gate.
 3. **Remaining deterministic scatter-add backward work** — `GatherBackward0`
    remains ≈+75 ms over 3 steps, and `IndexAddBackward0` remains det-only. The
    optimized index-select path closes its guarded slice, but top-k <4 and hidden

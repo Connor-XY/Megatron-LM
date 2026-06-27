@@ -73,6 +73,21 @@ def test_data_parallel_initializations(order):
     Utils.destroy_model_parallel()
 
 
+def test_deterministic_hierarchical_data_parallel_initialization():
+    if world_size < 4 or world_size % 2:
+        pytest.skip("requires an even world size of at least four")
+
+    Utils.initialize_model_parallel(deterministic_data_parallel_hierarchical_group_size=2)
+    groups = ps.get_deterministic_hierarchical_data_parallel_groups()
+    assert [group.size() for group in groups] == [2, world_size // 2]
+
+    collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['det_dp_hierarchy'])
+    assert collection.det_dp_hierarchy == groups
+
+    Utils.destroy_model_parallel()
+    assert ps.get_deterministic_hierarchical_data_parallel_groups(False) is None
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_tensor_model_parellel_world_size(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)

@@ -6,7 +6,15 @@ from tools.determinism.certify_traces import certify_trace_path, main
 
 
 def _write_trace(
-    root, *, rank=0, iteration=1, suffix="", matches_forward=True, pending=0, fp32_accumulation=True
+    root,
+    *,
+    rank=0,
+    iteration=1,
+    suffix="",
+    matches_forward=True,
+    pending=0,
+    fp32_accumulation=True,
+    hierarchical_fp32_accumulation=True,
 ):
     path = root / f"iter_{iteration:07d}" / f"rank_{rank:05d}{suffix}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,7 +44,11 @@ def _write_trace(
             "rank": rank,
             "kind": "collective",
             "name": "data_parallel.grad_reduce.bucket_0.begin",
-            "payload": {"fp32_accumulation": fp32_accumulation},
+            "payload": {
+                "fp32_accumulation": fp32_accumulation,
+                "hierarchical_fp32_accumulation": hierarchical_fp32_accumulation,
+                "group_size": 2,
+            },
         },
         {
             "schema_version": 1,
@@ -69,6 +81,7 @@ def test_certifies_complete_bit_exact_trace(tmp_path):
         expected_iterations=1,
         required_collective_prefixes=("data_parallel.",),
         require_dp_fp32_accumulation=True,
+        require_dp_hierarchical_fp32_accumulation=True,
     )
 
     assert report["equal"]
@@ -78,14 +91,23 @@ def test_certifies_complete_bit_exact_trace(tmp_path):
 
 
 def test_reports_recompute_pending_and_reduction_failures(tmp_path):
-    _write_trace(tmp_path, matches_forward=False, pending=1, fp32_accumulation=False)
+    _write_trace(
+        tmp_path,
+        matches_forward=False,
+        pending=1,
+        fp32_accumulation=False,
+        hierarchical_fp32_accumulation=False,
+    )
 
-    report = certify_trace_path(tmp_path, require_dp_fp32_accumulation=True)
+    report = certify_trace_path(
+        tmp_path, require_dp_fp32_accumulation=True, require_dp_hierarchical_fp32_accumulation=True
+    )
 
     assert not report["equal"]
     assert report["recompute_mismatches"] == 1
     assert report["pending_collectives"] == 1
     assert report["dp_grad_reductions_without_fp32_accumulation"] == 1
+    assert report["multi_rank_dp_grad_reductions_without_hierarchical_fp32_accumulation"] == 1
 
 
 def test_cli_compares_two_certified_trace_trees(tmp_path, capsys):

@@ -49,6 +49,7 @@ def certify_trace_path(
     expected_iterations: int | None = None,
     required_collective_prefixes: tuple[str, ...] = (),
     require_dp_fp32_accumulation: bool = False,
+    require_dp_hierarchical_fp32_accumulation: bool = False,
 ) -> dict[str, Any]:
     """Return a JSON-safe certification report for one trace directory."""
     trace_path = Path(trace_path)
@@ -163,6 +164,24 @@ def certify_trace_path(
             failures.append(
                 f"{len(dp_without_fp32)} data-parallel reductions did not use fp32 accumulation"
             )
+    multi_rank_dp_grad_begins = [
+        event for event in dp_grad_begins if event.get("payload", {}).get("group_size", 0) > 1
+    ]
+    multi_rank_dp_without_hierarchy = [
+        event
+        for event in multi_rank_dp_grad_begins
+        if event.get("payload", {}).get("hierarchical_fp32_accumulation") is not True
+    ]
+    if require_dp_hierarchical_fp32_accumulation:
+        if not dp_grad_begins:
+            failures.append("no data-parallel gradient-reduction events found")
+        elif not multi_rank_dp_grad_begins:
+            failures.append("no multi-rank data-parallel gradient-reduction events found")
+        elif multi_rank_dp_without_hierarchy:
+            failures.append(
+                f"{len(multi_rank_dp_without_hierarchy)} multi-rank data-parallel reductions "
+                "did not use the hierarchical fp32 path"
+            )
 
     return {
         "equal": not failures,
@@ -179,6 +198,10 @@ def certify_trace_path(
         "collective_prefix_counts": dict(prefix_counts),
         "dp_grad_reductions": len(dp_grad_begins),
         "dp_grad_reductions_without_fp32_accumulation": len(dp_without_fp32),
+        "multi_rank_dp_grad_reductions": len(multi_rank_dp_grad_begins),
+        "multi_rank_dp_grad_reductions_without_hierarchical_fp32_accumulation": len(
+            multi_rank_dp_without_hierarchy
+        ),
         "failures": failures,
     }
 
@@ -196,6 +219,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Require at least one collective whose semantic name starts with this prefix",
     )
     parser.add_argument("--require-dp-fp32-accumulation", action="store_true")
+    parser.add_argument("--require-dp-hierarchical-fp32-accumulation", action="store_true")
     parser.add_argument("--json", action="store_true", help="Emit the complete JSON report")
     return parser
 
@@ -208,6 +232,9 @@ def main(argv: list[str] | None = None) -> int:
             "expected_iterations": args.expected_iterations,
             "required_collective_prefixes": tuple(args.require_collective_prefix),
             "require_dp_fp32_accumulation": args.require_dp_fp32_accumulation,
+            "require_dp_hierarchical_fp32_accumulation": (
+                args.require_dp_hierarchical_fp32_accumulation
+            ),
         }
         report = {"left": certify_trace_path(args.left, **kwargs)}
         if args.right:

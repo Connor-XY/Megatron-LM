@@ -48,6 +48,7 @@ class ProcessGroupCollection:
         # Data Parallelism Groups
         dp: Data parallel process group
         dp_cp: Data and context parallel group
+        det_dp_hierarchy: Fixed local/inter groups for deterministic DP reduction
         expt_dp: Expert data parallel group
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
@@ -113,6 +114,9 @@ class ProcessGroupCollection:
 
     # _DATA_PARALLEL_GROUP_WITH_CP
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
+
+    # Fixed local/inter hierarchy for deterministic FP32-accumulation reduce-scatter.
+    det_dp_hierarchy: List[torch.distributed.ProcessGroup] = field(init=False)
 
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
@@ -218,6 +222,10 @@ class ProcessGroupCollection:
             ),
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'det_dp_hierarchy': partial(
+                parallel_state.get_deterministic_hierarchical_data_parallel_groups,
+                check_initialized=False,
+            ),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
@@ -483,6 +491,11 @@ class ProcessGroupCollection:
                 'dp_cp_group': parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 ),
+                'det_dp_hierarchy': (
+                    parallel_state.get_deterministic_hierarchical_data_parallel_groups()
+                    if ddp_config.reduce_scatter_hierarchical_group_size is not None
+                    else None
+                ),
                 'intra_dp_cp_group': parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=True
                 ),
@@ -526,6 +539,13 @@ class ProcessGroupCollection:
                         "dp_cp process group is required when context_parallel_size > 1 "
                         "but not provided in pg_collection"
                     )
+
+            result['det_dp_hierarchy'] = (
+                pg_collection.det_dp_hierarchy
+                if ddp_config.reduce_scatter_hierarchical_group_size is not None
+                and hasattr(pg_collection, 'det_dp_hierarchy')
+                else None
+            )
 
             # 3. Handle expert data parallel group (DDP-specific: create if missing)
             if hasattr(pg_collection, 'expt_dp') and pg_collection.expt_dp is not None:

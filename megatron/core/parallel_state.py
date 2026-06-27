@@ -122,6 +122,8 @@ _HYBRID_DP_CP_GROUPS = {}
 _DATA_PARALLEL_GROUP_WITH_CP = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
+# Fixed logical-rank hierarchy used by deterministic FP32-accumulation reduce-scatter.
+_DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS = None
 
 # Partial Data parallel group information with context parallel combined.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
@@ -566,6 +568,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    deterministic_data_parallel_hierarchical_group_size: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -679,6 +682,11 @@ def initialize_model_parallel(
             This option is only valid when use_sharp is True.
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
+
+        deterministic_data_parallel_hierarchical_group_size (int, default = None):
+            If set, create a fixed two-level hierarchy inside every data+context parallel
+            group for deterministic FP32-accumulation reduce-scatter. The first level uses
+            this many logical ranks; the second level spans the resulting partial sums.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -820,9 +828,11 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_CP
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    global _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
+    assert _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS is None
 
     assert (
         data_parallel_size * context_parallel_size
@@ -862,6 +872,29 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
+
+        if deterministic_data_parallel_hierarchical_group_size is not None:
+            local_group_size = deterministic_data_parallel_hierarchical_group_size
+            assert num_distributed_optimizer_instances == 1, (
+                "Deterministic hierarchical reduce-scatter requires one distributed "
+                "optimizer instance."
+            )
+            assert 1 < local_group_size < len(ranks_with_cp)
+            assert len(ranks_with_cp) % local_group_size == 0
+            hierarchical_groups, _ = create_hierarchical_groups(
+                rank,
+                ranks_with_cp,
+                [local_group_size, len(ranks_with_cp) // local_group_size],
+                create_gloo_process_groups=False,
+                pg_options=[
+                    get_nccl_options("det_dp_local", nccl_comm_cfgs),
+                    get_nccl_options("det_dp_inter", nccl_comm_cfgs),
+                ],
+                timeout=timeout,
+                group_desc="DETERMINISTIC_DATA_PARALLEL_GROUP",
+            )
+            if rank in ranks_with_cp:
+                _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS = hierarchical_groups
 
         if num_distributed_optimizer_instances > 1:
             # Create groups for intra-partial DP domain
@@ -1480,6 +1513,15 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
         assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
         assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
+
+
+def get_deterministic_hierarchical_data_parallel_groups(check_initialized=True):
+    """Get fixed local/inter groups for deterministic data-parallel reduce-scatter."""
+    if check_initialized:
+        assert (
+            _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS is not None
+        ), "deterministic hierarchical data-parallel groups are not initialized"
+    return _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -2106,6 +2148,9 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS
+    _DETERMINISTIC_HIERARCHICAL_DATA_PARALLEL_GROUPS = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None

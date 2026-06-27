@@ -50,9 +50,18 @@ Applied to the parsed `args` Namespace in `apply_determinism_to_args`:
 | `--cross-entropy-loss-fusion` | Must be off (asserted; fused CE is non-deterministic) |
 | `--tp-comm-overlap` | Forced off (the overlap path uses non-deterministic NCCL collectives) |
 | `--ddp-reduce-scatter-with-fp32-accumulation` | Forced on with the distributed optimizer; rank-ordered all-to-all plus local fp32 accumulation removes allocation-topology-dependent reduction order |
+| `--ddp-reduce-scatter-hierarchical-group-size N` | Optional production optimization for the ordered fp32 path; reduce fixed contiguous logical groups of `N` ranks before exchanging fp32 partials across groups |
 | `--ddp-average-in-collective` | Must be off with the distributed optimizer; averaging is applied outside the ordered sum |
 | `--num-distributed-optimizer-instances` | Must be 1; the multi-instance reduction path is not yet certified |
 | `torch.use_deterministic_algorithms` | Set to `True` |
+
+The hierarchical group size is intentionally not inferred from node placement:
+changing it changes the floating-point reduction tree. Choose one fixed logical
+size for a recipe and keep it unchanged across runs. It must be greater than
+one, smaller than and divide the data+context-parallel size, and it requires the
+distributed optimizer plus fp32-accumulation reduce-scatter. For example, use
+`N=4` when every four contiguous logical DP ranks consistently form the desired
+local communication domain.
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html)).
 
@@ -74,5 +83,8 @@ For multi-node certification, enable tensor hashes for a bounded trace window in
 two independent launches, then run `tools/determinism/certify_traces.py` over
 the two trace roots. The certifier validates runtime state, coverage, recompute
 identity, collective completion and hashes, ordered DP accumulation, and exact
-semantic trace equality; it exits nonzero for either a missing invariant or a
-numerical divergence.
+semantic trace equality. Pass
+`--require-dp-hierarchical-fp32-accumulation` when the recipe enables the
+hierarchy; it requires the hierarchical path for every multi-rank DP reduction.
+The certifier exits nonzero for either a missing invariant or a numerical
+divergence.

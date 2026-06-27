@@ -1547,6 +1547,23 @@ def validate_args(args, defaults={}):
 
         apply_determinism_to_args(args)
 
+    if args.ddp_reduce_scatter_hierarchical_group_size is not None:
+        hierarchical_size = args.ddp_reduce_scatter_hierarchical_group_size
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        assert args.use_distributed_optimizer, (
+            "--ddp-reduce-scatter-hierarchical-group-size requires "
+            "--use-distributed-optimizer."
+        )
+        assert args.ddp_reduce_scatter_with_fp32_accumulation, (
+            "--ddp-reduce-scatter-hierarchical-group-size requires "
+            "--ddp-reduce-scatter-with-fp32-accumulation."
+        )
+        assert 1 < hierarchical_size < dp_cp_size and dp_cp_size % hierarchical_size == 0, (
+            "--ddp-reduce-scatter-hierarchical-group-size must be greater than one, smaller "
+            f"than, and divide the data+context parallel size ({dp_cp_size}); got "
+            f"{hierarchical_size}."
+        )
+
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
@@ -2775,6 +2792,9 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--ddp-reduce-scatter-hierarchical-group-size', type=int, default=None,
+                       help='Use a fixed two-level FP32-accumulation reduce-scatter tree with this many '
+                       'logical data-parallel ranks in each first-level group.')
     group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
                        help='List of param_name patterns (in Python\'s fnmatch format) to match against '
                        'to do local gradient accumulation in FP32. The special pattern \'all\' matches '

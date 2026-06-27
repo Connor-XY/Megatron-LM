@@ -76,37 +76,6 @@ def _build_hierarchical_groups(
     return local_group, inter_group
 
 
-def _hierarchical_reduce_scatter(
-    output_tensor: torch.Tensor,
-    input_tensor: torch.Tensor,
-    *,
-    world_size: int,
-    local_group_size: int,
-    local_group: torch.distributed.ProcessGroup,
-    inter_group: torch.distributed.ProcessGroup,
-) -> None:
-    """Reduce-scatter using fixed logical-rank groups and ordered fp32 sums."""
-    num_local_groups = world_size // local_group_size
-    shard_numel = input_tensor.numel() // world_size
-
-    local_send = (
-        input_tensor.view(num_local_groups, local_group_size, shard_numel)
-        .permute(1, 0, 2)
-        .contiguous()
-    )
-    local_recv = torch.empty_like(local_send)
-    torch.distributed.all_to_all_single(local_recv, local_send, group=local_group)
-    local_partial = local_recv.view(local_group_size, num_local_groups, shard_numel).sum(
-        dim=0, dtype=torch.float32
-    )
-
-    inter_recv = torch.empty_like(local_partial)
-    torch.distributed.all_to_all_single(inter_recv, local_partial, group=inter_group)
-    output_tensor.copy_(
-        inter_recv.view(num_local_groups, shard_numel).sum(dim=0, dtype=torch.float32)
-    )
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--numel", type=int, default=41_943_040)
@@ -117,8 +86,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Also benchmark a two-level ordered reduction using fixed contiguous logical-rank "
-            "groups of this size (0 disables it)"
+            "Also benchmark the production two-level ordered reduction using fixed contiguous "
+            "logical-rank groups of this size (0 disables it)"
         ),
     )
     parser.add_argument(
@@ -169,14 +138,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         if hierarchical_groups is not None:
-            local_group, inter_group = hierarchical_groups
-            operations["hierarchical_fp32"] = lambda: _hierarchical_reduce_scatter(
+            operations["hierarchical_fp32"] = lambda: reduce_scatter_with_fp32_accumulation(
                 output_tensor,
                 input_tensor,
-                world_size=world_size,
-                local_group_size=args.hierarchical_group_size,
-                local_group=local_group,
-                inter_group=inter_group,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+                async_op=False,
+                hierarchical_groups=hierarchical_groups,
             )
         operation_names = tuple(operations)
         order = (

@@ -66,6 +66,10 @@ class DistributedDataParallelConfig:
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
 
+    reduce_scatter_hierarchical_group_size: Optional[int] = None
+    """When FP32-accumulation reduce-scatter is enabled, use a fixed two-level reduction
+       tree whose first-level groups contain this many logical data-parallel ranks."""
+
     param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
     """List of param_name patterns (in Python's fnmatch format) to match against to do
        local gradient accumulation in FP32. The special pattern 'all' matches every
