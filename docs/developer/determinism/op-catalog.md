@@ -47,6 +47,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Token unpermute (combine) | `transformer/moe/moe_utils.py:526-541` | scatter-accumulate | 🔵 | `index_add_` (CUDA-graph safe) | `scatter_add_` | `are_deterministic_algorithms_enabled()` | doc+code | `index_add_` +85.9 ms NVTX-range time over 3 profiled steps | The redundant second zero-allocation is removed. The cleanup is bit-exact but step-time neutral; the remaining reduction kernel is still a target. |
 | Routing map/probs | `moe_utils.py`, `moe/ops/deterministic_routing.py` | collision-free dense write + gather backward | 🔵 | fused Triton probability/map kernel; PyTorch `scatter_` fallback | out-of-place `scatter` ×2 | `are_deterministic_algorithms_enabled()` | code+**test** | isolated forward 4.21–4.63× faster and forward+backward 1.66–1.87× faster than deterministic `scatter_`; production scatter/fused ABBA median -2.0% | Top-k indices are unique within each row, so the fused path has no atomics or reductions. One row program initializes both dense outputs, writes selected entries, and backward gathers only selected gradients. Unsupported devices, dtypes, layouts, or missing Triton retain the prior scatter path. |
 | Top-k expert select | `moe_utils.py` | `torch.topk(sorted=...)` | 🔵 | `sorted=True`, including no-grad checkpoint forward | `sorted=is_grad_enabled()` | deterministic algorithms | code+**test** | `cub::DeviceRadixSort` 6.36 vs 1.23 ms over 3 steps (+5.13 ms) | Fixes sigmoid top-k probability drift between original forward and grad-enabled recompute. Investigate a faster stable-select path. |
+| Expert-bias score gather | `moe_utils.py` | `torch.gather` + dense backward write | 🔵 | PyTorch deterministic gather backward (`index_put_`) | PyTorch scatter-add backward | deterministic algorithms + expert bias | code+profile | candidate isolated forward+backward 1.48–2.23× faster, but gather-only production ABBA regressed 3.3% | A collision-free Triton candidate was exact and reduced the profiled range from `GatherBackward0` +1.75 ms to 0.29 ms, but two balanced production ABBAs regressed 3.2–3.3%; it was removed. Keep as an open fusion target rather than landing an isolated-only win. |
 | Group-limited top-k mask | `moe_utils.py:590-645` | `scatter_(1, group_idx, 1)` | 🟢 | unique group indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** by the DSV3 proxy across EP≤4/TP/FSDP/PP/VPP and by the final EP32 certificates (`518849`/`518850`). |
 | Aux-loss routing map | `moe_utils.py:888-901` | `scatter` | 🟢 | unique indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** via DSV3 proxy and final EP32 certificates with `seq_aux_loss` enabled. |
 | Capacity-drop mask | `moe_utils.py:950-962` | `scatter` | 🟢 | unique indices | — (no branch) | capacity factor | code+**test** | small | **Verified** bit-exact for `probs` and `position` drop policies, including unpadded and fixed-capacity padded A2A dispatch, across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
@@ -87,7 +88,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py:119-156` | 3× all-reduce + fp32 | 🟡 | no topology-independent TP reduction yet | native NCCL | env | code | MoE proxy: +17.9 ms (+168%) over 3 profiled steps | `NCCL_ALGO=Ring` does not pin the physical ring across allocations. TP>1 cross-allocation certification and an ordered SUM path remain open; indexed backward is also a perf target. |
+| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py`, `tensor_parallel/deterministic_cross_entropy.py` | 3× all-reduce + fp32 + selected class update | 🟡 | fused collision-free Triton selected subtract + smoothing + output scaling; native NCCL TP reductions | generic `index_put_` selected update + elementwise kernels; native NCCL | deterministic algorithms | code+**test** | fused local backward 3.34–20.41× faster in isolation; CE-backward profile -0.508 ms; production ABBA -2.7% | The local backward update is closed without atomics and supports label smoothing, fallback, and CUDA graphs. `NCCL_ALGO=Ring` still does not pin the physical TP ring across allocations; TP>1 cross-allocation certification and an ordered SUM path remain open. |
 | Fused cross-entropy | `cross_entropy_loss_fusion` | fused kernel | 🔴 | — (forbidden) | fused | asserted off | code | — | Open: can it be made deterministic? (perf opportunity). |
 
 ### Backward / grad reduction / optimizer
@@ -171,6 +172,23 @@ script. Cluster-local artifacts are retained under:
 | production routing `scatter_`/fused ABBA (GB200) | `520786`, fixed 32-GPU allocation | `perf-nemotron-fused-scatter-520786.out`, SHA256 `2980c4e33c93…` | median-of-leg medians 67.1→65.75 ms (-2.0%); forward pair -4.8%, reverse pair +1.1%; all 14-step loss, sequence-aux-loss, and grad-norm sequences are identical. |
 | post-fusion native/deterministic ABBA (GB200) | `520827`, fixed 32-GPU allocation | `perf-nemotron-fused-gap-520827.out`, SHA256 `c82242660b4d…` | median-of-leg medians: native 56.1 ms, deterministic 64.65 ms (+15.2%); forward pair +14.5%, reverse pair +16.0%. This confirms that closing routing does not close the remaining TE/attention/loss/gather gap on every allocation. |
 | post-fusion rank-scoped Nemotron profile (GB200) | `520828`, 32 GPUs | `profile-nemotron-fused-gap-520828/leaderboard.txt`, SHA256 `28f7a16c0038…`; `index-put-attribution.json`, SHA256 `bbad652beebd…` | `_DeterministicRoutingBackward` totals 0.376 ms; aggregate `index_put_` is 3.025 ms across eight ranges, all attributed to vocab cross-entropy or gather backward and none to routing. Latest deltas: MLP forward +3.38 ms, self-attention +1.32 ms, Mamba backward +2.79 ms, gather backward +1.75 ms, and vocab-CE backward +1.50 ms over the captured steps. |
+| selected-gather focused suite (GB200) | `520936`, 4 GPUs | `submit_logs/test_det_routing_fused_520936.out`, SHA256 `dbd5a5c38ca7…` | 50 passed on every rank: exact DSV3/Nemotron selected-score outputs and gradients, CPU fallback, invalid-shape coverage, routing integration, and CUDA-graph forward/backward replay. |
+| selected-gather ABBA microbenchmark (GB200) | `520946`, 1 rank on a 4-GPU allocation | `submit_logs/bench_det_selected_gather_520946.out`, SHA256 `c04e4f557e30…` | bf16/fp32 × 16/512/4096 tokens for DSV3 (256/top-8) and Nemotron (512/top-22): all 12 cells repeat exactly. Fused forward+backward is 1.48–2.23× faster; forward-only is 0.60–0.65× as fast, so the fast path is gated on grad-enabled inputs. |
+| selected-gather DSV3 cross-version certificate | `520784` / `520961`, independent 32-GPU allocations | `cross-version-520784-520961.json`, SHA256 `53bcccecda5e…` | 6,080/6,080 events exact; zero divergences; 64 recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| selected-gather Nemotron cross-version certificate | `520785` / `520962`, independent 32-GPU allocations | `cross-version-520785-520962.json`, SHA256 `640cdffe5a33…` | 9,664/9,664 events exact; zero divergences; 192 recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| post-gather native/deterministic ABBA (GB200) | `520963`, fixed 32-GPU allocation | `perf-nemotron-fused-gap-520963.out`, SHA256 `0b6f8f6dfe69…` | median-of-leg medians: native 54.85 ms, deterministic 60.3 ms (+9.9%); forward pair +7.8%, reverse pair +12.2%. Both deterministic legs have identical 14-step loss, sequence-aux-loss, and grad-norm sequences. Allocation sensitivity remains. |
+| post-gather rank-scoped Nemotron profile (GB200) | `520964`, 32 GPUs | `profile-nemotron-fused-gap-520964/leaderboard.txt`, SHA256 `824e5e986958…`; `index-put-attribution.json`, SHA256 `95082aec60c7…` | `_DeterministicSelectedGatherBackward` totals 0.290 ms and `GatherBackward0` is absent. The six residual `index_put_` ranges total 1.551 ms and are all vocab CE. Latest deltas: MLP forward +2.05 ms, Mamba backward +1.84 ms, vocab-CE backward +1.46 ms, and core attention +0.45 ms. |
+| gather-only production ABBA (GB200) | `521026`, fixed 32-GPU allocation | `perf-nemotron-selected-gather-521026.out`, SHA256 `8d604b452bb8…` | baseline 64.3 ms vs candidate 66.45 ms (+3.3% median-of-leg medians); forward pair +5.0%, reverse pair +1.7%; all loss, sequence-aux-loss, and grad-norm sequences identical. Candidate rejected. |
+| CE selected-update microbenchmark (GB200) | `521031`, 1 rank on a 4-GPU allocation | `submit_logs/bench_det_ce_write_521031.out`, SHA256 `374e486b39d5…` | 16/512/4096 rows × vocab shards 128/8192: all six backward cells byte-exact and 13.64–15.54× faster. Replacing the four forward mask writes with `where` was only 0.66–0.68× as fast, so forward remains unchanged. |
+| CE selected-update focused suite (GB200) | `521106`, 1 GPU | `submit_logs/test_det_ce_focused_521106.out`, SHA256 `23e3a460e124…` | 11 passed: bf16/fp32, label smoothing on/off, CPU fallback, invalid shapes, and CUDA-graph replay. |
+| combined gather+CE production ABBA (GB200) | `521127`, fixed 32-GPU single-domain allocation | `perf-nemotron-selected-gather-521127.out`, SHA256 `f3cc5d330ccd…` | baseline 61.8 ms vs combined candidate 63.8 ms (+3.2%); forward pair +7.4%, reverse pair -0.6%; all training sequences identical. This second negative gate triggered removal of gather. |
+| combined gather+CE rank profile (GB200) | `521128`, 32 GPUs | `profile-nemotron-fused-gap-521128/leaderboard.txt`, SHA256 `a1d22973fa0d…`; `index-put-attribution.json`, SHA256 `81678748e602…` | CE backward indexed writes are absent; only four forward mask writes remain (0.178 ms total). Broader TE/Mamba deltas were strongly allocation-sensitive; use the paired ABBA for the retention decision. |
+| fused CE backward microbenchmark (GB200) | `521310`, 1 rank on a 4-GPU allocation | `submit_logs/bench_fused_det_ce_521310.out`, SHA256 `ed992271e9ca…` | 16/512/4,096 rows × vocab shards 128/8,192 × label smoothing on/off: all 12 cells are byte-exact. Fusing selected subtract, optional smoothing, and output-gradient scaling is 3.34–20.41× faster than the original update+scale and 1.25–2.92× faster than the selected-only candidate. |
+| fused CE focused suite (GB200) | `521463`, 1 GPU | `submit_logs/test_det_ce_focused_521463.out`, SHA256 `08bc00be3091…` | 27 passed: direct bf16/fp32 kernels, label smoothing on/off, 16/512 rows and 128/8,192 columns, CPU fallback, invalid shapes, CUDA-graph replay, and full CE integration for batch 1/3 and vocab 128/257. |
+| fused CE DSV3 cross-version certificate | `520784` / `521405`, independent 32-GPU allocations | `cross-version-520784-521405.json`, SHA256 `9bf601725f2a…`; certification SHA256 `5f363c150cdf…` | 6,080/6,080 events exact; zero divergences; 64 recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| fused CE Nemotron cross-version certificate | `520785` / `521406`, independent 32-GPU allocations | `cross-version-520785-521406.json`, SHA256 `c52c72350ef7…`; certification SHA256 `7d52f590e209…` | 9,664/9,664 events exact; zero divergences; 192 recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| fused CE rank-scoped Nemotron profile (GB200) | `521407`, 32 GPUs | `profile-nemotron-fused-gap-521407/leaderboard.txt`, SHA256 `21f11d76841e…`; `index-put-attribution.json`, SHA256 `b913575972b5…` | `_VocabParallelCrossEntropyBackward` is 0.749 vs 1.257 ms (-0.508 ms, -40.4%) over two captured steps. No CE-backward indexed writes remain; the six residual writes are four small CE-forward mask writes and two gather-backward writes. |
+| fused CE extended production ABBA (GB200) | `521404`, fixed 32-GPU allocation | `perf-nemotron-ce-extended-521404.out`, SHA256 `9f7d57ba2ccb…` | Iterations 11–50: baseline/candidate medians are 67.5/66.9 ms forward-order (-0.9%) and 65.45/62.45 ms reverse-order (-4.6%); median-of-leg medians 66.475→64.675 ms (-2.7%). All 50 loss, sequence-aux-loss, and grad-norm values match across all four legs. |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -384,14 +402,16 @@ Post-fusion native/deterministic ABBA job `520827` measures 56.1/64.65 ms
 allocation in job `520625`, this confirms that the remaining full-stack gap is
 still topology/allocation-sensitive and is not routing alone.
 
-Rank-scoped profile job `520828` closes the attribution loop. The fused routing
-backward totals 0.376 ms over the capture, and SQLite containment finds only
-eight residual `aten::index_put_` ranges totaling 3.025 ms: four small vocab-CE
-forward writes, two vocab-CE backward writes, and two gather-backward writes.
-No residual indexed write is nested under routing. The leading remaining
-module/autograd deltas are MLP forward +3.38 ms, self-attention +1.32 ms,
-Mamba backward +2.79 ms, gather backward +1.75 ms, and vocab-CE backward
-+1.50 ms over the captured steps.
+Rank-scoped profile job `520828` first isolated the fused-routing residual:
+four small vocab-CE forward writes, two vocab-CE backward writes, and two
+gather-backward writes. The selected-gather experiment removed the latter two
+in job `520964`, but failed the production gate and was removed. With only the
+fused CE backward applied, current-source job `521407` contains six residual
+`aten::index_put_` ranges: four small CE-forward mask writes and the two
+gather-backward writes. No CE-backward indexed write remains, and
+`_VocabParallelCrossEntropyBackward` improves from 1.257 to 0.749 ms (-40.4%)
+over the two captured steps. `GatherBackward0` is now the largest directly
+attributed indexed-write target at +1.621 ms.
 
 ### WS3 targets, by measured impact
 
@@ -412,17 +432,28 @@ Mamba backward +2.79 ms, gather backward +1.75 ms, and vocab-CE backward
    removes the generic indexed-write path. It is 4.21–4.63× faster forward in
    isolation and improves median-of-leg production step time by 2.0%. Retain
    the fallback, CUDA-graph test, and two-allocation certificates as gates.
-4. **Indexed loss/gather backward** — latest job `520828` measures
-   `_VocabParallelCrossEntropyBackward` +1.50 ms and `GatherBackward0` +1.75 ms.
-   SQLite containment assigns all eight residual `index_put_` ranges to these
-   paths and CE forward, with none under routing.
-5. **Attention deterministic kernels** — latest self-attention +1.32 ms and
+4. **Expert-bias selected-score gather — still open.** The collision-free
+   candidate was exact, 1.48–2.23× faster forward+backward in isolation, and
+   reduced the profiled range from `GatherBackward0` +1.75 ms to 0.29 ms. It was
+   nevertheless 3.3% slower in gather-only production ABBA and the combined
+   gather+CE candidate was 3.2% slower. The candidate is removed; pursue a
+   fused gather+normalization/routing design that survives the full-step gate.
+5. **Vocab-parallel cross-entropy local backward — closed.** A fused,
+   collision-free one-class-per-row Triton pass performs the selected subtract,
+   optional smoothing, and output-gradient scaling. It is 3.34–20.41× faster
+   than the original update+scale in isolation, reduces the profiled CE
+   backward by 0.508 ms, and improves the extended production ABBA by 2.7%.
+   Forward mask writes remain because the measured `where` alternative
+   regressed. TP collective ordering remains a separate correctness/performance
+   gap.
+6. **Attention deterministic kernels** — latest core attention +0.45 ms;
+   job `520828` measured self-attention +1.32 ms and
    core attention +0.52 ms; job `520565` measured +4.02/+2.44 ms, so preserve
    paired allocation evidence while optimizing.
-6. **Deterministic grouped GEMM** — `_GroupedLinearBackward` ranged from
+7. **Deterministic grouped GEMM** — `_GroupedLinearBackward` ranged from
    +2.27 ms in job `520565` to -0.76 ms in job `520828`; re-isolate before
    changing the kernel choice.
-7. **Mamba profile delta** — backward +2.79 ms in job `520828` (+7.31 ms in
+8. **Mamba profile delta** — backward +1.84 ms in job `520964` (+7.31 ms in
    `520565`), but paired Mamba-only attribution in job `519888` was step-time
    neutral. Re-isolate before changing the fixed-config/workspace path.
 
@@ -444,6 +475,16 @@ Mamba backward +2.79 ms, gather backward +1.75 ms, and vocab-CE backward
   is a selected-entry gather. Unsupported inputs retain the scatter fallback.
   DSV3/Nemotron output, map, gradient, CUDA-graph, and cross-allocation trace
   gates all pass; isolated and production gains are reported separately above.
+- ❌ **Rejected after production ABBA:** generic deterministic gather backward
+  → collision-free selected-score backward. The candidate was exact and faster
+  in isolation/profile, but gather-only and combined ABBAs regressed 3.3% and
+  3.2%, respectively. The source path remains regular `torch.gather`.
+- ✅ **Applied:** vocab-CE deterministic `index_put_` selected subtract plus
+  separate smoothing/output scaling → one fused collision-free Triton pass per
+  token row. The kernel has no atomics or reductions, retains a PyTorch
+  fallback, supports label smoothing and CUDA graphs, and leaves the
+  measured-slower forward mask alternative untouched. The extended production
+  ABBA improves by 2.7% with exact training sequences.
 
 ## Verification backlog (the ⚠ rows)
 

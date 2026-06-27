@@ -52,6 +52,7 @@ Legend for the "Determinism" column:
 | --- | --- | --- | --- |
 | Router gating + softmax/sigmoid | `transformer/moe/moe_utils.py:789-818` | 🟢 | Computed in fp32; elementwise. |
 | Top-k expert selection | `moe_utils.py` (`torch.topk`) | 🔵 | Deterministic mode forces `sorted=True` even in the no-grad activation-checkpoint forward; normal mode keeps the faster no-grad `sorted=False` path. This avoids forward/recompute probability drift for sigmoid top-k normalization. The sorted path is the source of the `cub::DeviceRadixSort` det-vs-nondet delta (**hotspot**). |
+| Expert-bias selected-score gather | `moe_utils.py` (`torch.gather`) | 🔵 | PyTorch switches gather backward from scatter-add to its deterministic indexed-write path. A collision-free Triton candidate was exact and faster in isolation/profile but regressed two balanced production ABBAs by 3.2–3.3%, so it is not in the source tree. |
 | Group-limited (node-limited) top-k | `moe_utils.py:617-634` (`group_mask.scatter_`) | 🟡 | `scatter_` writes 1s at unique group indices → deterministic in forward; no explicit det branch (**verify**). |
 | Routing map / probs construction | `moe_utils.py`, `moe/ops/deterministic_routing.py` | 🔵 | det: a fused row-wise Triton kernel initializes probabilities and the boolean map, writes unique top-k entries, and gathers selected gradients in backward. It has no atomics or reductions; unsupported inputs retain in-place `scatter_`. Non-det uses out-of-place `scatter`. The fused path is exact to the scatter and former `index_put_(accumulate=False)` implementations and passes CUDA-graph replay. Also `compute_routing_scores_for_aux_loss` and capacity masks use collision-free `scatter` with **no** det branch. |
 | Capacity-factor drop | `moe_utils.py:940-951` | 🟡 | `scatter` of capacity mask; unique indices. |
@@ -75,7 +76,7 @@ Legend for the "Determinism" column:
 
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
-| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py:119-156` | 🟡 | 3 all-reduces (MAX, SUM, SUM) across TP. `NCCL_ALGO=Ring` pins the algorithm but not necessarily the physical rank order across allocations; TP>1 therefore remains a cross-allocation verification gap. fp32 intermediates reduce, but do not remove, order sensitivity. |
+| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py`, `tensor_parallel/deterministic_cross_entropy.py` | 🟡 | The local deterministic backward fuses the one-selected-class subtract, optional label-smoothing subtract, and output-gradient scaling in one collision-free Triton pass (no atomics/reductions; PyTorch fallback; CUDA-graph coverage). The 3 all-reduces (MAX, SUM, SUM) still use native TP collectives. `NCCL_ALGO=Ring` pins the algorithm but not necessarily the physical rank order across allocations; TP>1 remains a cross-allocation verification gap. |
 | Fused CE | `cross_entropy_loss_fusion` | 🔴→forbidden | Non-deterministic; **asserted off** in deterministic mode (`arguments.py:1502`). |
 | MoE aux loss | `moe_utils.py:842-890` | 🟡 | `scatter` for routing map; aux-loss scalar reduction. |
 

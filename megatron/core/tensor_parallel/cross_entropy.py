@@ -7,6 +7,7 @@ import torch
 from megatron.core.parallel_state import get_tensor_model_parallel_group
 from megatron.core.utils import get_pg_rank, get_pg_size
 
+from .deterministic_cross_entropy import deterministic_cross_entropy_backward_
 from .utils import VocabUtility
 
 
@@ -193,10 +194,25 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         (grad_2d, arange_1d, softmax_update, grad_input) = (
             VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
         )
+        deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
 
-        if label_smoothing > 0:
+        if deterministic_algorithms:
+            smoothing = (
+                label_smoothing * vocab_size / (vocab_size - 1) if label_smoothing > 0 else 0.0
+            )
+            selected_update = (1.0 - smoothing) * softmax_update
+            average_grad = 1 / vocab_size
+            deterministic_cross_entropy_backward_(
+                grad_2d,
+                masked_target_1d,
+                selected_update,
+                grad_output,
+                smoothing_update=smoothing * average_grad,
+            )
+        elif label_smoothing > 0:
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)
-            grad_2d[arange_1d, masked_target_1d] -= (1.0 - smoothing) * softmax_update
+            selected_update = (1.0 - smoothing) * softmax_update
+            grad_2d[arange_1d, masked_target_1d] -= selected_update
             average_grad = 1 / vocab_size
             grad_2d[arange_1d, :] -= smoothing * average_grad
 

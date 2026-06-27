@@ -248,6 +248,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
   measures `_DeterministicRoutingBackward` at 0.376 ms over the capture and only
   eight residual `index_put_` ranges totaling 3.025 ms; containment assigns all
   eight to vocab cross-entropy or gather backward and none to routing.
+  Experimental post-gather job `520964` removes both gather indexed writes:
+  `_DeterministicSelectedGatherBackward` totals 0.290 ms, and all six residual
+  `index_put_` ranges (1.551 ms) belong to vocab cross-entropy. The gather
+  candidate was later removed after two negative production ABBAs. In the
+  current-source profile `521407`, the fused CE backward removes both CE
+  backward indexed writes and improves `_VocabParallelCrossEntropyBackward`
+  from 1.257 to 0.749 ms (-40.4%). The six residual writes are four small CE
+  forward masks and two gather-backward writes.
 - **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
   `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
   two-launch comparison matched 6,080/6,080 semantic events, and the two
@@ -297,6 +305,29 @@ small set of reductions and dispatch choices. They are fully enumerated in
   independent 32-GPU allocation; Nemotron job `520785` matches `520561` at
   9,664/9,664. Both reports have zero divergence, zero pending collectives,
   exact recompute coverage, and no missing hierarchical DP reductions.
+- **Selected-score gather experiment (rejected):** AWS-DFW job `520936` passes 50
+  focused tests on every rank, including exact DSV3/Nemotron outputs and
+  gradients, routing integration, fallbacks, and CUDA-graph replay. Job
+  `520946` repeats exact hashes in all 12 model-shape cells and measures
+  1.48–2.23× forward+backward speedup. DSV3 job `520961` matches pre-change
+  build `520784` at 6,080/6,080 events; Nemotron job `520962` matches `520785`
+  at 9,664/9,664, with zero divergence, exact recomputes and collectives, and no
+  missing hierarchical reductions. Despite that correctness and profiler win,
+  gather-only production job `521026` regressed 3.3%, and combined gather+CE job
+  `521127` regressed 3.2%; the gather candidate is therefore not applied.
+- **Vocab-CE fused local-backward certification:** AWS-DFW job `521463` passes
+  all 27 focused cases across bf16/fp32, label smoothing, batch 1/3, vocab
+  128/257, fallback, invalid shapes, full CE integration, and CUDA graphs.
+  Microbenchmark job `521310` is byte-exact in all 12 shape/smoothing cells and
+  is 3.34–20.41× faster than the original selected update plus output scaling.
+  DSV3 job `521405` matches pre-change build `520784` at 6,080/6,080 events;
+  Nemotron job `521406` matches `520785` at 9,664/9,664, with zero divergence,
+  exact recomputes and collectives, and no missing hierarchical reductions.
+  Profile `521407` measures the CE backward at -0.508 ms (-40.4%) and finds no
+  CE-backward indexed writes. Extended 50-step production ABBA `521404`
+  improves the median-of-leg medians 66.475→64.675 ms (-2.7%); both order pairs
+  improve and all loss, sequence-aux-loss, and grad-norm values match. The
+  measured-slower forward `where` candidate is not applied.
 - **Full Megatron-Bridge evidence (not yet a gate):** branch
   `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
@@ -319,12 +350,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
    scatter cleanup contributes 1.8% in direct old/new ABBA, and the fused
    collision-free kernel contributes another 2.0% in direct scatter/fused ABBA.
    Post-scatter native/deterministic job `520625` reached +5.3% on one allocation
-   (56.4/59.4 ms), but post-fusion job `520827` measured +15.2% on another
-   (56.1/64.65 ms), with consistent +14.5%/+16.0% order pairs. Topology/allocation
+   (56.4/59.4 ms), post-fusion job `520827` measured +15.2% on another
+   (56.1/64.65 ms), and post-gather job `520963` measured +9.9% (54.85/60.3 ms)
+   with +7.8%/+12.2% order pairs. Topology/allocation
    variance remains too large to declare the target closed globally. The
    exposed DP and routing improvements can be hidden by communication overlap,
-   which leaves attention, indexed loss/gather backward, and deterministic
-   grouped GEMM as the primary measured kernel targets. Mamba's fixed
+   which leaves expert-score gather backward, attention, and deterministic
+   grouped GEMM as the primary measured kernel targets. Vocab-CE's local
+   backward is closed, while TP collective ordering remains open. Mamba's fixed
    config/workspaces show no measurable slowdown in the paired attribution. The
    hierarchy also increases peak allocated memory in this proxy by about 140
    MiB because it materializes the locally permuted send buffer. Each further

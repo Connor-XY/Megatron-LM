@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from megatron.core.models.common.language_module import language_module as language_module_module
@@ -108,3 +109,41 @@ def test_vocab_parallel_cross_entropy():
     ).cuda()
     assert torch.equal(torch.round(expected_output), torch.round(output))
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+@pytest.mark.parametrize("vocab_size", [128, 257])
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_deterministic_vocab_parallel_cross_entropy_matches_index_put(
+    monkeypatch, dtype, label_smoothing, vocab_size, batch_size
+):
+    tp_group = _FakeTPGroup()
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, op=None, group=None: tensor)
+    torch.manual_seed(1234)
+    candidate_logits = torch.randn(
+        16, batch_size, vocab_size, device="cuda", dtype=dtype, requires_grad=True
+    )
+    reference_logits = candidate_logits.detach().clone().requires_grad_(True)
+    target = torch.randint(vocab_size, (16, batch_size), device="cuda")
+
+    previous_deterministic_mode = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        candidate_loss = vocab_parallel_cross_entropy(
+            candidate_logits, target, label_smoothing=label_smoothing, tp_group=tp_group
+        )
+        candidate_grad = torch.autograd.grad(candidate_loss.sum(), candidate_logits)[0]
+
+        torch.use_deterministic_algorithms(False)
+        reference_loss = vocab_parallel_cross_entropy(
+            reference_logits, target, label_smoothing=label_smoothing, tp_group=tp_group
+        )
+        reference_grad = torch.autograd.grad(reference_loss.sum(), reference_logits)[0]
+    finally:
+        torch.use_deterministic_algorithms(previous_deterministic_mode)
+
+    assert torch.equal(candidate_loss, reference_loss)
+    assert torch.equal(candidate_grad, reference_grad)
