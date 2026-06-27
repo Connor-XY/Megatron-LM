@@ -22,6 +22,9 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.ops.deterministic_index_select import deterministic_index_select
+from megatron.core.transformer.moe.ops.deterministic_routing import (
+    deterministic_routing_probs_and_map,
+)
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -836,11 +839,9 @@ def topk_routing_with_score_function(
         return probs, top_indices
 
     if torch.are_deterministic_algorithms_enabled():
-        # Top-k indices are unique within each row, so these scatters have no write collisions.
-        routing_probs = torch.zeros_like(logits)
-        routing_probs.scatter_(1, top_indices, probs)
-        routing_map = torch.zeros_like(logits, dtype=torch.bool)
-        routing_map.scatter_(1, top_indices, True)
+        routing_probs, routing_map = deterministic_routing_probs_and_map(
+            probs, top_indices, logits.shape[1]
+        )
     else:
         # TODO Try using element-wise operations instead of scatter?
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)

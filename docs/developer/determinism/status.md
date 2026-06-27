@@ -74,15 +74,23 @@ median-of-leg medians by 1.8% in direct ABBA job `520526`. Post-change
 native/deterministic ABBA job `520625` measures 56.4/59.4 ms (+5.3%), reaching
 the aggressive target on that allocation; its forward and reverse pairs are
 +8.8% and +1.6%, so the result remains order/allocation-sensitive rather than a
-production-wide guarantee.
+production-wide guarantee. The follow-up fused collision-free routing kernel
+removes generic deterministic scatter dispatch. Job `520763` measures
+4.21–4.63× faster forward and 1.66–1.87× faster forward+backward across DSV3
+and Nemotron shapes; direct production ABBA job `520786` improves
+median-of-leg medians by another 2.0% (forward pair -4.8%, reverse pair +1.1%).
+Post-fusion native/deterministic ABBA job `520827` still measures +15.2%
+(56.1/64.65 ms) on a different allocation, with +14.5%/+16.0% order pairs.
+Thus routing is improved and independently attributed, but the full target is
+not consistently closed.
 
 ## 4. Control plane — how determinism is turned on
 
 ### 4.1 Upstream state
 
-PR #5041 remains open against `NVIDIA/main`. This branch is stacked on that PR,
-so the implementation and tests described below are available here but are not
-yet an upstream guarantee.
+PR #5041 is closed and there is currently no determinism PR against
+`NVIDIA/main`. This branch still contains the stacked implementation and tests
+described below; none of them are an upstream guarantee.
 
 The config flag is `model_parallel_config.py` `deterministic_mode: bool = False`,
 threaded into `TransformerConfig`; library code reads that flag or
@@ -137,11 +145,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
 
 - **MoE unpermute** (`moe_utils.py:517`): `index_add_` (det, CUDA-graph safe) vs
   `scatter_add_` (fast).
-- **MoE routing map/probs** (`moe_utils.py:823`): collision-free in-place
-  `scatter_` for the deterministic probabilities/boolean map vs out-of-place
-  `scatter` in the normal path. The selected expert indices are unique within
-  each row; focused tests compare outputs and gradients byte-for-byte with the
-  former `index_put_(accumulate=False)` implementation.
+- **MoE routing map/probs** (`moe_utils.py`,
+  `moe/ops/deterministic_routing.py`): deterministic mode uses one row-wise
+  Triton kernel to initialize dense probabilities and the boolean map and write
+  unique top-k entries, with a selected-entry gather backward. It has no
+  atomics or reductions. Unsupported devices, dtypes, layouts, or missing
+  Triton retain collision-free in-place `scatter_`; normal mode keeps the
+  out-of-place `scatter` path.
 - **MoE top-k under activation checkpointing** (`moe_utils.py`): deterministic
   mode keeps `sorted=True` in both no-grad forward and grad-enabled recompute.
 - **Vocab embedding fwd** (`tensor_parallel/layers.py:299`): direct `weight[idx]`
@@ -234,7 +244,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
   residual aggregate `index_put_` time spans routing-probability scatter, vocab
   cross-entropy, and gather backward; it is not one monolithic routing cost.
   `tools/determinism/attribute_nsys_ranges.py` makes that SQLite containment
-  analysis reusable for any NVTX range substring.
+  analysis reusable for any NVTX range substring. Post-fusion job `520828`
+  measures `_DeterministicRoutingBackward` at 0.376 ms over the capture and only
+  eight residual `index_put_` ranges totaling 3.025 ms; containment assigns all
+  eight to vocab cross-entropy or gather backward and none to routing.
 - **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
   `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
   two-launch comparison matched 6,080/6,080 semantic events, and the two
@@ -275,6 +288,15 @@ small set of reductions and dispatch choices. They are fully enumerated in
   9,664/9,664 events. Both cross-version reports have zero divergences, zero
   pending collectives, exact recompute coverage, and no missing hierarchical
   DP reductions.
+- **Fused-routing certification:** AWS-DFW jobs `520748` and final-source rerun
+  `520897` pass 39 focused tests on every rank, including exact DSV3/Nemotron
+  forward, boolean-map, and backward comparisons plus CPU fallback and
+  CUDA-graph replay. Job `520763`
+  repeats exact hashes for all 12 bf16/fp32 model-shape cells. DSV3 job `520784`
+  matches the prior scatter build (`520570`) at 6,080/6,080 events on an
+  independent 32-GPU allocation; Nemotron job `520785` matches `520561` at
+  9,664/9,664. Both reports have zero divergence, zero pending collectives,
+  exact recompute coverage, and no missing hierarchical DP reductions.
 - **Full Megatron-Bridge evidence (not yet a gate):** branch
   `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
@@ -294,12 +316,15 @@ small set of reductions and dispatch choices. They are fully enumerated in
    ordered. It is exact across independent DSV3 and Nemotron allocations. Full
    deterministic mode was +16–19% in jobs `520235`/`520311`; the direct
    full-mode A/B was 66.5 ms flat versus 66.7 ms hierarchical. The routing
-   cleanup contributes a modest 1.8% in direct old/new ABBA, while post-change
-   native/deterministic ABBA job `520625` reaches +5.3% on one allocation
-   (56.4/59.4 ms). Its two order pairs are +8.8% and +1.6%, so topology/order
+   scatter cleanup contributes 1.8% in direct old/new ABBA, and the fused
+   collision-free kernel contributes another 2.0% in direct scatter/fused ABBA.
+   Post-scatter native/deterministic job `520625` reached +5.3% on one allocation
+   (56.4/59.4 ms), but post-fusion job `520827` measured +15.2% on another
+   (56.1/64.65 ms), with consistent +14.5%/+16.0% order pairs. Topology/allocation
    variance remains too large to declare the target closed globally. The
-   exposed DP improvement is hidden by communication overlap, which moves the
-   primary target to the deterministic TE/MoE kernel set. Mamba's fixed
+   exposed DP and routing improvements can be hidden by communication overlap,
+   which leaves attention, indexed loss/gather backward, and deterministic
+   grouped GEMM as the primary measured kernel targets. Mamba's fixed
    config/workspaces show no measurable slowdown in the paired attribution. The
    hierarchy also increases peak allocated memory in this proxy by about 140
    MiB because it materializes the locally permuted send buffer. Each further

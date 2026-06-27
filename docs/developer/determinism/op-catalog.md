@@ -45,7 +45,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Token unpermute (combine) | `transformer/moe/moe_utils.py:526-541` | scatter-accumulate | 🔵 | `index_add_` (CUDA-graph safe) | `scatter_add_` | `are_deterministic_algorithms_enabled()` | doc+code | `index_add_` +85.9 ms NVTX-range time over 3 profiled steps | The redundant second zero-allocation is removed. The cleanup is bit-exact but step-time neutral; the remaining reduction kernel is still a target. |
-| Routing map/probs | `moe_utils.py:834-849` | collision-free scatter | 🔵 | in-place `scatter_` for probabilities + boolean map | out-of-place `scatter` ×2 | `are_deterministic_algorithms_enabled()` | code+**test** | isolated forward 1.76–1.80× faster; full-step ABBA median -1.8%; post-change `scatter_` 5.79 ms over the profile capture | Top-k indices are unique within each row. The new path is byte-exact to the former explicit `index_put_(accumulate=False)` outputs and gradients. PyTorch deterministic `scatter_` still lowers the probability write through `index_put_`; a direct fused collision-free kernel is the next opportunity. |
+| Routing map/probs | `moe_utils.py`, `moe/ops/deterministic_routing.py` | collision-free dense write + gather backward | 🔵 | fused Triton probability/map kernel; PyTorch `scatter_` fallback | out-of-place `scatter` ×2 | `are_deterministic_algorithms_enabled()` | code+**test** | isolated forward 4.21–4.63× faster and forward+backward 1.66–1.87× faster than deterministic `scatter_`; production scatter/fused ABBA median -2.0% | Top-k indices are unique within each row, so the fused path has no atomics or reductions. One row program initializes both dense outputs, writes selected entries, and backward gathers only selected gradients. Unsupported devices, dtypes, layouts, or missing Triton retain the prior scatter path. |
 | Top-k expert select | `moe_utils.py` | `torch.topk(sorted=...)` | 🔵 | `sorted=True`, including no-grad checkpoint forward | `sorted=is_grad_enabled()` | deterministic algorithms | code+**test** | `cub::DeviceRadixSort` 6.36 vs 1.23 ms over 3 steps (+5.13 ms) | Fixes sigmoid top-k probability drift between original forward and grad-enabled recompute. Investigate a faster stable-select path. |
 | Group-limited top-k mask | `moe_utils.py:590-645` | `scatter_(1, group_idx, 1)` | 🟢 | unique group indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** by the DSV3 proxy across EP≤4/TP/FSDP/PP/VPP and by the final EP32 certificates (`518849`/`518850`). |
 | Aux-loss routing map | `moe_utils.py:888-901` | `scatter` | 🟢 | unique indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** via DSV3 proxy and final EP32 certificates with `seq_aux_loss` enabled. |
@@ -164,6 +164,13 @@ script. Cluster-local artifacts are retained under:
 | post-change DSV3 cross-version certificate | `520203` / `520570`, independent 32-GPU allocations | `dsv3-routing-scatter-cross-version-520203-520570.json`, SHA256 `8148959a084b…` | 6,080/6,080 events exact; zero divergences; 64 recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions per tree. |
 | post-change Nemotron cross-version certificate | `520204` / `520561`, independent 32-GPU allocations | `nemotron-routing-scatter-cross-version-520204-520561.json`, SHA256 `dc492dfc3bf9…` | 9,664/9,664 events exact; zero divergences; 192 recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions per tree. |
 | post-change native/deterministic ABBA (GB200) | `520625`, fixed 32-GPU allocation | `perf-nemotron-route-gap-520625.out`, SHA256 `99a9aa6104f…` | median-of-leg medians: native 56.4 ms, deterministic 59.4 ms (+5.3%). Forward pair +8.8%; reverse pair +1.6%. This reaches the aggressive target on one allocation but remains order/allocation-sensitive. |
+| fused routing focused suite (GB200) | `520748`; final-source rerun `520897`, 4 GPUs | `submit_logs/test_det_routing_fused_520897.out`, SHA256 `cb73fc1977d0…` | 39 passed on every rank: bf16/fp32 DSV3 and Nemotron shapes match scatter exactly in outputs, boolean maps, and gradients; CPU fallback and CUDA-graph forward/backward replay pass. |
+| fused routing construction ABBA (GB200) | `520763`, 1 rank on a 4-GPU allocation | `submit_logs/bench_det_routing_fused_520763.out`, SHA256 `20aea5beed85…` | bf16/fp32 × 16/512/4096 tokens for DSV3 (256 experts, top-k 8) and Nemotron (512 experts, top-k 22): all 12 cells repeat exactly; fused/scatter speedup is 4.21–4.63× forward and 1.66–1.87× forward+backward. |
+| fused DSV3 cross-version certificate | `520570` / `520784`, independent 32-GPU allocations | `dsv3-fused-cross-version-520570-520784.json`, SHA256 `0e0cf6575a32…` | 6,080/6,080 events exact; zero divergences; 64 recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions per tree. |
+| fused Nemotron cross-version certificate | `520561` / `520785`, independent 32-GPU allocations | `nemotron-fused-cross-version-520561-520785.json`, SHA256 `9cc61f201005…` | 9,664/9,664 events exact; zero divergences; 192 recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions per tree. |
+| production routing `scatter_`/fused ABBA (GB200) | `520786`, fixed 32-GPU allocation | `perf-nemotron-fused-scatter-520786.out`, SHA256 `2980c4e33c93…` | median-of-leg medians 67.1→65.75 ms (-2.0%); forward pair -4.8%, reverse pair +1.1%; all 14-step loss, sequence-aux-loss, and grad-norm sequences are identical. |
+| post-fusion native/deterministic ABBA (GB200) | `520827`, fixed 32-GPU allocation | `perf-nemotron-fused-gap-520827.out`, SHA256 `c82242660b4d…` | median-of-leg medians: native 56.1 ms, deterministic 64.65 ms (+15.2%); forward pair +14.5%, reverse pair +16.0%. This confirms that closing routing does not close the remaining TE/attention/loss/gather gap on every allocation. |
+| post-fusion rank-scoped Nemotron profile (GB200) | `520828`, 32 GPUs | `profile-nemotron-fused-gap-520828/leaderboard.txt`, SHA256 `28f7a16c0038…`; `index-put-attribution.json`, SHA256 `bbad652beebd…` | `_DeterministicRoutingBackward` totals 0.376 ms; aggregate `index_put_` is 3.025 ms across eight ranges, all attributed to vocab cross-entropy or gather backward and none to routing. Latest deltas: MLP forward +3.38 ms, self-attention +1.32 ms, Mamba backward +2.79 ms, gather backward +1.75 ms, and vocab-CE backward +1.50 ms over the captured steps. |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -350,9 +357,9 @@ isolated ratio: deterministic `scatter_` still lowers the probability write
 through PyTorch's generic `index_put_` implementation. NVTX containment in the
 exported SQLite attributes four ≈1.0–1.3 ms indexed writes to routing-probability
 scatter, two to vocab-cross-entropy backward, two to gather backward, and four
-small writes to cross-entropy forward. The remaining direct opportunity is a
-fused collision-free routing kernel that creates probabilities and the boolean
-map without the generic deterministic scatter machinery.
+small writes to cross-entropy forward. The remaining direct opportunity at that
+point was a fused collision-free routing kernel that creates probabilities and
+the boolean map without the generic deterministic scatter machinery.
 
 Job `520625` measured the post-change full-stack gap with native/deterministic/
 deterministic/native ABBA ordering on one allocation. Median-of-leg medians were
@@ -362,11 +369,36 @@ and the reverse pair +1.6%. This is the first allocation to reach the aggressive
 it as a topology-independent guarantee. The direct old/new ABBA from job
 `520526` remains the attribution for this code change: -1.8%.
 
+Job `520763` bypassed the remaining generic deterministic scatter with a
+collision-free Triton kernel that initializes probabilities and the boolean map
+in one row program and gathers selected gradients in backward. Across DSV3 and
+Nemotron shapes, all 12 bf16/fp32 cells matched scatter byte-for-byte and the
+fused path was 4.21–4.63× faster forward and 1.66–1.87× faster
+forward+backward. Direct production ABBA job `520786` moved median-of-leg
+medians from 67.1 to 65.75 ms (-2.0%): its forward pair improved 4.8% while the
+reverse pair regressed 1.1%, again exposing overlap/order variance. DSV3 job
+`520784` and Nemotron job `520785` match the prior scatter build across
+independent 32-GPU allocations at 6,080/6,080 and 9,664/9,664 events.
+Post-fusion native/deterministic ABBA job `520827` measures 56.1/64.65 ms
+(+15.2%) with consistent +14.5%/+16.0% order pairs. Together with the +5.3%
+allocation in job `520625`, this confirms that the remaining full-stack gap is
+still topology/allocation-sensitive and is not routing alone.
+
+Rank-scoped profile job `520828` closes the attribution loop. The fused routing
+backward totals 0.376 ms over the capture, and SQLite containment finds only
+eight residual `aten::index_put_` ranges totaling 3.025 ms: four small vocab-CE
+forward writes, two vocab-CE backward writes, and two gather-backward writes.
+No residual indexed write is nested under routing. The leading remaining
+module/autograd deltas are MLP forward +3.38 ms, self-attention +1.32 ms,
+Mamba backward +2.79 ms, gather backward +1.75 ms, and vocab-CE backward
++1.50 ms over the captured steps.
+
 ### WS3 targets, by measured impact
 
 1. **Remaining deterministic TE/MoE kernel set** — allocation-sensitive from
-   +3.0 ms (+5.3%) in post-change job `520625` to +9.5–10.8 ms (+16–19%) in
-   jobs `520235`/`520311`. Preserve ABBA ordering and report both pairs; a single
+   +3.0 ms (+5.3%) in job `520625` to +8.55 ms (+15.2%) post-fusion in job
+   `520827`, with older +9.5–10.8 ms (+16–19%) results in jobs
+   `520235`/`520311`. Preserve ABBA ordering and report both pairs; a single
    placement is not a production guarantee.
 2. **Cross-domain ordered fp32 reduce-scatter — closed for the EP32 proxies.**
    The production fixed-logical-rank hierarchy reduces isolated latency from
@@ -375,18 +407,24 @@ it as a topology-independent guarantee. The direct old/new ABBA from job
    independent DSV3 and Nemotron allocations. Job `520311` shows no full-stack
    speedup because communication is hidden by other deterministic kernels.
    Retain the hierarchy as a performance and correctness gate.
-3. **Routing probability scatter** — `scatter_` contributes +5.79 ms over the
-   post-change capture and contains four ≈1.0–1.3 ms deterministic
-   `index_put_` writes. Evaluate a fused collision-free probability+map kernel.
-4. **Attention deterministic kernels** — self-attention +4.02 ms and core
-   attention +2.44 ms over the production capture.
-5. **Indexed loss/gather backward** — `_VocabParallelCrossEntropyBackward`
-   +2.84 ms and `GatherBackward0` +2.57 ms. The attribution tool separates these
-   from routing despite their shared `index_put_` implementation.
-6. **Deterministic grouped GEMM** — `_GroupedLinearBackward` +2.27 ms (+38.5%).
-7. **Mamba profile delta** — backward +7.31 ms in job `520565`, but the paired
-   Mamba-only attribution in job `519888` was step-time neutral. Re-isolate
-   before changing the fixed-config/workspace path.
+3. **Routing probability scatter — closed for the target shapes.** The fused
+   collision-free probability+map kernel is exact across both model traces and
+   removes the generic indexed-write path. It is 4.21–4.63× faster forward in
+   isolation and improves median-of-leg production step time by 2.0%. Retain
+   the fallback, CUDA-graph test, and two-allocation certificates as gates.
+4. **Indexed loss/gather backward** — latest job `520828` measures
+   `_VocabParallelCrossEntropyBackward` +1.50 ms and `GatherBackward0` +1.75 ms.
+   SQLite containment assigns all eight residual `index_put_` ranges to these
+   paths and CE forward, with none under routing.
+5. **Attention deterministic kernels** — latest self-attention +1.32 ms and
+   core attention +0.52 ms; job `520565` measured +4.02/+2.44 ms, so preserve
+   paired allocation evidence while optimizing.
+6. **Deterministic grouped GEMM** — `_GroupedLinearBackward` ranged from
+   +2.27 ms in job `520565` to -0.76 ms in job `520828`; re-isolate before
+   changing the kernel choice.
+7. **Mamba profile delta** — backward +2.79 ms in job `520828` (+7.31 ms in
+   `520565`), but paired Mamba-only attribution in job `519888` was step-time
+   neutral. Re-isolate before changing the fixed-config/workspace path.
 
 ### Low-risk cleanups and measured outcomes
 
@@ -400,6 +438,12 @@ it as a topology-independent guarantee. The direct old/new ABBA from job
   result is overlap/order-sensitive, and PyTorch still implements the source
   scatter through deterministic `index_put_`; retain the operator benchmark and
   model certificate rather than treating 1.8% as a universal speedup.
+- ✅ **Applied:** deterministic `scatter_` → fused collision-free probability
+  and boolean-map construction (`moe/ops/deterministic_routing.py`). The kernel
+  removes generic indexed-write dispatch and dense backward metadata; backward
+  is a selected-entry gather. Unsupported inputs retain the scatter fallback.
+  DSV3/Nemotron output, map, gradient, CUDA-graph, and cross-allocation trace
+  gates all pass; isolated and production gains are reported separately above.
 
 ## Verification backlog (the ⚠ rows)
 
