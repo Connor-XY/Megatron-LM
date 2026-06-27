@@ -380,6 +380,18 @@ small set of reductions and dispatch choices. They are fully enumerated in
   no missing hierarchical DP reductions. Nemotron EP32 job `522521` likewise
   matches 9,664/9,664 events with 192 exact recomputes, 2,304 collective events,
   zero pending collectives, and no missing hierarchical reductions.
+- **Checked-in weekly MCore gate:**
+  `tests/functional_tests/shell_test_utils/determinism/run_model_certification.sh`
+  now owns the two-run 32-GPU launch and strict certificate, while
+  `tests/test_utils/recipes/gb200/determinism-certification.yaml` registers the
+  DSV3 and Nemotron rows as weekly L3 GB200 workloads. Exact-runner AWS-DFW
+  validation passed in jobs `522695` and `522696`. DSV3 matched 6,080/6,080
+  events across a four-domain allocation (report SHA256 `9e887e0d821a…`);
+  Nemotron matched 9,664/9,664 on a single NVL72 domain (report SHA256
+  `fbb673910cfe…`). Both reports have exact recomputes, zero pending
+  collectives, and zero multi-rank DP reductions missing hierarchical fp32
+  accumulation. This gates the scaled MCore proxies; it is not a substitute for
+  the full Megatron-Bridge recipe.
 - **Vocab-embedding backward experiment (rejected):** AWS-DFW job `521744`
   compares the current deterministic direct-index backward with a stable-sort,
   fixed-order segmented reduction across 12 shape, dtype, and duplicate-token
@@ -397,9 +409,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
 
 ## 8. Known gaps (feeding the roadmap)
 
-1. **Scaled evidence is not yet CI-gated.** The EP32 MCore certificates close the
-   immediate coverage gap, but the full Bridge recipe still needs a weekly gate,
-   retained artifacts, and a same-mode control at 192/3,072 GPUs.
+1. **Full Bridge evidence is not yet CI-gated.** The checked-in weekly L3 GB200
+   rows retain strict EP32 MCore certificates for both model proxies, but the
+   full Bridge recipe still needs its own weekly gate, retained artifacts, and
+   a same-mode control at 192/3,072 GPUs.
 2. **The production perf target is not consistently closed.** The production
    fixed-logical-rank hierarchy removes the measured DP penalty in job `520235`:
    hierarchical-DP-only is 55.4 ms versus 55.6 ms native and 57.8 ms flat

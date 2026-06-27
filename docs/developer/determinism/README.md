@@ -115,6 +115,25 @@ perform no inter-rank reduction. Exit code 0 is a certificate, 1 is a failed
 invariant or cross-run divergence, and 2 is invalid input. Use `--json` to retain
 the complete evidence report.
 
+## Run the checked-in EP32 model certificates
+
+The multi-node runner launches and certifies two independent deterministic runs
+of either the DSV3-style or Nemotron-3-Ultra-style MCore proxy. Invoke it once
+per node in an 8-node, 4-GPU-per-node allocation; it derives node rank and node
+count from Slurm by default and writes the retained JSON report under
+`$OUTPUT_PATH/determinism-certification/`:
+
+```bash
+bash tests/functional_tests/shell_test_utils/determinism/run_model_certification.sh dsv3
+bash tests/functional_tests/shell_test_utils/determinism/run_model_certification.sh nemotron
+```
+
+`tests/test_utils/recipes/gb200/determinism-certification.yaml` registers both
+32-GPU certificates as weekly L3 GB200 workloads. Each workload fails unless
+all 32 ranks and both iterations are present, recomputes are exact, MoE and DP
+collective surfaces are covered, no collective remains pending, and every
+multi-rank DP reduction used hierarchical fp32 accumulation.
+
 ## Profile one distributed rank with Nsight Systems
 
 Profiling every rank produces redundant reports and can exhaust host resources.

@@ -1,0 +1,47 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: determinism
+  build: mcore-pyt-{environment}
+  nodes: 8
+  gpus: 4
+  n_repeat: 1
+  platforms: dgx_gb200
+  time_limit: 1800
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    cd /opt
+    rm -rf /opt/megatron-lm
+    mkdir megatron-lm
+    cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+  script: |-
+    set -euo pipefail
+    cd /opt/megatron-lm
+    export OUTPUT_PATH={assets_dir}
+    export GPUS_PER_NODE={gpus}
+    bash tests/functional_tests/shell_test_utils/determinism/run_model_certification.sh {certification_model}
+products:
+  - test_case: [dsv3_determinism_ep32]
+    products:
+      - certification_model: [dsv3]
+        environment: [dev]
+        scope: [weekly]
+        platforms: [dgx_gb200]
+  - test_case: [nemotron_determinism_ep32]
+    products:
+      - certification_model: [nemotron]
+        environment: [dev]
+        scope: [weekly]
+        platforms: [dgx_gb200]
