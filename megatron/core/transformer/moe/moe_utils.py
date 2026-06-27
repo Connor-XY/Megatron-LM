@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_para
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.ops.deterministic_index_select import deterministic_index_select
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -305,6 +306,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
+    dropless_topk: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -337,6 +339,9 @@ def permute(
         tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
                                                     actual token counts per expert.
         align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
+        dropless_topk (int, optional): The uniform number of experts selected per token.
+                                      Enables an optimized deterministic backward when every
+                                      token occurs exactly this many times. Defaults to None.
 
     Returns:
         Tuple[
@@ -424,7 +429,15 @@ def permute(
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    if (
+        dropless_topk is not None
+        and dropless_topk >= 4
+        and hidden >= 2048
+        and torch.are_deterministic_algorithms_enabled()
+    ):
+        permuted_input = deterministic_index_select(tokens, sorted_indices, dropless_topk)
+    else:
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 

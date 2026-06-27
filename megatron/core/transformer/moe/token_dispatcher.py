@@ -649,6 +649,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            # Before A2A, a dropless full routing map contains exactly topk entries per token.
+            dropless_topk=(
+                self.config.moe_router_topk
+                if self.config.moe_expert_capacity_factor is None
+                and not self.config.moe_router_padding_for_quantization
+                else None
+            ),
         )
         return permutated_local_input_tokens, permuted_probs
 
