@@ -369,9 +369,9 @@ _SHORTNAME_TO_INIT_KWARG = {
 # Each cell that exercises a specific quantization recipe carries it as an
 # explicit field in its TransformerConfig overrides — there is no global
 # attention-backend toggle. The TE attention backend is whatever NVTE's
-# default selection picks at first attention call; the deterministic-mode
-# guard at megatron/training/determinism.py rejects ``--use-flash-attn``
-# outright, so flash-attn is never reached under the determinism contract.
+# default selection picks at first attention call. Deterministic mode permits
+# FlashAttention and FusedAttention when TE supports a deterministic kernel for
+# the requested shape, but requires ``NVTE_ALLOW_NONDETERMINISTIC_ALGO=0``.
 #
 # FP8 recipe (specified per-cell in TransformerConfig overrides):
 #   fp8='hybrid' / fp8='e4m3'  + fp8_recipe='tensorwise' | 'delayed' | 'mxfp8'

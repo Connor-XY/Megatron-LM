@@ -169,7 +169,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
   `distributed/deterministic_collectives.py`): rank-indexed all-to-all or
   all-gather followed by a fixed local fp32 sum.
 - **TE attention** (`extensions/transformer_engine.py:1697`): asserts
-  `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` when `deterministic_mode` is on.
+  `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` when `deterministic_mode` is on, then TE
+  filters Flash/Fused/Unfused backends by input-specific deterministic support.
+  The backend must not be globally forced: dropout, layout, dtype, mask, and
+  architecture change which deterministic kernels are eligible.
 - **Inference/RL scheduling** (`dynamic_engine.py:607`,
   `data_parallel_inference_coordinator.py:181`, `rl/rl_utils.py:678`): sort by a
   stable key instead of completion order to remove timing jitter.
@@ -275,6 +278,16 @@ small set of reductions and dispatch choices. They are fully enumerated in
   forward masks, or generic index backward, with none under CE backward. The
   step-7 deterministic/native ratio is 1.15×, while self-attention and core
   attention remain the leading +22.743/+15.620 ms ranges.
+  A TE 2.17 source/runtime audit (`699987`/`700020`) then separates selection
+  from kernel cost. At dropout 0.1, deterministic fused attention is unavailable
+  for the dense input, so auto correctly selects Flash versus native fused.
+  Fixed-Flash job `699999` removes the forward/core-attention delta but leaves
+  Flash backward +6.034 ms (+37.4%). At dropout 0, auto job `700030` selects
+  fused attention in both modes; forcing it in job `700029` does not improve
+  the paired ratio. Fused backward remains +3.740 ms (+24.7%), followed by
+  LayerNormLinear backward +12.123 ms and compiled backward +7.666 ms over the
+  capture. There is no safe branch-side backend override; the attention kernel
+  gap is in TE.
 - **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
   `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
   two-launch comparison matched 6,080/6,080 semantic events, and the two
@@ -400,11 +413,15 @@ small set of reductions and dispatch choices. They are fully enumerated in
    (56.1/64.65 ms), and post-gather job `520963` measured +9.9% (54.85/60.3 ms)
    with +7.8%/+12.2% order pairs. Topology/allocation
    variance remains too large to declare the target closed globally. The
-   exposed DP and routing improvements can be hidden by communication overlap,
-   which leaves expert-score gather backward, attention, and deterministic
-   grouped GEMM as the primary measured kernel targets. Vocab-CE's local
-   backward is closed, while TP collective ordering remains open. Mamba's fixed
-   config/workspaces show no measurable slowdown in the paired attribution. The
+   exposed DP and routing improvements can be hidden by communication overlap.
+   After the strided CE fix, the refreshed dense step-7 ratio is 1.15× with
+   default dropout and 1.13× with dropout 0. The attention matrix rules out a
+   global backend override: TE already chooses the input-compatible backend,
+   while deterministic Flash/Fused backward, TE LayerNormLinear, and compiled
+   BDA remain measured kernel costs. Expert-score gather and grouped GEMM remain
+   MoE targets. Vocab-CE's local backward is closed, while TP collective
+   ordering remains open. Mamba's fixed config/workspaces show no measurable
+   slowdown in the paired attribution. The
    hierarchy also increases peak allocated memory in this proxy by about 140
    MiB because it materializes the locally permuted send buffer. Each further
    optimization must retain the two-allocation certificate.

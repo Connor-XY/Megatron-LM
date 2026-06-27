@@ -63,7 +63,8 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FlashAttention backward | TE; `extensions/transformer_engine.py:1697-1703` | atomic dQ/dK/dV accumulation | 🔵🟡 | TE deterministic FA kernels | TE atomic FA | `deterministic_mode` asserts `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | doc+code | dense proxy: +10.0 ms (+38%) over 3 profiled steps | **Deterministic FAG** (Longcat/DSV4): independent accum buffers + global deterministic sum. |
+| TE attention backend selection | TE; `extensions/transformer_engine.py:1697-1703`; `TransformerConfig.attention_backend` | FlashAttention / cuDNN FusedAttention / unfused DPA | 🔵🟡 | TE filters out backends/sub-backends that cannot honor deterministic execution | TE selects an eligible backend by internal priority and heuristics | `attention_backend`, `NVTE_{FLASH,FUSED,UNFUSED}_ATTN`, `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | source+profile+**test** | dense dropout 0.1: det Flash vs native fused; dropout 0: fused in both modes; forcing fused shows no gain | Do not globally force a backend: deterministic fused is unavailable for the profiled dropout-0.1 shape, and forcing fused at dropout 0 does not improve the paired ratio. Nemotron's dropout-0 fused recipe is model-certified. |
+| FlashAttention backward | TE; `extensions/transformer_engine.py:1697-1703` | atomic dQ/dK/dV accumulation | 🔵🟡 | TE deterministic FA kernels | TE atomic FA | `deterministic_mode` asserts `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | source+profile+code | fixed-Flash dense profile: +6.034 ms (+37.4%) over the capture | **Deterministic FAG** (Longcat/DSV4): independent accumulation buffers + global deterministic sum remains an external TE/kernel target. |
 | Core attention fwd | TE `DotProductAttention` | fused attn | 🟢 | — | — | — | doc | — | Forward deterministic. |
 | Multi-Latent Attention (MLA) | `transformer/multi_latent_attention.py` (q/kv low-rank proj + YaRN rope) | low-rank GEMMs + rope | 🟢 | — | — | — | doc+**test** | — | **Verified** bit-exact by `test_deepseek_model.py` (DSV3 MLA + qk_layernorm + YaRN) across EP/TP/FSDP/PP/VPP. |
 | Attention dropout | `transformer/dot_product_attention.py:114-220` | RNG mask | 🟡 | fixed RNG state | — | RNG | doc | — | Set dropout=0 for hero runs to eliminate. |
@@ -200,6 +201,10 @@ script. Cluster-local artifacts are retained under:
 | stride-aware fused-CE production ABBA (GB300) | AWS-CMH `699912`, fixed 4-GPU allocation | `perf-dense-ce-warm-699912.out`, SHA256 `0dd8057cfe1a…` | After a 200-step thermal warmup, iterations 11–50 improve 63.25→52.05 ms in forward order (-17.7%) and 66.8→61.2 ms in reverse order (-8.4%); median-of-leg medians improve 65.025→56.625 ms (-12.9%). All 50 loss and grad-norm values match across all four legs. |
 | final-source DSV3 EP32 certificate | AWS-DFW `522520`, 32 GPUs | `det-dsv3-fused-ep32-522520/certification.json`, SHA256 `62b506f4c16a…` | Two launches match 6,080/6,080 events with zero divergences, 64 exact recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
 | final-source Nemotron EP32 certificate | AWS-DFW `522521`, 32 GPUs | `det-nemotron-fused-ep32-522521/certification.json`, SHA256 `b1f8b2688382…` | Two launches match 9,664/9,664 events with zero divergences, 192 exact recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| TE 2.17 attention determinism source audit (GB300 image) | AWS-CMH `699987` | `inspect-te-attention-699987.out`, SHA256 `abff0bf5bdfb…` | TE derives `deterministic` from `NVTE_ALLOW_NONDETERMINISTIC_ALGO` or torch global state, filters backend eligibility, and documents deterministic FlashAttention ≥2.4.1 plus conditional fused sub-backends 0/1; fused sub-backend 2 is non-deterministic. |
+| forced-fused dropout-0.1 diagnostic (GB300) | AWS-CMH `700020`, 4 GPUs | `det-attn-backend-700020.out`, SHA256 `d7211a9035f1…` | Expected failure: TE debug reports the exact dense `sbh3d`, bf16, causal, seq-256, dropout-0.1 input has no deterministic fused backend. This rules out a global force-fused override. |
+| fixed-Flash attention profile (GB300) | AWS-CMH `699999`, 4 GPUs | console SHA256 `38568432111d…`; deterministic SQLite SHA256 `d4b3343c5171…` | With Flash forced in both modes, attention forward/core attention are -3.894/-0.672 ms (no deterministic penalty within profile noise), while `FlashAttnFuncBackward` is +6.034 ms (+37.4%). Step 7 is 130.1/115.5 ms (1.13×). |
+| dropout-0 attention backend matrix (GB300) | AWS-CMH fused `700029`, auto `700030`, 4 GPUs each | console SHA256 `5c6bcfe71b52…` / `e14fddbf33f6…`; deterministic SQLite SHA256 `4e7d4b343a68…` / `54dd4ac03c37…` | Auto selects fused attention in both modes. Forcing fused does not improve the paired ratio in these placements: 1.18× forced versus 1.13× auto. In auto, fused-attention backward is +3.740 ms (+24.7%), LayerNormLinear backward +12.123 ms, and compiled backward +7.666 ms over the capture. |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -460,11 +465,15 @@ attributed indexed-write target at +1.621 ms.
    `where` alternative regressed. TP collective ordering remains a separate
    correctness/performance gap.
 6. **Attention deterministic kernels** — refreshed dense GB200/GB300 profiles
-   agree that this is now the leading branch. HSG job `3614788` measures
-   self-attention/core-attention at +21.351/+13.898 ms over the capture, and
-   AWS-CMH final-source job `699916` measures +22.743/+15.620 ms. Deterministic
-   mode selected `FlashAttnFunc` while native selected `FusedAttnFunc`; isolate
-   backend selection and deterministic-kernel cost before changing policy.
+   exposed both backend selection and intrinsic deterministic-kernel cost. With
+   dropout 0.1, deterministic fused attention is unsupported and auto selects
+   Flash while native selects fused. Fixing both modes to Flash removes the
+   forward delta, but deterministic Flash backward remains +6.034 ms (+37.4%).
+   With production-like dropout 0, auto selects fused in both modes; forcing
+   fused does not improve the paired ratio, and fused backward remains
+   +3.740 ms (+24.7%). There is no safe MCore backend override. The kernel
+   optimization belongs in TE;
+   MCore should retain the auto selector and model-level certificates.
 7. **Deterministic grouped GEMM** — `_GroupedLinearBackward` ranged from
    +2.27 ms in job `520565` to -0.76 ms in job `520828`; re-isolate before
    changing the kernel choice.
