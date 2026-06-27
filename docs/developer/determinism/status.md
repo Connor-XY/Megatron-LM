@@ -60,6 +60,10 @@ Profiling attributes most of the gap to a handful of ops — see
 [`op-catalog.md`](./op-catalog.md) "Hotspots". The headline offenders from the
 det-vs-nondet nsys leaderboard are `aten::fill_`, `aten::empty`,
 `aten::index_put_`, `scatter_add`, and `cub::DeviceRadixSort` (MoE top-k path).
+On this branch, a same-allocation Nemotron EP32 proxy now measures **+10.2%**
+(79.9 vs 72.5 ms median): ordered fp32 DP reduction contributes +3.6%, while
+the remaining deterministic TE/MoE branches contribute about +6.4%. Paired
+Mamba workspace/config attribution shows no measurable Mamba slowdown.
 
 ## 4. Control plane — how determinism is turned on
 
@@ -212,7 +216,12 @@ small set of reductions and dispatch choices. They are fully enumerated in
   auxiliary loss, and grad norm matched as well. The Slurm wrappers exited 1
   only after comparison because their temporary summary snippet referenced an
   undefined local variable; the retained comparison JSON and strict certifier
-  both pass. Nemotron-style hybrid EP32 jobs
+  both pass. Follow-up job `519887` extended the same topology to four optimizer
+  updates per launch: the strict certifier matched 12,416/12,416 events, 128
+  recomputes, and 4,096 collective boundaries with zero pending operations. Its
+  wrapper likewise failed only in a stale post-check that expected 64 trace
+  files instead of the correct 128; the comparison and certifier both pass.
+  Nemotron-style hybrid EP32 jobs
   `518541` and `518542` kept the fused memory-efficient Mamba path and matched
   9,664/9,664 events within each allocation and
   across allocations, including 192 exact activation recomputes, 1,152 completed
@@ -234,10 +243,17 @@ small set of reductions and dispatch choices. They are fully enumerated in
 1. **Scaled evidence is not yet CI-gated.** The EP32 MCore certificates close the
    immediate coverage gap, but the full Bridge recipe still needs a weekly gate,
    retained artifacts, and a same-mode control at 192/3,072 GPUs.
-2. **~15% perf overhead** remains concentrated in MoE scatter/unpermute,
-   FlashAttention backward (FAG), grouped GEMM, top-k radix sort, ordered DP
-   reduction, and fixed-config Mamba kernels. Each optimization must retain the
-   two-allocation certificate.
+2. **The production perf target is not fully closed.** The paired Nemotron EP32
+   proxy is now +10.2%, with +3.6% from cross-domain ordered DP reduction and
+   about +6.4% from the remaining TE/MoE deterministic branches. Mamba's fixed
+   config/workspaces show no measurable slowdown in the paired attribution. A
+   fixed-logical-rank hierarchical reduction prototype halves the isolated
+   cross-domain ordered latency (1.117 ms versus 2.249 ms in the exact-hash
+   run). It matches exact output hashes across single- and cross-domain
+   allocations on all 32 ranks; native NCCL differs on 32/32. The tradeoff is
+   0.605 ms versus 0.452 ms for the current ordered path on one NVL72 domain.
+   It is not yet wired into DDP or certified end to end. Each optimization must
+   retain the two-allocation certificate.
 3. **First-divergence tooling still has uncovered runtime surfaces.**
    `compare_dumps.py` localizes existing activation/param/wgrad/dgrad dumps, and
    the structured runtime trace now covers phase ordering, Megatron recompute

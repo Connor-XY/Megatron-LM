@@ -95,7 +95,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | floating-point NCCL collective | 🔵 | ordered fp32 reduce-scatter for deterministic distributed optimizer | native NCCL | deterministic args | code+**test** | hash tracing is debug-only | Native floating-point collectives are allocation-topology-sensitive even with Ring. Non-distributed-optimizer all-reduce remains a gap. |
-| fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | rank-indexed ordered fp32 sum | native RS | forced in deterministic distributed optimizer | code+**test** | TBD | One optimizer instance and no collective AVG are enforced. Final DSV3 EP32 jobs `518849`/`518850` matched 6,080/6,080 trace events across independent allocations. |
+| fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | rank-indexed ordered fp32 sum | native RS | forced in deterministic distributed optimizer | code+**test** | isolated 32×GB200: single-domain **35–37% faster**, cross-domain **1.94–2.24× slower**; paired Nemotron proxy: **+3.6% step time** | One optimizer instance and no collective AVG are enforced. Final DSV3 EP32 jobs `518849`/`518850` matched across allocations. A fixed-rank hierarchical prototype halves cross-domain latency and preserves exact cross-topology hashes; production integration/end-to-end certification is pending. |
 | Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | NCCL all-gather | 🟢 | rank-indexed byte copies | — | always | code+**test** | hash tracing is debug-only | No floating-point reduction; structured trace fingerprints sync and overlapped gathers without adding a collective or wait. |
 | Distributed optimizer param order | `optimizer/distrib_optimizer.py:1094` | shard mapping | 🟢 | "preserving deterministic ordering across ranks" | — | always | code | — | — |
 | Grad clip global norm | `optimizer/clip_grads.py`, `distributed/deterministic_collectives.py` | SUM reduction | 🔵 | rank-ordered all-gather + local sum | native all-reduce | deterministic algorithms | code+**test** | TBD | Closed a one-ulp scalar divergence that otherwise changed every optimizer parameter. Intended only for small statistics. |
@@ -105,11 +105,11 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Triton autotune | `megatron/determinism_env.py`, `ssm/ops/determinism.py`, external `mamba_ssm.utils.determinism` | autotune config select | 🔵 | one fixed config (`TRITON_CACHE_AUTOTUNING=0`) | timing-selected config | early deterministic env | code+**test** | TBD | Cold cached-autotune selected different reduction tilings across launches; env setup must precede kernel-module import. |
-| Tiled reduction workspace | `ssm/ops/determinism.py:106-123` | `zeros`+`sum` vs `empty` | 🔵 | ordered tile sum | unordered | `use_deterministic_mode()` | code | mem+ | Extra memory for tiled reduction. |
+| Triton autotune | `megatron/determinism_env.py`, `ssm/ops/determinism.py`, external `mamba_ssm.utils.determinism` | autotune config select | 🔵 | one fixed config (`TRITON_CACHE_AUTOTUNING=0`) | timing-selected config | early deterministic env | code+**test** | paired Nemotron EP32 proxy: fixed 74.5 ms vs autotuned 75.0 ms (no slowdown) | Cold cached-autotune selected different reduction tilings across launches; env setup must precede kernel-module import. |
+| Tiled reduction workspace | `ssm/ops/determinism.py:106-123` | `zeros`+`sum` vs `empty` | 🔵 | ordered tile sum | unordered | `use_deterministic_mode()` | code | paired Nemotron EP32 proxy: workspace+autotune 75.0 ms vs normal 75.5 ms (no slowdown) | Extra memory for tiled reduction; no measurable step-time cost in the current proxy. |
 | Gated-delta-rule kernel | `ssm/gated_delta_net.py:213-216` | torch vs FLA fused | 🔵 | `torch_chunk_gated_delta_rule` | FLA fused | `deterministic_mode` | code | TBD | — |
 | Causal conv1d | `ssm/gated_delta_net.py:430-446` | `F.conv1d` vs FLA | 🔵 | `F.conv1d` (+transpose) | `causal_conv1d` | `deterministic_mode` | code | TBD | — |
-| Mamba-2 combined training | `ssm/mamba_mixer.py`, external `mamba_ssm` | fused causal conv + selective scan | 🟢🟡 | fused path with deterministic workspaces and fixed Triton config | same path with timing autotune / atomic reductions | early env + torch deterministic algorithms | code+**test** | production-scale delta pending | Fused EP32 jobs `518541`/`518542` matched 9,664/9,664 events within and across allocations without launcher-supplied Mamba/Triton env. Disabling only the fused path did not fix cold-cache autotune drift; pinning config did. |
+| Mamba-2 combined training | `ssm/mamba_mixer.py`, external `mamba_ssm` | fused causal conv + selective scan | 🟢🟡 | fused path with deterministic workspaces and fixed Triton config | same path with timing autotune / atomic reductions | early env + torch deterministic algorithms | code+**test** | paired EP32 proxy: no measurable deterministic Mamba overhead (74.5–75.0 ms vs normal 75.5 ms) | Fused EP32 jobs `518541`/`518542` matched 9,664/9,664 events within and across allocations without launcher-supplied Mamba/Triton env. Disabling only the fused path did not fix cold-cache autotune drift; pinning config did. |
 | Packed sequence (`thd`) | `ssm/gated_delta_net.py:314` | — | 🔴 | — | thd | asserted off | code | — | **Gap**: no deterministic packed-seq SSM path. |
 
 ### Inference / RL (not training-loop, listed for completeness)
@@ -143,6 +143,15 @@ script. Cluster-local artifacts are retained under:
 | top-k-8/hidden-2048 parent→optimized A/B | `10429428` / `batch-block1-3968` | `det-profile-topk8-results/{baseline,candidate}/console.log`, SHA256 `bf5e8d8cc5fe…` / `794c70496a4f…` | parent 242.8 / 189.1 ms; optimized 241.4 / 192.3 ms |
 | top-k-8/hidden-2048 optimized→parent B/A | `10429492` / `batch-block1-2042` | `det-profile-topk8-results-repeat2/{candidate,baseline}/console.log`, SHA256 `e4feffa550d5…` / `80af2d8832d2…` | optimized 237.4 / 195.0 ms; parent 238.3 / 194.2 ms |
 | production helper isolated ABBA (GB200) | `516088` / `nvl72d040-T11` | `submit_logs/perf_det_idx_select_516088.out`, SHA256 `0cddc145a70e…` | bit-exact; 6.5–55.4% latency reduction across top-k 4/8 and hidden 4096/7168 |
+| fp32 reduce-scatter, both A/B orders (GB200) | `519609` / `519610`, 32 GPUs | `bench-det-rs-519609.out`, SHA256 `fd9bd65d42f2…`; `bench-det-rs-ordered-519610.out`, SHA256 `0292b6e73b67…` | ordered 0.505–0.520 ms vs native 0.777–0.820 ms; ordered/native 0.63–0.65× |
+| fp32 reduce-scatter, cross-domain (GB200) | `519905`, 32 GPUs across `nvl72d038`/`nvl72d049` | `bench-det-rs-519905.out`, SHA256 `3cc9304aaad3…` | ordered 3.081 ms vs native 1.372 ms; ordered/native 2.24×; max absolute numerical delta 9.54e-6 |
+| fp32 reduce-scatter, cross-domain repeat (GB200) | `519924`, 32 GPUs across `nvl72d049`/`nvl72d070` | `bench-det-rs-519924.out`, SHA256 `d301f26b3768…` | ordered 2.389 ms vs native 1.230 ms; ordered/native 1.94×; max delta 9.54e-6 (3.13e-7 of max magnitude) |
+| Nemotron Mamba attribution (GB200) | `519888`, 32 GPUs across `nvl72d039`/`nvl72d069` | `perf-nemotron-decompose-519888.out`, SHA256 `fa1e0917d177…` | normal 75.5 ms; deterministic workspace+autotune 75.0 ms; deterministic workspace+fixed config 74.5 ms |
+| Nemotron deterministic attribution (GB200) | `519928`, 32 GPUs across `nvl72d038`/`nvl72d039` | `perf-nemotron-dp-attribution-519928.out`, SHA256 `221507ab2f1a…` | native 72.5 ms; ordered-DP-only 75.1 ms (+3.6%); full deterministic 79.9 ms (+10.2%) |
+| hierarchical ordered RS, forward order (GB200) | `519943`, 32 GPUs across `nvl72d021`/`nvl72d069` | `bench-det-rs-hier-519943.out`, SHA256 `f0c4184216b6…` | hierarchical 1.153 ms; current ordered 2.314 ms; native 1.183 ms; same 9.54e-6 max delta to native |
+| hierarchical ordered RS, reverse order (GB200) | `519967`, 32 GPUs across `nvl72d036`/`nvl72d070` | `bench-det-rs-hier-rev-519967.out`, SHA256 `c8025fb9aa0f…` | hierarchical 1.144 ms; current ordered 2.329 ms; native 1.191 ms; same 9.54e-6 max delta to native |
+| hierarchical RS exact-hash cross-domain (GB200) | `520019`, 32 GPUs across `nvl72d039`/`nvl72d070` | `bench-det-rs-hier-rev-520019.out`, SHA256 `b5ce2fa2422f…` | hierarchical 1.117 ms; current ordered 2.249 ms; native 1.140 ms |
+| hierarchical RS exact-hash single-domain (GB200) | `520022`, 32 GPUs in `nvl72d039` | `bench-det-rs-hier-hash-520022.out`, SHA256 `de84be49e350…` | hierarchical 0.605 ms; current ordered 0.452 ms; native 0.801 ms; ordered and hierarchical hashes match `520019` on all ranks, native differs on 32/32 |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -254,17 +263,51 @@ time also moves in the right direction in both orderings, but its 0.4–0.6% cha
 is comparable to control drift, so it is not yet a statistically isolated
 end-to-end speedup. One run clears the 1.25× gate and one remains at 1.26×.
 
+### Measured — Nemotron hybrid EP32 paired attribution (32×GB200)
+
+Job `519928` ran three 14-iteration modes serially on the same cross-domain
+allocation (`nvl72d038` + `nvl72d039`), with the same fused Mamba+attention+MoE
+model and fixed Mamba config. Medians below use steady iterations 6–14; the
+single 456 ms system outlier in the full-deterministic leg does not affect its
+median (and the corresponding trimmed mean is 79.8 ms).
+
+| mode | median step | delta vs native | attribution |
+| --- | --- | --- | --- |
+| fast kernels + native DP reduce-scatter | 72.5 ms | — | paired baseline |
+| fast kernels + ordered fp32 DP reduce-scatter | 75.1 ms | **+3.6%** | cross-domain deterministic DP cost |
+| full deterministic mode | 79.9 ms | **+10.2%** | DP plus deterministic TE/MoE branches |
+
+Thus the ordered DP path accounts for about 2.6 ms and the remaining
+deterministic TE/MoE branches for about 4.8 ms on this proxy. A separate paired
+Mamba-only attribution in job `519888` measured 75.5 ms normal, 75.0 ms with
+deterministic workspaces plus autotuning, and 74.5 ms with deterministic
+workspaces plus the fixed config. Mamba is not the current step-time gap. The
+job's unused full-deterministic leg correctly rejected an intentionally retained
+`NVTE_ALLOW_NONDETERMINISTIC_ALGO=1`; the three completed Mamba legs precede
+that launcher error.
+
 ### WS3 targets, by measured impact
 
-1. **Remaining deterministic scatter-add backward work** — `GatherBackward0`
+1. **Remaining deterministic TE/MoE kernel set** — about +4.8 ms in the paired
+   Nemotron proxy. Split grouped-GEMM/attention from scatter-add with GPU kernel
+   timing before changing another branch.
+2. **Cross-domain ordered fp32 reduce-scatter** — about +2.6 ms (+3.6% step
+   time) in the paired proxy and 1.94–2.24× native latency in isolated 32-GPU
+   tests. A fixed-logical-rank hierarchical candidate repeated at 1.117–1.153
+   ms cross-domain versus 2.249–2.329 ms for the current ordered path. Its
+   single-domain cost is 0.605 ms versus 0.452 ms current ordered. Across those
+   two topologies, both deterministic variants matched exact output hashes on
+   all 32 ranks while native NCCL differed on 32/32. Production DDP integration
+   and end-to-end certification are next.
+3. **Remaining deterministic scatter-add backward work** — `GatherBackward0`
    remains ≈+75 ms over 3 steps, and `IndexAddBackward0` remains det-only. The
    optimized index-select path closes its guarded slice, but top-k <4 and hidden
    <2048 retain the PyTorch fallback.
-2. **MoE MLP range** (+262 ms over 3 steps) — isolate deterministic grouped GEMM
+4. **MoE MLP range** (+262 ms over 3 steps) — isolate deterministic grouped GEMM
    (`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`) from token unpermute before changing it.
-3. **Deterministic grouped GEMM** wgrad (`_GroupedLinearBackward` +18%).
-4. **MLA / attention deterministic kernels** (+20% module-range time).
-5. **`_VocabParallelCrossEntropy` deterministic backward** (+154%; all models).
+5. **Deterministic grouped GEMM** wgrad (`_GroupedLinearBackward` +18%).
+6. **MLA / attention deterministic kernels** (+20% module-range time).
+7. **`_VocabParallelCrossEntropy` deterministic backward** (+154%; all models).
 
 ### Free cleanups found along the way (correct but ~wall-clock-neutral on the proxy)
 
@@ -332,6 +375,9 @@ optimizer runs. The comparison included 48 DP reduction/gather boundary events,
 **Verified (EP32, ordered DP, and scaled recompute):** AWS-DFW GB200 jobs
 `518849` and `518850` independently certified final DSV3-style EP32 runs, with
 6,080/6,080 semantic events matching both within and across allocations.
+Follow-up job `519887` extended that topology to four optimizer updates per
+launch and matched 12,416/12,416 events, including 128 recomputes and 4,096
+collective boundaries with zero pending operations.
 Nemotron-style fused-Mamba+attention+MoE EP32 jobs `518541` and `518542` matched
 9,664/9,664 events within each allocation and across allocations. Each trace
 tree contained 192 matching recomputes, 1,152 completed collective hashes, no

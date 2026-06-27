@@ -112,6 +112,37 @@ ordered fp32 data-parallel reduction path. Exit code 0 is a certificate, 1 is a
 failed invariant or cross-run divergence, and 2 is invalid input. Use `--json`
 to retain the complete evidence report.
 
+## Benchmark the deterministic data-parallel reduction
+
+Use the distributed microbenchmark to compare the native NCCL reduce-scatter
+with the rank-ordered fp32 implementation at the actual gradient-bucket size:
+
+```bash
+torchrun \
+  --nnodes 8 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" --master-port 29500 \
+  tools/determinism/benchmark_reduce_scatter.py \
+  --numel 41943040 --warmup 3 --iterations 10 \
+  --hierarchical-group-size 4
+```
+
+Run both `--order native-first` and `--order ordered-first` to expose ordering
+or cache effects, and repeat on the allocation topology used by the target
+recipe: single-domain and cross-domain results can differ substantially. Rank 0
+prints JSON with min/median/max latency, every sample, the ordered/native median
+ratio, numerical-difference bounds, rank-to-host placement, and exact output
+SHA-256 hashes by rank. The benchmark synchronizes each sample and reports the
+slowest rank, so it measures isolated collective latency rather than
+communication/computation overlap in a training step.
+
+`--hierarchical-group-size` additionally evaluates a two-level deterministic
+candidate. It first sums fixed contiguous logical-rank groups, then sums those
+partials in fixed group order; it does not choose a tree from measured timing.
+The candidate is currently a profiling tool, not the production DDP path. Its
+group size must divide the world size and should map the target recipe's logical
+DP ranks onto fast local communication domains.
+
 ## Maintenance
 
 Keep the catalog **evidence-based**: classify each op via PyTorch/TE/NCCL docs, an
