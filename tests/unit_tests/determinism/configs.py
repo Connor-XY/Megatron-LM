@@ -72,8 +72,13 @@ def hybrid_base() -> dict:
     return dict(_BASE_HYBRID)
 
 
-def moe_overrides(tp: int = 1, ep: int = 1) -> dict:
-    """Return MoE overrides. When ``tp > 1`` we must also enable
+def moe_overrides(tp: int = 1, ep: int = 1, *, enable_moe: bool = True) -> dict:
+    """Return MoE defaults and parallelism propagation overrides.
+
+    ``enable_moe`` controls whether the generic four-expert topology is
+    included. Specialized model presets such as DeepSeek and Nemotron already
+    define their topology, so their EP cells set it to ``False`` and receive
+    only the parallelism fields below. When ``tp > 1`` we must also enable
     ``sequence_parallel`` (MoE+TP without SP raises in moe_layer.py) and
     propagate ``tensor_model_parallel_size`` into the config (otherwise
     the SP validator sees TP=1 in the config and rejects SP=True). When
@@ -82,13 +87,21 @@ def moe_overrides(tp: int = 1, ep: int = 1) -> dict:
     ``ColumnParallelLinear``/``RowParallelLinear`` reads
     ``config.expert_model_parallel_size`` to decide whether expert weights
     use the expert tp_group or the dense tp_group."""
-    overrides = dict(_MOE_OVERRIDES)
+    overrides = dict(_MOE_OVERRIDES) if enable_moe else {}
     if tp > 1:
         overrides["sequence_parallel"] = True
         overrides["tensor_model_parallel_size"] = tp
     if ep > 1:
         overrides["expert_model_parallel_size"] = ep
     return overrides
+
+
+def merge_moe_overrides(
+    base_config: dict, config_overrides: dict, tp: int = 1, ep: int = 1
+) -> dict:
+    """Apply MoE parallelism fields without replacing model-defined topology."""
+    model_has_moe = (base_config | config_overrides).get("num_moe_experts") is not None
+    return {**config_overrides, **moe_overrides(tp, ep, enable_moe=not model_has_moe)}
 
 
 # DeepSeek-V3-style proxy base. Built on ``MLATransformerConfig`` by the test
@@ -197,15 +210,41 @@ HYBRID_CONFIGS = [
 ]
 
 
-# DeepSeek-V3 proxy presets. MLA + MoE config lives in ``deepseek_base()``;
-# overrides here only carry per-cell variations (none yet — one canonical cell).
-DEEPSEEK_CONFIGS = [pytest.param({}, id="dsv3-like")]
+# DeepSeek-V3 proxy presets. The A2A variant raises hidden size and top-k to
+# exercise the fixed-order deterministic index-select backward used by the
+# production dispatcher path.
+DEEPSEEK_CONFIGS = [
+    pytest.param({}, id="dsv3-like"),
+    pytest.param(
+        dict(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            num_moe_experts=16,
+            moe_router_topk=8,
+            moe_token_dispatcher_type="alltoall",
+        ),
+        id="dsv3-a2a-topk8",
+    ),
+]
 
 
 # Nemotron-3-Ultra proxy presets. The first arg is the hybrid layer pattern.
 # ``M*E`` = Mamba + attention + MoE — the three layer types that define the
-# Nemotron-3-Ultra stack. MoE config lives in ``nemotron_hybrid_base()``.
-NEMOTRON_CONFIGS = [pytest.param("M*E", {}, id="mamba-attn-moe")]
+# Nemotron-3-Ultra stack. The A2A variant reaches the same optimized
+# deterministic dispatcher path with Nemotron's hybrid stack around it.
+NEMOTRON_CONFIGS = [
+    pytest.param("M*E", {}, id="mamba-attn-moe"),
+    pytest.param(
+        "M*E",
+        dict(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            moe_router_topk=6,
+            moe_token_dispatcher_type="alltoall",
+        ),
+        id="mamba-attn-moe-a2a-topk6",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +302,7 @@ def parallelism_configs(*, exclude: tuple[str, ...] = ()) -> list:
 
 # DeepSeek-V3 proxy parallelism matrix. MoE is always on (baked into
 # ``deepseek_base``). Cells are chosen so MoE is valid without extra wiring:
-# either EP>1 (the runner merges ``moe_overrides`` → sets SP + TP/EP propagation)
+# either EP>1 (the runner applies MoE parallelism propagation)
 # or TP==1 (no MoE+TP sequence-parallel requirement). EP is DSV3's signature
 # parallelism; FSDP/PP cells exercise MLA + dense-EP determinism.
 DEEPSEEK_PARALLELISM_CONFIGS = [
