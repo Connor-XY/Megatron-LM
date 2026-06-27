@@ -156,6 +156,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
   mode keeps `sorted=True` in both no-grad forward and grad-enabled recompute.
 - **Vocab embedding fwd** (`tensor_parallel/layers.py:299`): direct `weight[idx]`
   (det backward) vs `F.embedding` (non-det backward).
+- **Vocab-parallel CE backward** (`tensor_parallel/cross_entropy.py`,
+  `tensor_parallel/deterministic_cross_entropy.py`): a collision-free Triton
+  pass fuses the selected-class subtract, smoothing, and output scaling. It
+  loads contiguous or 2D-strided loss gradients in logical row order; unusual
+  layouts retain the equivalent PyTorch fallback.
 - **Mamba/SSM** (`ssm/ops/determinism.py`, `ssm/mamba_mixer.py`,
   `ssm/gated_delta_net.py`): fixed Triton config + tiled-workspace reductions;
   the fast fused Mamba path remains enabled; gated-delta-net uses torch
@@ -262,6 +267,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
   `empty_like` (14.0%), `_to_copy` (12.0%), and `zeros` (8.6%), showing that the
   aggregate fill delta is distributed rather than one removable allocation.
   AWS-DFW job `522195` passes all six attribution-tool tests.
+  Fresh dense profiles on HSG GB200 (`3614788`) and AWS-CMH GB300 (`699350`)
+  then exposed a batch-2 vocab-CE fallback: deterministic CE backward was
+  17.808 and 18.713 ms, respectively. With direct 2D-strided gradient loads,
+  AWS-CMH job `699916` reduces it to 7.001 ms (-62.6% from the refreshed
+  baseline); its 80 residual `index_put_` ranges belong to embeddings, CE
+  forward masks, or generic index backward, with none under CE backward. The
+  step-7 deterministic/native ratio is 1.15×, while self-attention and core
+  attention remain the leading +22.743/+15.620 ms ranges.
 - **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
   `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
   two-launch comparison matched 6,080/6,080 semantic events, and the two
@@ -334,6 +347,26 @@ small set of reductions and dispatch choices. They are fully enumerated in
   improves the median-of-leg medians 66.475→64.675 ms (-2.7%); both order pairs
   improve and all loss, sequence-aux-loss, and grad-norm values match. The
   measured-slower forward `where` candidate is not applied.
+- **Strided vocab-CE hardening:** refreshed dense profiles exposed that the
+  training loss gradient is non-contiguous at micro-batch size 2, so the first
+  fused implementation fell back to deterministic `index_put_`. HSG GB200 job
+  `3614788` measures vocab-CE backward at 17.808/5.373 ms and AWS-CMH GB300 job
+  `699350` at 18.713/5.183 ms; the latter contains 16 CE-backward indexed writes
+  totaling 9.431 ms. The final kernel loads the common 2D-strided layout
+  directly without an allocation or copy. AWS-DFW jobs `522493`/`522494` are
+  byte-exact in all 12 benchmark cells and pass all 35 focused cases, including
+  strided CUDA-graph replay and full batch-3 CE integration; the isolated
+  speedup over the indexed-write fallback is 14.41–16.52×. A contiguous-copy
+  experiment (`699565`) had a favorable median-of-leg result but contradictory
+  +8.4%/-17.1% order pairs, so that allocation-adding design was not retained.
+  The final stride-aware production ABBA (`699912`) improves both order pairs
+  (-17.7%/-8.4%) and the median-of-leg medians 65.025→56.625 ms (-12.9%);
+  all four 50-step loss and grad-norm sequences are identical.
+  Final-source DSV3 EP32 job `522520` matches 6,080/6,080 semantic events with
+  64 exact recomputes, 1,920 collective events, zero pending collectives, and
+  no missing hierarchical DP reductions. Nemotron EP32 job `522521` likewise
+  matches 9,664/9,664 events with 192 exact recomputes, 2,304 collective events,
+  zero pending collectives, and no missing hierarchical reductions.
 - **Vocab-embedding backward experiment (rejected):** AWS-DFW job `521744`
   compares the current deterministic direct-index backward with a stable-sort,
   fixed-order segmented reduction across 12 shape, dtype, and duplicate-token

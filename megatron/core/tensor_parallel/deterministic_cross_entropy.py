@@ -26,9 +26,13 @@ def _cross_entropy_backward(
     indices_ptr,
     updates_ptr,
     grad_output_ptr,
+    grad_output_stride_0,
+    grad_output_stride_1,
     numel,
     smoothing_update,
     num_columns: tl.constexpr,
+    grad_output_columns: tl.constexpr,
+    grad_output_is_contiguous: tl.constexpr,
     block_size: tl.constexpr,
     has_smoothing: tl.constexpr,
 ):
@@ -39,7 +43,15 @@ def _cross_entropy_backward(
     columns = offsets - rows * num_columns
     selected_columns = tl.load(indices_ptr + rows, mask=mask)
     selected_updates = tl.load(updates_ptr + rows, mask=mask)
-    grad_output = tl.load(grad_output_ptr + rows, mask=mask)
+    if grad_output_is_contiguous:
+        grad_output_offsets = rows
+    else:
+        grad_output_rows = rows // grad_output_columns
+        grad_output_cols = rows - grad_output_rows * grad_output_columns
+        grad_output_offsets = (
+            grad_output_rows * grad_output_stride_0 + grad_output_cols * grad_output_stride_1
+        )
+    grad_output = tl.load(grad_output_ptr + grad_output_offsets, mask=mask)
     values = tl.load(values_ptr + offsets, mask=mask)
     selected_values = (values - selected_updates).to(values_ptr.dtype.element_ty)
     values = tl.where(columns == selected_columns, selected_values, values)
@@ -82,6 +94,7 @@ def deterministic_cross_entropy_backward_(
 
     supported_dtype = values.dtype in (torch.bfloat16, torch.float16, torch.float32)
     supported_index_dtype = indices.dtype in (torch.int32, torch.int64)
+    supported_grad_output_layout = grad_output.is_contiguous() or grad_output.dim() == 2
     use_triton = (
         HAVE_TRITON
         and values.is_cuda
@@ -91,23 +104,37 @@ def deterministic_cross_entropy_backward_(
         and values.is_contiguous()
         and indices.is_contiguous()
         and updates.is_contiguous()
-        and grad_output.is_contiguous()
         and values.shape[0] > 0
         and updates.dtype == values.dtype
         and grad_output.dtype == values.dtype
         and supported_dtype
         and supported_index_dtype
+        and supported_grad_output_layout
     )
     if use_triton:
+        # Loss masking/scaling can produce a strided [sequence, batch] gradient.
+        # Load that common 2D layout directly so the fused path does not add a
+        # per-backward allocation/copy. Other non-contiguous layouts retain the
+        # generic PyTorch fallback below.
+        if grad_output.dim() == 2:
+            grad_output_columns = grad_output.shape[1]
+            grad_output_stride_0, grad_output_stride_1 = grad_output.stride()
+        else:
+            grad_output_columns = 1
+            grad_output_stride_0 = grad_output_stride_1 = 1
         block_size = 256
         _cross_entropy_backward[(triton.cdiv(values.numel(), block_size),)](
             values,
             indices,
             updates,
             grad_output,
+            grad_output_stride_0,
+            grad_output_stride_1,
             values.numel(),
             smoothing_update,
             num_columns=values.shape[1],
+            grad_output_columns=grad_output_columns,
+            grad_output_is_contiguous=grad_output.is_contiguous(),
             block_size=block_size,
             has_smoothing=smoothing_update != 0.0,
             num_warps=4,

@@ -14,12 +14,19 @@ from megatron.core.tensor_parallel.deterministic_cross_entropy import (
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_rows, num_columns", [(16, 128), (512, 8192)])
 @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
-def test_fused_backward_matches_index_put(dtype, num_rows, num_columns, label_smoothing):
+@pytest.mark.parametrize("strided_grad_output", [False, True])
+def test_fused_backward_matches_index_put(
+    dtype, num_rows, num_columns, label_smoothing, strided_grad_output
+):
     torch.manual_seed(1234)
     source = torch.randn(num_rows, num_columns, device="cuda", dtype=dtype)
     indices = torch.randint(num_columns, (num_rows,), device="cuda")
     updates = torch.randint(2, (num_rows,), device="cuda", dtype=torch.int32).to(dtype)
-    grad_output = torch.randn(num_rows, 1, device="cuda", dtype=dtype)
+    if strided_grad_output:
+        grad_output = torch.randn(2, num_rows // 2, device="cuda", dtype=dtype).t()
+        assert not grad_output.is_contiguous()
+    else:
+        grad_output = torch.randn(num_rows, device="cuda", dtype=dtype)
     smoothing_update = label_smoothing / num_columns
     rows = torch.arange(num_rows, device="cuda")
     reference = source.clone()
@@ -73,7 +80,8 @@ def test_fused_backward_cuda_graph_replay():
     values = source.clone()
     indices = torch.randint(num_columns, (num_rows,), device="cuda")
     updates = torch.randint(2, (num_rows,), device="cuda", dtype=torch.int32).float()
-    grad_output = torch.randn(num_rows, 1, device="cuda")
+    grad_output = torch.randn(2, num_rows // 2, device="cuda").t()
+    assert not grad_output.is_contiguous()
 
     warmup_values = source.clone()
     deterministic_cross_entropy_backward_(warmup_values, indices, updates, grad_output)

@@ -135,13 +135,22 @@ def test_deterministic_vocab_parallel_cross_entropy_matches_index_put(
         candidate_loss = vocab_parallel_cross_entropy(
             candidate_logits, target, label_smoothing=label_smoothing, tp_group=tp_group
         )
-        candidate_grad = torch.autograd.grad(candidate_loss.sum(), candidate_logits)[0]
+        loss_gradient = torch.randn(
+            batch_size, 16, device="cuda", dtype=candidate_loss.dtype
+        ).transpose(0, 1)
+        if batch_size > 1:
+            assert not loss_gradient.is_contiguous()
+        candidate_grad = torch.autograd.grad(
+            candidate_loss, candidate_logits, grad_outputs=loss_gradient
+        )[0]
 
         torch.use_deterministic_algorithms(False)
         reference_loss = vocab_parallel_cross_entropy(
             reference_logits, target, label_smoothing=label_smoothing, tp_group=tp_group
         )
-        reference_grad = torch.autograd.grad(reference_loss.sum(), reference_logits)[0]
+        reference_grad = torch.autograd.grad(
+            reference_loss, reference_logits, grad_outputs=loss_gradient
+        )[0]
     finally:
         torch.use_deterministic_algorithms(previous_deterministic_mode)
 

@@ -89,7 +89,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py`, `tensor_parallel/deterministic_cross_entropy.py` | 3× all-reduce + fp32 + selected class update | 🟡 | fused collision-free Triton selected subtract + smoothing + output scaling; native NCCL TP reductions | generic `index_put_` selected update + elementwise kernels; native NCCL | deterministic algorithms | code+**test** | fused local backward 3.34–20.41× faster in isolation; CE-backward profile -0.508 ms; production ABBA -2.7% | The local backward update is closed without atomics and supports label smoothing, fallback, and CUDA graphs. `NCCL_ALGO=Ring` still does not pin the physical TP ring across allocations; TP>1 cross-allocation certification and an ordered SUM path remain open. |
+| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py`, `tensor_parallel/deterministic_cross_entropy.py` | 3× all-reduce + fp32 + selected class update | 🟡 | fused collision-free Triton selected subtract + smoothing + output scaling, including direct logical-order loads from 2D-strided loss gradients; native NCCL TP reductions | generic `index_put_` selected update + elementwise kernels; native NCCL | deterministic algorithms | code+**test** | fused local backward 3.34–20.41× faster for contiguous gradients and 14.41–16.52× for 2D-strided gradients in isolation; original production ABBA -2.7%; dense strided ABBA -12.9% | The local backward update is closed without atomics and supports label smoothing, the training loss's common strided layout, fallback, and CUDA graphs. `NCCL_ALGO=Ring` still does not pin the physical TP ring across allocations; TP>1 cross-allocation certification and an ordered SUM path remain open. |
 | Fused cross-entropy | `cross_entropy_loss_fusion` | fused kernel | 🔴 | — (forbidden) | fused | asserted off | code | — | Open: can it be made deterministic? (perf opportunity). |
 
 ### Backward / grad reduction / optimizer
@@ -191,6 +191,15 @@ script. Cluster-local artifacts are retained under:
 | fused CE rank-scoped Nemotron profile (GB200) | `521407`, 32 GPUs | `profile-nemotron-fused-gap-521407/leaderboard.txt`, SHA256 `21f11d76841e…`; `index-put-attribution.json`, SHA256 `b913575972b5…` | `_VocabParallelCrossEntropyBackward` is 0.749 vs 1.257 ms (-0.508 ms, -40.4%) over two captured steps. No CE-backward indexed writes remain; the six residual writes are four small CE-forward mask writes and two gather-backward writes. |
 | fused CE extended production ABBA (GB200) | `521404`, fixed 32-GPU allocation | `perf-nemotron-ce-extended-521404.out`, SHA256 `9f7d57ba2ccb…` | Iterations 11–50: baseline/candidate medians are 67.5/66.9 ms forward-order (-0.9%) and 65.45/62.45 ms reverse-order (-4.6%); median-of-leg medians 66.475→64.675 ms (-2.7%). All 50 loss, sequence-aux-loss, and grad-norm values match across all four legs. |
 | deterministic embedding-backward candidate (GB200) | `521744`, 1 rank on a 4-GPU allocation | `submit_logs/bench_det_embedding_521744.out`, SHA256 `c15faf510804…` | 128/8,192 vocab rows, 16/512/2,048 tokens, hidden 1,024/2,048/4,096, bf16/fp32, and uniform/hot duplicate distributions: all 12 cells are byte-exact. Stable-sort + fixed-order segmented reduction is only 0.61–0.69× as fast as the current deterministic direct-index backward, so the candidate is rejected. |
+| refreshed dense GPT baseline (GB200) | HSG `3614788`, 4 GPUs | `leaderboard.txt`, SHA256 `219315ec31a4…`; deterministic SQLite SHA256 `f86562fce98d…`; console SHA256 `0db28bc895ba…` | Step 7 is 119.0/104.7 ms deterministic/native (1.14×). Over the capture, vocab-CE backward is 17.808/5.373 ms (+12.435 ms), self-attention +21.351 ms, and core attention +13.898 ms. |
+| refreshed dense GPT baseline (GB300) | AWS-CMH `699350`, 4 GPUs | `leaderboard.txt`, SHA256 `4c6ac53f4adbc…`; deterministic SQLite SHA256 `0b3d71954b48…`; console SHA256 `bb5d81955c33…` | Step 7 is 130.2/107.0 ms deterministic/native (1.22×). Vocab-CE backward is 18.713/5.183 ms (+13.531 ms); 16 CE-backward `index_put_` ranges total 9.431 ms. Self-attention is +25.194 ms and core attention +17.189 ms. |
+| strided fused-CE microbenchmark (GB200) | AWS-DFW `522493`, 1 rank on a 4-GPU allocation | `submit_logs/bench_strided_det_ce_522493.out`, SHA256 `9ad4293378f0…` | 512 rows × 128/8,192 columns plus 4,096 rows × 128 columns, crossed with bf16/fp32 and smoothing on/off: all 12 cells are byte-exact. Direct 2D-strided loads are 14.41–16.52× faster than the deterministic indexed-write fallback. |
+| strided fused-CE focused suite (GB200) | AWS-DFW `522494`, 1 GPU | `submit_logs/test_det_ce_focused_522494.out`, SHA256 `9322de841b1a…` | 35 passed: contiguous/strided bf16/fp32 kernels, smoothing, fallback, invalid shapes, strided CUDA-graph replay, and full CE integration with explicit strided batch-3 loss gradients. |
+| contiguous-copy strided-CE experiment (GB300) | AWS-CMH `699565`, fixed 4-GPU allocation | `perf-dense-ce-warm-699565.out`, SHA256 `75eb627ee192…` | After a 200-step thermal warmup, baseline/candidate median-of-leg medians are 56.35/53.10 ms (-5.8%), but the order pairs disagree (+8.4%/-17.1%). All 50 loss and grad-norm values match. This noisy, allocation-adding design was superseded by direct stride-aware loads. |
+| stride-aware fused-CE rank profile (GB300) | AWS-CMH `699916`, 4 GPUs | console SHA256 `62fb7fc85fb7…`; deterministic SQLite SHA256 `d313825bf678…`; `index-put-attribution.json`, SHA256 `a9843d931a0e…` | Vocab-CE backward is 7.001/6.014 ms deterministic/native (+0.987 ms) over the capture; deterministic time is 62.6% below the refreshed baseline's 18.713 ms. No CE-backward indexed writes remain. Step 7 is 123.2/107.1 ms (1.15×); self-attention/core-attention remain +22.743/+15.620 ms. |
+| stride-aware fused-CE production ABBA (GB300) | AWS-CMH `699912`, fixed 4-GPU allocation | `perf-dense-ce-warm-699912.out`, SHA256 `0dd8057cfe1a…` | After a 200-step thermal warmup, iterations 11–50 improve 63.25→52.05 ms in forward order (-17.7%) and 66.8→61.2 ms in reverse order (-8.4%); median-of-leg medians improve 65.025→56.625 ms (-12.9%). All 50 loss and grad-norm values match across all four legs. |
+| final-source DSV3 EP32 certificate | AWS-DFW `522520`, 32 GPUs | `det-dsv3-fused-ep32-522520/certification.json`, SHA256 `62b506f4c16a…` | Two launches match 6,080/6,080 events with zero divergences, 64 exact recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| final-source Nemotron EP32 certificate | AWS-DFW `522521`, 32 GPUs | `det-nemotron-fused-ep32-522521/certification.json`, SHA256 `b1f8b2688382…` | Two launches match 9,664/9,664 events with zero divergences, 192 exact recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -442,16 +451,20 @@ attributed indexed-write target at +1.621 ms.
    fused gather+normalization/routing design that survives the full-step gate.
 5. **Vocab-parallel cross-entropy local backward — closed.** A fused,
    collision-free one-class-per-row Triton pass performs the selected subtract,
-   optional smoothing, and output-gradient scaling. It is 3.34–20.41× faster
-   than the original update+scale in isolation, reduces the profiled CE
-   backward by 0.508 ms, and improves the extended production ABBA by 2.7%.
-   Forward mask writes remain because the measured `where` alternative
-   regressed. TP collective ordering remains a separate correctness/performance
-   gap.
-6. **Attention deterministic kernels** — latest core attention +0.45 ms;
-   job `520828` measured self-attention +1.32 ms and
-   core attention +0.52 ms; job `520565` measured +4.02/+2.44 ms, so preserve
-   paired allocation evidence while optimizing.
+   optional smoothing, and output-gradient scaling, including direct logical
+   loads from the training loss's 2D-strided gradient. It is 3.34–20.41× faster
+   for contiguous inputs and 14.41–16.52× faster for strided inputs in
+   isolation. The refreshed dense profile reduces deterministic CE backward
+   18.713→7.001 ms (-62.6%), and the warmed production ABBA improves 12.9% with
+   both order pairs positive. Forward mask writes remain because the measured
+   `where` alternative regressed. TP collective ordering remains a separate
+   correctness/performance gap.
+6. **Attention deterministic kernels** — refreshed dense GB200/GB300 profiles
+   agree that this is now the leading branch. HSG job `3614788` measures
+   self-attention/core-attention at +21.351/+13.898 ms over the capture, and
+   AWS-CMH final-source job `699916` measures +22.743/+15.620 ms. Deterministic
+   mode selected `FlashAttnFunc` while native selected `FusedAttnFunc`; isolate
+   backend selection and deterministic-kernel cost before changing policy.
 7. **Deterministic grouped GEMM** — `_GroupedLinearBackward` ranged from
    +2.27 ms in job `520565` to -0.76 ms in job `520828`; re-isolate before
    changing the kernel choice.
@@ -483,10 +496,12 @@ attributed indexed-write target at +1.621 ms.
   3.2%, respectively. The source path remains regular `torch.gather`.
 - ✅ **Applied:** vocab-CE deterministic `index_put_` selected subtract plus
   separate smoothing/output scaling → one fused collision-free Triton pass per
-  token row. The kernel has no atomics or reductions, retains a PyTorch
-  fallback, supports label smoothing and CUDA graphs, and leaves the
-  measured-slower forward mask alternative untouched. The extended production
-  ABBA improves by 2.7% with exact training sequences.
+  token row. The kernel has no atomics or reductions, directly supports the
+  common 2D-strided loss gradient without a copy, retains a PyTorch fallback,
+  supports label smoothing and CUDA graphs, and leaves the measured-slower
+  forward mask alternative untouched. The original extended production ABBA
+  improves by 2.7%; the dense strided gate improves by 12.9%, with exact
+  training sequences in both.
 
 ## Verification backlog (the ⚠ rows)
 

@@ -77,7 +77,7 @@ Legend for the "Determinism" column:
 
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
-| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py`, `tensor_parallel/deterministic_cross_entropy.py` | 🟡 | The local deterministic backward fuses the one-selected-class subtract, optional label-smoothing subtract, and output-gradient scaling in one collision-free Triton pass (no atomics/reductions; PyTorch fallback; CUDA-graph coverage). The 3 all-reduces (MAX, SUM, SUM) still use native TP collectives. `NCCL_ALGO=Ring` pins the algorithm but not necessarily the physical rank order across allocations; TP>1 remains a cross-allocation verification gap. |
+| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py`, `tensor_parallel/deterministic_cross_entropy.py` | 🟡 | The local deterministic backward fuses the one-selected-class subtract, optional label-smoothing subtract, and output-gradient scaling in one collision-free Triton pass. It reads the training loss's common non-contiguous `[sequence, batch]` gradient directly in logical row order instead of allocating a contiguous copy (no atomics/reductions; PyTorch fallback; CUDA-graph coverage). The 3 all-reduces (MAX, SUM, SUM) still use native TP collectives. `NCCL_ALGO=Ring` pins the algorithm but not necessarily the physical rank order across allocations; TP>1 remains a cross-allocation verification gap. |
 | Fused CE | `cross_entropy_loss_fusion` | 🔴→forbidden | Non-deterministic; **asserted off** in deterministic mode (`arguments.py:1502`). |
 | MoE aux loss | `moe_utils.py:842-890` | 🟡 | `scatter` for routing map; aux-loss scalar reduction. |
 
