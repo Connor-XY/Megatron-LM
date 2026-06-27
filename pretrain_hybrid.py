@@ -10,7 +10,15 @@ import json
 
 # Suppress warnings on all ranks but rank 0.
 import os
+import sys
 import warnings
+
+if "--deterministic-mode" in sys.argv:
+    # Mamba's Triton autotune decorators evaluate their config list at import
+    # time, so this must run before importing torch or HybridModel.
+    from megatron.determinism_env import set_determinism_env_vars
+
+    set_determinism_env_vars()
 
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:

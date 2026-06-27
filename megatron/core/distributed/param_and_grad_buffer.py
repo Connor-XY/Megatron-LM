@@ -722,6 +722,7 @@ class _ParamAndGradBucketGroup:
                         bucket,
                         async_op=async_op,
                         force_all_reduce=force_all_reduce,
+                        fp32_accumulation=self.ddp_config.reduce_scatter_with_fp32_accumulation,
                         reduce_op=str(reduce_op),
                     )
                     grad_reduce_handle = dist_reduce_scatter_func(

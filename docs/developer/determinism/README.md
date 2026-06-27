@@ -91,6 +91,27 @@ parameter all-gather. TP reduction/gather payloads, TE FP8/FP4 recompute,
 optimizer moment state, and actual selected kernel identities remain follow-up
 instrumentation surfaces.
 
+For a scaled model run, use the stricter certifier instead of relying on a trace
+comparison alone:
+
+```bash
+python tools/determinism/certify_traces.py \
+  /path/to/run-a /path/to/run-b \
+  --expected-ranks 32 \
+  --expected-iterations 2 \
+  --require-collective-prefix moe.ep_ \
+  --require-collective-prefix data_parallel. \
+  --require-dp-fp32-accumulation
+```
+
+`certify_traces.py` checks both trees independently before comparing them. It
+requires deterministic runtime state, the requested rank/iteration/file counts,
+matching activation recomputes, completed collective output hashes, zero pending
+collectives, the requested semantic collective surfaces, and (optionally) the
+ordered fp32 data-parallel reduction path. Exit code 0 is a certificate, 1 is a
+failed invariant or cross-run divergence, and 2 is invalid input. Use `--json`
+to retain the complete evidence report.
+
 ## Maintenance
 
 Keep the catalog **evidence-based**: classify each op via PyTorch/TE/NCCL docs, an

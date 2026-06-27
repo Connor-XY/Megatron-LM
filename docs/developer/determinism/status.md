@@ -63,44 +63,39 @@ det-vs-nondet nsys leaderboard are `aten::fill_`, `aten::empty`,
 
 ## 4. Control plane — how determinism is turned on
 
-### 4.1 Today (on `main`)
+### 4.1 Upstream state
 
-`--deterministic-mode` is handled inline in `validate_args`
-(`megatron/training/arguments.py:1499-1508`):
+PR #5041 remains open against `NVIDIA/main`. This branch is stacked on that PR,
+so the implementation and tests described below are available here but are not
+yet an upstream guarantee.
 
-1. Asserts `not use_flash_attn` — **flash-attn is forbidden** today.
-2. Asserts `not cross_entropy_loss_fusion` — fused CE is non-deterministic.
-3. Validates `NCCL_ALGO ∈ {Tree, Ring, CollnetDirect, CollnetChain, ^NVLS}`
-   (the env var must already be exported by the launcher).
-4. Calls `torch.use_deterministic_algorithms(True)`.
-
-It does **not** set env vars for you and does **not** force `tp_comm_overlap` off.
-
-The config flag is `model_parallel_config.py:153` `deterministic_mode: bool = False`,
-threaded into `TransformerConfig`; library code reads either that flag or
+The config flag is `model_parallel_config.py` `deterministic_mode: bool = False`,
+threaded into `TransformerConfig`; library code reads that flag or
 `torch.are_deterministic_algorithms_enabled()`.
 
-### 4.2 After PR #5041 (`megatron/training/determinism.py`)
+### 4.2 This branch
 
-PR #5041 extracts the logic into a reusable module (mirroring Megatron-Bridge) so
-tests and profiling scripts can opt in without an `args` Namespace:
+`--deterministic-mode` delegates to reusable setup helpers:
 
-- **`set_determinism_env_vars()`** — `os.environ.setdefault` of:
-  `NCCL_ALGO=Ring`, `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`,
-  `CUBLAS_WORKSPACE_CONFIG=:4096:8`. Uses `setdefault` so a launcher-exported
-  value wins (these are captured by NCCL/cuBLAS/TE at *first use*, so they must be
-  set before the first kernel).
-- **`apply_determinism_to_args(args)`** — asserts CE fusion off, validates
-  `NCCL_ALGO` (**now excludes `Tree`** — its reduction order is not
-  user-controllable), forces `tp_comm_overlap=False` (with a `warn_rank_0`),
-  calls `torch.use_deterministic_algorithms(True)`.
+- **`megatron.determinism_env.set_determinism_env_vars()`** is intentionally
+  lightweight enough to run before importing torch or Mamba kernels. It defaults
+  `NCCL_ALGO=Ring`, `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, and
+  `CUBLAS_WORKSPACE_CONFIG=:4096:8`; it also forces
+  `MAMBA_DETERMINISTIC=1` and `TRITON_CACHE_AUTOTUNING=0`. The latter is
+  load-bearing: a cold autotune cache can choose different reduction tilings.
+  `pretrain_hybrid.py` runs this bootstrap before importing `HybridModel`.
+- **`megatron.training.determinism.apply_determinism_to_args(args)`** rejects CE
+  fusion, validates `NCCL_ALGO` (excluding `Tree`), forces
+  `tp_comm_overlap=False`, and finally enables torch deterministic algorithms.
+  For the distributed optimizer it also requires one optimizer instance,
+  rejects collective AVG, and forces ordered fp32 reduce-scatter.
+- **Small floating-point statistics** (gradient norm, reported loss, and MoE
+  metrics) use rank-ordered all-gather plus a fixed local sum. `NCCL_ALGO=Ring`
+  selects an algorithm but does not pin the physical ring across allocations.
 
-Two behavior changes vs. today worth flagging:
-
-- **Flash-attn is now permitted** under `--deterministic-mode`. TE FlashAttention
-  is deterministic on supported configs when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`;
-  the bit-exact suite covers it. (Old code rejected it outright.)
-- **`tp_comm_overlap` is force-disabled** rather than left to the user.
+Flash attention is permitted when Transformer Engine honors
+`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`; the bit-exact suite covers supported
+configurations.
 
 ## 5. Enforced limitations in deterministic mode
 
@@ -110,7 +105,8 @@ These features are currently **incompatible** with deterministic mode:
 | --- | --- | --- |
 | `cross_entropy_loss_fusion` | `arguments.py:1502` / `determinism.py` assert | Fused CE kernel is non-deterministic |
 | `tp_comm_overlap` (async TP) | `determinism.py` (forces off) | Async NCCL collective ordering varies |
-| Flash-attn (today only) | `arguments.py:1501` assert | Relaxed by PR #5041 (TE FA is deterministic) |
+| Multiple distributed-optimizer instances | `determinism.py` assert | The cross-instance floating-point reduction is not ordered |
+| `ddp_average_in_collective` | `determinism.py` assert | AVG must follow the rank-ordered SUM, not occur inside NCCL |
 | Packed sequence (`thd`) in gated-delta-net | `ssm/gated_delta_net.py:314` assert | No deterministic packed-seq SSM path |
 
 > **Open question (tracked in the roadmap docs):** it is not fully established
@@ -120,20 +116,25 @@ These features are currently **incompatible** with deterministic mode:
 
 ## 6. Surface area — the det/non-det branches that exist
 
-The kernel-level determinism surface in `megatron/core` is **small**: there are
-only ~5 `torch.are_deterministic_algorithms_enabled()` call sites plus a handful
-of `config.deterministic_mode` branches. They are fully enumerated in
+The kernel-level determinism surface in `megatron/core` is concentrated in a
+small set of reductions and dispatch choices. They are fully enumerated in
 [`op-catalog.md`](./op-catalog.md); the load-bearing ones:
 
 - **MoE unpermute** (`moe_utils.py:517`): `index_add_` (det, CUDA-graph safe) vs
   `scatter_add_` (fast).
 - **MoE routing map/probs** (`moe_utils.py:823`): `index_put_(accumulate=False)`
   vs `scatter`.
+- **MoE top-k under activation checkpointing** (`moe_utils.py`): deterministic
+  mode keeps `sorted=True` in both no-grad forward and grad-enabled recompute.
 - **Vocab embedding fwd** (`tensor_parallel/layers.py:299`): direct `weight[idx]`
   (det backward) vs `F.embedding` (non-det backward).
-- **Mamba/SSM** (`ssm/ops/determinism.py`, `ssm/gated_delta_net.py:213/314/430`):
-  cheapest-autotune + tiled-workspace reduction; torch `chunk_gated_delta_rule` /
-  `F.conv1d` fallbacks; packed-seq forbidden.
+- **Mamba/SSM** (`ssm/ops/determinism.py`, `ssm/mamba_mixer.py`,
+  `ssm/gated_delta_net.py`): fixed Triton config + tiled-workspace reductions;
+  the fast fused Mamba path remains enabled; gated-delta-net uses torch
+  fallbacks and retains its packed-seq restriction.
+- **DP and small-stat reductions** (`distributed/param_and_grad_buffer.py`,
+  `distributed/deterministic_collectives.py`): rank-indexed all-to-all or
+  all-gather followed by a fixed local fp32 sum.
 - **TE attention** (`extensions/transformer_engine.py:1697`): asserts
   `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` when `deterministic_mode` is on.
 - **Inference/RL scheduling** (`dynamic_engine.py:607`,
@@ -188,7 +189,11 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   captures autograd-worker launches; `iteration.end.pending_collectives` reports
   operations that outlive the selected window instead of writing to a closed trace.
   `tools/determinism/compare_traces.py` aligns rank traces by semantic event
-  identity instead of PP/VPP arrival order. The final 22-test focused suite
+  identity instead of PP/VPP arrival order. `certify_traces.py` additionally
+  enforces rank/iteration coverage, deterministic runtime state, recompute
+  identity, completed collective hashes, zero pending collectives, requested
+  semantic surfaces, and ordered DP accumulation before comparing two trees.
+  The final 22-test focused suite
   passed on every rank in AWS-DFW GB200 job `517022`, AWS-CMH GB300 job `696943`,
   and Draco H100 job `10430851`. Two independent DSV3-style TP2×EP2 launches
   matched all 984 events on GB200 (`516924`) and all 1,968 events on H100
@@ -200,17 +205,39 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   matched 1,352/1,352 events across two distributed-optimizer runs, including 48
   DP boundary events and zero pending collectives. Every completed model run
   reported byte-identical recompute outputs.
-- **E2E full-recipe (WS2 Tier B — pending):** the real nemotron-3-ultra recipe
-  lives in **Megatron-Bridge** (`zhiyul/nemotron-3-ultra-perf-recipe`); the
-  weekly multi-node e2e + wandb dashboard is the remaining tier — it is the only
-  way to reach **EP>16**, where DSV3 non-determinism empirically appears.
+- **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
+  `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
+  two-launch comparison matched 6,080/6,080 semantic events, and the two
+  independent allocations also matched exactly; reported LM loss, sequence
+  auxiliary loss, and grad norm matched as well. The Slurm wrappers exited 1
+  only after comparison because their temporary summary snippet referenced an
+  undefined local variable; the retained comparison JSON and strict certifier
+  both pass. Nemotron-style hybrid EP32 jobs
+  `518541` and `518542` kept the fused memory-efficient Mamba path and matched
+  9,664/9,664 events within each allocation and
+  across allocations, including 192 exact activation recomputes, 1,152 completed
+  collective hashes, and zero pending collectives per trace tree. Their launcher
+  did not export Mamba/Triton determinism variables, which also verifies the
+  early `pretrain_hybrid.py` bootstrap. The final 48-test focused suite passed
+  on every rank in AWS-DFW GB200 job `519253` and AWS-CMH GB300 job `697567`.
+  HSG login timed out during both verification attempts.
+- **Full Megatron-Bridge evidence (not yet a gate):** branch
+  `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
+  allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
+  det-without-nsys divergence from iteration 3. The latter lacks a same-mode
+  control, and these historical raw logs were not independently available in
+  this checkout. The remaining deliverable is a reproducible weekly gate and
+  dashboard on the current MCore commit.
 
 ## 8. Known gaps (feeding the roadmap)
 
-1. **No e2e determinism coverage** → Workstream 2: scaled CI-gating proxies in
-   mcore (nemotron-3-ultra, DSV3) + full recipes in Megatron-Bridge (weekly).
-2. **~15% perf overhead** concentrated in MoE scatter/unpermute, FlashAttention
-   backward (FAG), grouped GEMM, and top-k radix sort → Workstream 3.
+1. **Scaled evidence is not yet CI-gated.** The EP32 MCore certificates close the
+   immediate coverage gap, but the full Bridge recipe still needs a weekly gate,
+   retained artifacts, and a same-mode control at 192/3,072 GPUs.
+2. **~15% perf overhead** remains concentrated in MoE scatter/unpermute,
+   FlashAttention backward (FAG), grouped GEMM, top-k radix sort, ordered DP
+   reduction, and fixed-config Mamba kernels. Each optimization must retain the
+   two-allocation certificate.
 3. **First-divergence tooling still has uncovered runtime surfaces.**
    `compare_dumps.py` localizes existing activation/param/wgrad/dgrad dumps, and
    the structured runtime trace now covers phase ordering, Megatron recompute
@@ -219,9 +246,8 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    outputs, pipeline P2P sends/receives, DP gradient reduction, and distributed-
    optimizer parameter gather. TP reduction/gather payloads, optimizer moment
    state, TE FP8/FP4 recompute, and actual selected kernel identities are still
-   missing. DSV3's known EP>16 + PP/VPP divergence therefore still needs the
-   scaled e2e recipe plus the remaining collective instrumentation to localize
-   fully.
+   missing. Native floating-point TP reductions and the non-distributed-optimizer
+   DP all-reduce also lack topology-independent paths.
 
 ## 9. References
 

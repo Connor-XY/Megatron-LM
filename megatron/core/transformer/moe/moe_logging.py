@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.distributed.deterministic_collectives import all_reduce_avg, all_reduce_sum
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
@@ -269,18 +270,16 @@ class MoEMetricsTracker:
             entry = self._metrics[name]
             v = entry.values
 
-            torch.distributed.all_reduce(v, group=pp_group)
+            all_reduce_sum(v, group=pp_group)
 
             if entry.reduce_group is not None:
-                torch.distributed.all_reduce(v, group=entry.reduce_group)
+                all_reduce_sum(v, group=entry.reduce_group)
 
             if entry.avg_group is not None:
-                torch.distributed.all_reduce(
-                    v, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
-                )
+                all_reduce_avg(v, group=entry.avg_group)
 
             if entry.needs_dp_avg:
-                torch.distributed.all_reduce(v, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+                all_reduce_avg(v, group=dp_group)
 
     @staticmethod
     def _count_moe_layers(

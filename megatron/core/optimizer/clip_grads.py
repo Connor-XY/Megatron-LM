@@ -7,6 +7,8 @@ from typing import List, Optional, Union
 import torch
 from torch import inf
 
+from megatron.core.distributed.deterministic_collectives import all_reduce_sum
+
 try:
     from transformer_engine.pytorch.optimizers import (
         multi_tensor_applier,
@@ -130,12 +132,8 @@ def get_grad_norm_fp32(
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
-            torch.distributed.all_reduce(
-                total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
-            )
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-        )
+            all_reduce_sum(total_norm, group=data_parallel_group)
+        all_reduce_sum(total_norm, group=grad_stats_parallel_group)
         if multi_tensor_scale_tensor_impl is not None:
             total_norm = total_norm.pow(1.0 / norm_type)
         else:

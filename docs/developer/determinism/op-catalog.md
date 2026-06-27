@@ -28,9 +28,9 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Item | File:line | Effect |
 | --- | --- | --- |
-| `--deterministic-mode` (current) | `megatron/training/arguments.py:1499-1508` | asserts no flash-attn, no CE-fusion; validates `NCCL_ALGO`; `torch.use_deterministic_algorithms(True)` |
-| `set_determinism_env_vars()` (PR #5041) | `megatron/training/determinism.py` | setdefault `NCCL_ALGO=Ring`, `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, `CUBLAS_WORKSPACE_CONFIG=:4096:8` |
-| `apply_determinism_to_args()` (PR #5041) | `megatron/training/determinism.py` | assert no CE-fusion; validate `NCCL_ALGO` (excl. Tree); force `tp_comm_overlap=False`; permit flash-attn; `use_deterministic_algorithms(True)` |
+| `--deterministic-mode` (this branch) | `megatron/training/arguments.py` | delegates the complete setup to `apply_determinism_to_args()` before model construction |
+| `set_determinism_env_vars()` (stacked on PR #5041) | `megatron/determinism_env.py` | default `NCCL_ALGO=Ring`, `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`; force `MAMBA_DETERMINISTIC=1`, `TRITON_CACHE_AUTOTUNING=0` before kernel imports |
+| `apply_determinism_to_args()` | `megatron/training/determinism.py` | assert no CE-fusion; validate `NCCL_ALGO` (excl. Tree); force `tp_comm_overlap=False`; for distributed optimizer require one instance/no collective AVG and force ordered fp32 reduce-scatter; finally enable torch deterministic algorithms |
 | `deterministic_mode` config flag | `megatron/core/model_parallel_config.py:153` | threaded into `TransformerConfig`; read by library branches below |
 
 ---
@@ -46,14 +46,14 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Token unpermute (combine) | `transformer/moe/moe_utils.py:526-541` | scatter-accumulate | 🔵 | `index_add_` (CUDA-graph safe) | `scatter_add_` | `are_deterministic_algorithms_enabled()` | doc+code | `index_add_` +85.9 ms NVTX-range time over 3 profiled steps | The redundant second zero-allocation is removed. The cleanup is bit-exact but step-time neutral; the remaining reduction kernel is still a target. |
 | Routing map/probs | `moe_utils.py:834-849` | scatter vs index_put | 🔵 | `index_put_(accumulate=False)` ×2 | `scatter` ×2 | `are_deterministic_algorithms_enabled()` | code | `index_put_` +299.3 ms CPU NVTX-range time over 3 steps | An out-of-place `scatter` candidate is bit-exact and removes dispatch overhead, but did not improve proxy step time; held pending production-scale evidence. |
-| Top-k expert select | `moe_utils.py:758-788` | `torch.topk(sorted=is_grad_enabled())` | 🟡 | `sorted=True` in training pins order | `sorted=False` (inference) | grad-enabled | doc | `cub::DeviceRadixSort` 6.36 vs 1.23 ms over 3 steps (+5.13 ms) | Investigate deterministic top-k without the 5× dispatch-range amplification; check fused TE top-k parity. |
-| Group-limited top-k mask | `moe_utils.py:590-645` | `scatter_(1, group_idx, 1)` | 🟢 | unique group indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** bit-exact by `test_deepseek_model.py` (DSV3 group routing: `num_groups`/`group_topk`) across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
-| Aux-loss routing map | `moe_utils.py:888-901` | `scatter` | 🟢 | unique indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** via DSV3 proxy (`seq_aux_loss` enabled) — bit-exact. |
+| Top-k expert select | `moe_utils.py` | `torch.topk(sorted=...)` | 🔵 | `sorted=True`, including no-grad checkpoint forward | `sorted=is_grad_enabled()` | deterministic algorithms | code+**test** | `cub::DeviceRadixSort` 6.36 vs 1.23 ms over 3 steps (+5.13 ms) | Fixes sigmoid top-k probability drift between original forward and grad-enabled recompute. Investigate a faster stable-select path. |
+| Group-limited top-k mask | `moe_utils.py:590-645` | `scatter_(1, group_idx, 1)` | 🟢 | unique group indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** by the DSV3 proxy across EP≤4/TP/FSDP/PP/VPP and by the final EP32 certificates (`518849`/`518850`). |
+| Aux-loss routing map | `moe_utils.py:888-901` | `scatter` | 🟢 | unique indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** via DSV3 proxy and final EP32 certificates with `seq_aux_loss` enabled. |
 | Capacity-drop mask | `moe_utils.py:950-962` | `scatter` | 🟢 | unique indices | — (no branch) | capacity factor | code+**test** | small | **Verified** bit-exact for `probs` and `position` drop policies, including unpadded and fixed-capacity padded A2A dispatch, across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
 | Router map (Sinkhorn) | `transformer/moe/router.py:260` | `scatter` | 🟢 | unique top-k indices | — | Sinkhorn routing | code+**test** | small | **Verified** bit-exact with the DSV3 Sinkhorn preset across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
 | Pad routing map | `moe_utils.py:648-680` / `fusions/fused_pad_routing_map.py` | `cumsum` + mask write | 🟢 | ordered cumsum | — | always | doc | small | cumsum is deterministic. |
 | Token permute (dispatch) | `moe_utils.py:300-442`; `token_dispatcher.py:645-659`; `moe/ops/deterministic_index_select.py` | `argsort(stable=True)` + row gather | 🔵 | fixed-order Triton backward for dropless top-k ≥4 and hidden ≥2048 | PyTorch `index_select` backward / fused TE | deterministic algorithms + guarded shape | code+**test** | H100: `IndexSelectBackward0` 50.34→14.97 ms (**-70%**) over 3 profiled steps; GB200 isolated kernel: 6.5–55.4% lower latency | Model-level A2A top-k-8/top-k-6 presets are bit-exact. Extend the fast path only with shape-specific evidence; supported fallbacks remain unchanged. |
-| EP all-to-all dispatch/combine | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | `all_to_all` | 🟢🟡 | fixed NCCL algo | — | env | doc+**test** | — | Bit-exact at EP≤4 (DSV3 + nemotron proxies). Structured traces can fingerprint semantic dispatch/combine boundaries. ⚠ EP>16 at scale unverified (DSV3 only diverges there). |
+| EP all-to-all dispatch/combine | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | `all_to_all` | 🟢 | rank-indexed permutation | — | always | code+**test** | — | EP32 DSV3 and Nemotron-style structured traces fingerprint dispatch/combine in forward, recompute, and backward. The collective does not perform floating-point reduction. |
 | Grouped GEMM (experts) | `extensions/transformer_engine.py` `TEGroupedLinear` | grouped matmul | 🟢🟡 | TE deterministic kernels | TE fast kernels | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | doc+**test** | `_GroupedLinearBackward` +19.2 ms (+20%) over 3 profiled steps | Bit-exact in DSV3 + nemotron proxies (`moe_grouped_gemm=True`). wgrad order remains a perf target ("optimized grouped GEMM", "fused GemmAdd"). |
 | Router replay | `transformer/moe/router_replay.py` | record/replay top-k | 🟢 | replay recorded indices | — | opt-in | code | — | A determinism *tool*, not default path. |
 
@@ -87,27 +87,29 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py:119-156` | 3× all-reduce + fp32 | 🟡 | fixed NCCL algo, fp32 intermediates | — | env | doc | MoE proxy: +17.9 ms (+168%) over 3 profiled steps | Native CE is deterministic under `NCCL_ALGO`; its indexed backward remains a perf target. |
+| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py:119-156` | 3× all-reduce + fp32 | 🟡 | no topology-independent TP reduction yet | native NCCL | env | code | MoE proxy: +17.9 ms (+168%) over 3 profiled steps | `NCCL_ALGO=Ring` does not pin the physical ring across allocations. TP>1 cross-allocation certification and an ordered SUM path remain open; indexed backward is also a perf target. |
 | Fused cross-entropy | `cross_entropy_loss_fusion` | fused kernel | 🔴 | — (forbidden) | fused | asserted off | code | — | Open: can it be made deterministic? (perf opportunity). |
 
 ### Backward / grad reduction / optimizer
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | NCCL collective | 🟡 | fixed NCCL ring order | — | env | doc+**test** | hash tracing is debug-only | bf16 FP non-assoc but reproducible run-to-run; structured trace fingerprints every bucket before launch and after existing sync/wait/stream completion. |
-| fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | ordered fp32 sum | bf16 RS | `ddp_config.reduce_scatter_with_fp32_accumulation` | code | small | Accuracy + determinism friendly; 1-bucket only. |
-| Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | NCCL all-gather | 🟡 | fixed NCCL ring order | — | env | code+**test** | hash tracing is debug-only | Structured trace fingerprints sync and overlapped bucket gathers without adding a collective or wait. |
+| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | floating-point NCCL collective | 🔵 | ordered fp32 reduce-scatter for deterministic distributed optimizer | native NCCL | deterministic args | code+**test** | hash tracing is debug-only | Native floating-point collectives are allocation-topology-sensitive even with Ring. Non-distributed-optimizer all-reduce remains a gap. |
+| fp32-accum reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` | all-to-all + ordered `sum(fp32)` | 🟢 | rank-indexed ordered fp32 sum | native RS | forced in deterministic distributed optimizer | code+**test** | TBD | One optimizer instance and no collective AVG are enforced. Final DSV3 EP32 jobs `518849`/`518850` matched 6,080/6,080 trace events across independent allocations. |
+| Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | NCCL all-gather | 🟢 | rank-indexed byte copies | — | always | code+**test** | hash tracing is debug-only | No floating-point reduction; structured trace fingerprints sync and overlapped gathers without adding a collective or wait. |
 | Distributed optimizer param order | `optimizer/distrib_optimizer.py:1094` | shard mapping | 🟢 | "preserving deterministic ordering across ranks" | — | always | code | — | — |
-| Grad clip global norm | `optimizer/clip_grads.py` | all-reduce | 🟡 | fixed NCCL algo | — | env | doc | — | — |
+| Grad clip global norm | `optimizer/clip_grads.py`, `distributed/deterministic_collectives.py` | SUM reduction | 🔵 | rank-ordered all-gather + local sum | native all-reduce | deterministic algorithms | code+**test** | TBD | Closed a one-ulp scalar divergence that otherwise changed every optimizer parameter. Intended only for small statistics. |
+| Reported loss / MoE metrics | `training.py`, `training/utils/common_utils.py`, `transformer/moe/moe_logging.py` | SUM / AVG reductions | 🔵 | rank-ordered all-gather + local sum/divide | native all-reduce | deterministic algorithms | code+**test** | TBD | Keeps reported loss and expert-bias/load-balancing metrics exact across allocations. |
 
 ### SSM / Mamba (hybrid models)
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Triton autotune | `ssm/ops/determinism.py:81-103` | autotune config select | 🔵 | cheapest config | run-all autotune | `use_deterministic_mode()` | code | TBD | Avoids autotune-driven kernel variance. |
+| Triton autotune | `megatron/determinism_env.py`, `ssm/ops/determinism.py`, external `mamba_ssm.utils.determinism` | autotune config select | 🔵 | one fixed config (`TRITON_CACHE_AUTOTUNING=0`) | timing-selected config | early deterministic env | code+**test** | TBD | Cold cached-autotune selected different reduction tilings across launches; env setup must precede kernel-module import. |
 | Tiled reduction workspace | `ssm/ops/determinism.py:106-123` | `zeros`+`sum` vs `empty` | 🔵 | ordered tile sum | unordered | `use_deterministic_mode()` | code | mem+ | Extra memory for tiled reduction. |
 | Gated-delta-rule kernel | `ssm/gated_delta_net.py:213-216` | torch vs FLA fused | 🔵 | `torch_chunk_gated_delta_rule` | FLA fused | `deterministic_mode` | code | TBD | — |
 | Causal conv1d | `ssm/gated_delta_net.py:430-446` | `F.conv1d` vs FLA | 🔵 | `F.conv1d` (+transpose) | `causal_conv1d` | `deterministic_mode` | code | TBD | — |
+| Mamba-2 combined training | `ssm/mamba_mixer.py`, external `mamba_ssm` | fused causal conv + selective scan | 🟢🟡 | fused path with deterministic workspaces and fixed Triton config | same path with timing autotune / atomic reductions | early env + torch deterministic algorithms | code+**test** | production-scale delta pending | Fused EP32 jobs `518541`/`518542` matched 9,664/9,664 events within and across allocations without launcher-supplied Mamba/Triton env. Disabling only the fused path did not fix cold-cache autotune drift; pinning config did. |
 | Packed sequence (`thd`) | `ssm/gated_delta_net.py:314` | — | 🔴 | — | thd | asserted off | code | — | **Gap**: no deterministic packed-seq SSM path. |
 
 ### Inference / RL (not training-loop, listed for completeness)
@@ -327,9 +329,18 @@ boundary events completed through the schedule's existing waits.
 optimizer runs. The comparison included 48 DP reduction/gather boundary events,
 24 completed output hashes, and zero pending collectives.
 
-**Still open:** EP all-to-all at **EP>16** (proxies cap at EP4 — needs the Tier-B
-mbridge e2e recipe to reach the scale where DSV3 empirically diverges) and the
-8-GPU cells for the new A2A presets. AWS-DFW and AWS-CMH expose four GPUs per
-node to this fixture; HSG was unreachable during this run. Promote each to
-🟢/🔵 or open a gap with a fix following the `moe_utils.py:530` det-branch
-pattern.
+**Verified (EP32, ordered DP, and scaled recompute):** AWS-DFW GB200 jobs
+`518849` and `518850` independently certified final DSV3-style EP32 runs, with
+6,080/6,080 semantic events matching both within and across allocations.
+Nemotron-style fused-Mamba+attention+MoE EP32 jobs `518541` and `518542` matched
+9,664/9,664 events within each allocation and across allocations. Each trace
+tree contained 192 matching recomputes, 1,152 completed collective hashes, no
+pending operations, and 384 DP reductions using ordered fp32 accumulation. Job
+`519253` passed the final 48-test focused suite on every AWS-DFW GB200 rank;
+AWS-CMH GB300 job `697567` passed the same 48 tests on every rank.
+
+**Still open:** a retained weekly gate for the full Megatron-Bridge recipe;
+topology-independent native TP floating-point reductions and non-distributed-
+optimizer DP all-reduce; and the 8-GPU cells for the new
+A2A presets. AWS-DFW and AWS-CMH expose four GPUs per node to this fixture; HSG
+was unreachable during this run.

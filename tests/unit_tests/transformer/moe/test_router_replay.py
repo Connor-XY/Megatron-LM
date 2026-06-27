@@ -14,6 +14,31 @@ def teardown_function():
     RouterReplay.global_router_replay_instances.clear()
 
 
+@pytest.mark.parametrize("deterministic, expected_sorted", [(False, False), (True, True)])
+def test_no_grad_topk_order_is_stable_in_deterministic_mode(
+    monkeypatch, deterministic, expected_sorted
+):
+    original_topk = torch.topk
+    observed_sorted = []
+
+    def capture_topk(*args, **kwargs):
+        observed_sorted.append(kwargs["sorted"])
+        return original_topk(*args, **kwargs)
+
+    previous_deterministic_mode = torch.are_deterministic_algorithms_enabled()
+    monkeypatch.setattr(torch, "topk", capture_topk)
+    try:
+        torch.use_deterministic_algorithms(deterministic)
+        with torch.no_grad():
+            topk_routing_with_score_function(
+                logits=torch.randn(4, 32), topk=22, use_pre_softmax=False, score_function="sigmoid"
+            )
+    finally:
+        torch.use_deterministic_algorithms(previous_deterministic_mode)
+
+    assert observed_sorted == [expected_sorted]
+
+
 def test_record_mode_with_topk_routing_softmax_post():
     rr = RouterReplay()
     rr.set_router_replay_action(RouterReplayAction.RECORD)

@@ -784,8 +784,12 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            # Sorting top-k is normally disabled during inference. Activation-checkpoint
+            # forward also runs under no_grad, though, and must use the same ordering as its
+            # grad-enabled recompute: sigmoid routing normalizes the selected scores in their
+            # returned order, so changing that order can change low bits of the denominator.
+            sorted_topk = torch.is_grad_enabled() or torch.are_deterministic_algorithms_enabled()
+            return torch.topk(scores, k=topk, dim=1, sorted=sorted_topk)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active

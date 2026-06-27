@@ -5,18 +5,18 @@ import json
 import os
 import sys
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
-from collections import defaultdict
 from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-
 from megatron.core._slurm_utils import resolve_slurm_local_rank
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.distributed.deterministic_collectives import all_reduce_sum
+from megatron.core.msc_utils import open_file
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -36,17 +36,16 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
     unwrap_model,
 )
-
-from megatron.core.transformer.module import param_is_not_shared
+from megatron.training import get_adlr_autoresume, get_args, get_timers
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -245,7 +244,7 @@ def average_losses_across_data_parallel_group(
     if group is None:
         group = mpu.get_data_parallel_group()
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(averaged_losses, group=group)
+    all_reduce_sum(averaged_losses, group=group)
     averaged_losses = averaged_losses / group.size()
 
     return averaged_losses

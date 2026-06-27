@@ -4,9 +4,9 @@
 
 Mirrors the split that ``megatron-bridge`` uses for the same purpose:
 
-* :func:`set_determinism_env_vars` — env-var setdefaults that must happen
-  BEFORE the first cuBLAS / Transformer Engine kernel invocation in the
-  process. Equivalent to bridge's
+* :func:`set_determinism_env_vars` — lightweight env setup, re-exported from
+  :mod:`megatron.determinism_env`, that must happen BEFORE CUDA libraries and
+  Triton kernel modules are imported. Equivalent to bridge's
   ``PerfEnvPlugin._set_determinism_env_vars`` (``scripts/performance/perf_plugins.py``).
 * :func:`apply_determinism_to_args` — config-level overrides applied to a
   parsed ``args`` Namespace. Equivalent to bridge's
@@ -29,22 +29,7 @@ import os
 
 import torch
 
-
-def set_determinism_env_vars() -> None:
-    """Populate env vars required for bit-exact reproducibility.
-
-    These env vars are captured by their respective libraries at first use
-    (NCCL at communicator init, cuBLAS at handle creation, TE at first
-    attention forward), so the call must happen BEFORE any of those events.
-    Uses ``setdefault`` so any value the launcher has already exported
-    wins — defense in depth: in the test process pytest may import another
-    module that triggers CUDA-context creation before this package loads,
-    in which case the Python-side setdefault is too late and the launcher's
-    shell-side export is what actually takes effect.
-    """
-    os.environ.setdefault("NCCL_ALGO", "Ring")
-    os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+from megatron.determinism_env import set_determinism_env_vars
 
 
 def apply_determinism_to_args(args) -> None:
@@ -53,12 +38,12 @@ def apply_determinism_to_args(args) -> None:
     Idempotent. Performs (in this order):
 
     1. Asserts ``cross_entropy_loss_fusion`` is off (fused CE is non-deterministic).
-    2. Sets env vars via :func:`set_determinism_env_vars` — a user-supplied
-       value (e.g. an ``NCCL_ALGO`` exported by the launcher) survives the
-       setdefault, so this step does not second-guess the user's choice of
-       deterministic algo.
+    2. Sets env vars via :func:`set_determinism_env_vars`. A user-supplied
+       cuBLAS/TE/NCCL value survives its setdefault; Mamba deterministic mode
+       and cold-cache Triton autotuning are forced to safe values.
     3. Forces ``tp_comm_overlap=False`` (non-deterministic NCCL collectives).
-    4. Calls ``torch.use_deterministic_algorithms(True)``.
+    4. Uses rank-ordered FP32 accumulation for distributed-optimizer gradient reduction.
+    5. Calls ``torch.use_deterministic_algorithms(True)``.
 
     The argument assertion runs FIRST so a malformed args Namespace fails
     fast without leaving the process in a half-deterministic state (env
@@ -111,5 +96,25 @@ def apply_determinism_to_args(args) -> None:
         warn_rank_0("Disabling tp_comm_overlap for deterministic mode.")
         args.tp_comm_overlap = False
 
-    # 5. Torch global state last — all assertions have already passed.
+    # 5. NCCL Ring does not fix the physical ring across allocations. A different ring changes
+    #    floating-point accumulation order even when every rank enters with identical gradients.
+    #    The ordered all-to-all + local FP32 sum is the deterministic distributed-optimizer path.
+    if args.use_distributed_optimizer:
+        assert args.num_distributed_optimizer_instances == 1, (
+            "Deterministic distributed-optimizer gradient reduction does not support "
+            "multiple optimizer instances."
+        )
+        assert not args.ddp_average_in_collective, (
+            "Deterministic distributed-optimizer gradient reduction does not support "
+            "--ddp-average-in-collective."
+        )
+        if not args.ddp_reduce_scatter_with_fp32_accumulation:
+            from megatron.training.utils import warn_rank_0
+
+            warn_rank_0(
+                "Enabling ddp_reduce_scatter_with_fp32_accumulation for deterministic mode."
+            )
+            args.ddp_reduce_scatter_with_fp32_accumulation = True
+
+    # 6. Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)

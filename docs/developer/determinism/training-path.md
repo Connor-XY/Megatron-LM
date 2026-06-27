@@ -51,12 +51,12 @@ Legend for the "Determinism" column:
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
 | Router gating + softmax/sigmoid | `transformer/moe/moe_utils.py:789-818` | 🟢 | Computed in fp32; elementwise. |
-| Top-k expert selection | `moe_utils.py:777` (`torch.topk(..., sorted=torch.is_grad_enabled())`) | 🟡 | `sorted=True` during training pins order; this `topk` is the source of the `cub::DeviceRadixSort` that shows a large det-vs-nondet delta in profiling (**hotspot**). |
+| Top-k expert selection | `moe_utils.py` (`torch.topk`) | 🔵 | Deterministic mode forces `sorted=True` even in the no-grad activation-checkpoint forward; normal mode keeps the faster no-grad `sorted=False` path. This avoids forward/recompute probability drift for sigmoid top-k normalization. The sorted path is the source of the `cub::DeviceRadixSort` det-vs-nondet delta (**hotspot**). |
 | Group-limited (node-limited) top-k | `moe_utils.py:617-634` (`group_mask.scatter_`) | 🟡 | `scatter_` writes 1s at unique group indices → deterministic in forward; no explicit det branch (**verify**). |
 | Routing map / probs construction | `moe_utils.py:823-837` | 🔵 | det: `index_put_(accumulate=False)`; non-det: `scatter`. Also `compute_routing_scores_for_aux_loss:890` and capacity masks `946/951` use `scatter` with **no** det branch (**verify**). |
 | Capacity-factor drop | `moe_utils.py:940-951` | 🟡 | `scatter` of capacity mask; unique indices. |
 | Token permute (dispatch sort) | `moe_utils.py:299-431` (`argsort(stable=True)` + `index_select`, or fused TE permute) | 🟢 | Stable sort + gather is deterministic. |
-| EP all-to-all dispatch | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | 🟡 | Collective itself is ordered; reproducible under fixed NCCL algo. The structured trace can record semantic dispatch/combine input and output hashes in forward and backward. |
+| EP all-to-all dispatch | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | 🟢 | All-to-all is a rank-indexed permutation, not a floating-point reduction. EP32 traces certify exact dispatch/combine payloads when the inputs match. |
 | Grouped GEMM (expert FFN) | `extensions/transformer_engine.py` `TEGroupedLinear` | 🟡 | Forward deterministic; backward weight-grad accumulation order is the concern + a perf target (Longcat "optimized grouped GEMM"). |
 | Token unpermute (combine) | `moe_utils.py:513-531` | 🔵 | det: `index_add_` (CUDA-graph safe); non-det: `scatter_add_`. This is the `aten::fill_`/`empty`/`index_put` **hotspot**. |
 | Router replay (optional) | `transformer/moe/router_replay.py` | 🟢 | Records top-k indices once and replays them — forces identical routing across runs (a determinism *tool*, not on the default path). |
@@ -65,7 +65,7 @@ Legend for the "Determinism" column:
 
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
-| Triton kernel autotune | `ssm/ops/determinism.py:81-103` | 🔵 | det: pick cheapest config (avoids autotune-driven kernel variance); else run-all autotune. |
+| Triton kernel autotune | `megatron/determinism_env.py`, `ssm/ops/determinism.py` and `mamba_ssm.utils.determinism` | 🔵 | det: `MAMBA_DETERMINISTIC=1` plus `TRITON_CACHE_AUTOTUNING=0` before kernel imports selects one fixed config; normal mode may timing-autotune. A cold cached-autotune run was the Nemotron backward divergence root cause. |
 | Tiled reduction workspace | `ssm/ops/determinism.py:106-123` | 🔵 | det: allocate `zeros(..., tile_dim)` and `.sum(-1)` (ordered reduction); non-det: `empty(...)`. |
 | Gated-delta-rule kernel | `ssm/gated_delta_net.py:213-216` | 🔵 | det: torch `chunk_gated_delta_rule`; non-det: FLA fused kernel. |
 | Causal conv1d | `ssm/gated_delta_net.py:430-446` | 🔵 | det: `F.conv1d` (+ transposes); non-det: FLA `causal_conv1d`. |
@@ -75,7 +75,7 @@ Legend for the "Determinism" column:
 
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
-| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py:119-156` | 🟡 | 3 all-reduces (MAX, SUM, SUM) across TP. Deterministic under fixed `NCCL_ALGO` (ring order pins FP reduction order). fp32 intermediates. |
+| Vocab-parallel cross-entropy | `tensor_parallel/cross_entropy.py:119-156` | 🟡 | 3 all-reduces (MAX, SUM, SUM) across TP. `NCCL_ALGO=Ring` pins the algorithm but not necessarily the physical rank order across allocations; TP>1 therefore remains a cross-allocation verification gap. fp32 intermediates reduce, but do not remove, order sensitivity. |
 | Fused CE | `cross_entropy_loss_fusion` | 🔴→forbidden | Non-deterministic; **asserted off** in deterministic mode (`arguments.py:1502`). |
 | MoE aux loss | `moe_utils.py:842-890` | 🟡 | `scatter` for routing map; aux-loss scalar reduction. |
 
@@ -94,9 +94,9 @@ Legend for the "Determinism" column:
 
 | Step | Where | Determinism | Notes |
 | --- | --- | --- | --- |
-| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | 🟡 | bf16 collective has FP non-associativity but a **fixed NCCL ring order makes it reproducible** run-to-run. The structured trace can hash each bucket before launch and after the existing completion boundary. |
-| fp32-accumulation reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` (enabled via `ddp_config.reduce_scatter_with_fp32_accumulation`) | 🟢 | All-to-all then **ordered `torch.sum(..., dtype=fp32)`** — a deterministic, higher-precision reduction. Primarily an accuracy feature; also determinism-friendly. |
-| Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | 🟡 | Sync and overlapped paths are reproducible under fixed NCCL ordering. The structured trace hashes each bucket before launch and after the existing completion boundary. |
+| Grad bucket all-reduce / reduce-scatter | `distributed/param_and_grad_buffer.py` | 🔵 | Deterministic distributed-optimizer mode forces the ordered fp32 path below. Native floating-point all-reduce/reduce-scatter remains topology-sensitive across allocations. The trace hashes every bucket before launch and after its existing completion boundary. |
+| fp32-accumulation reduce-scatter | `distributed/reduce_scatter_with_fp32_accumulation.py` (forced by `apply_determinism_to_args` for the distributed optimizer) | 🟢 | Rank-indexed all-to-all then **ordered `torch.sum(..., dtype=fp32)`**. EP32 DSV3 traces matched 6,080/6,080 semantic events within and across independent 32-GPU allocations. |
+| Distributed-optimizer param all-gather | `distributed/param_and_grad_buffer.py` | 🟢 | All-gather copies rank-indexed parameter shards and performs no floating-point reduction. The trace hashes each bucket before launch and after the existing completion boundary. |
 | Async param gather / grad reduce overlap | `distributed/param_and_grad_buffer.py`, `tensor_parallel/layers.py:544/565/577` (`async_op=True`) | 🟡 | Async completion order can vary; determinism relies on existing `wait()` or stream barriers before use. The trace adds no wait and reports operations that outlive its window through `iteration.end.pending_collectives`. `tp_comm_overlap` is force-disabled in det mode. |
 
 ## Stage 5 — Optimizer
@@ -105,14 +105,15 @@ Legend for the "Determinism" column:
 | --- | --- | --- | --- |
 | Distributed optimizer param sharding/order | `optimizer/distrib_optimizer.py:1094` | 🟢 | Param→shard mapping "preserves deterministic ordering across ranks". |
 | Adam / Muon update | `optimizer/` | 🟢 | Elementwise; deterministic given deterministic grads. |
-| Grad clipping (global norm) | `optimizer/clip_grads.py` | 🟡 | Global-norm all-reduce; reproducible under fixed NCCL algo. |
+| Grad clipping (global norm) | `optimizer/clip_grads.py`, `distributed/deterministic_collectives.py` | 🔵 | det: rank-ordered all-gather plus fixed local fp32 sum; normal: native all-reduce. This closes the scalar divergence that otherwise changes every optimizer update after an exact gradient reduction. |
+| Reported losses / MoE metrics | `training.py`, `training/utils/common_utils.py`, `transformer/moe/moe_logging.py` | 🔵 | det: rank-ordered sum/average for small statistics; normal: native SUM/AVG collectives. This keeps logs and scheduler-facing aggregates cross-allocation exact. |
 
 ## Cross-cutting (affect every stage)
 
 | Concern | Control | Determinism | Notes |
 | --- | --- | --- | --- |
 | cuBLAS GEMM workspace | `CUBLAS_WORKSPACE_CONFIG=:4096:8` | 🟡 | Required for deterministic GEMM algo selection. |
-| NCCL collective algorithm | `NCCL_ALGO=Ring` | 🟡 | Pins reduction topology/order. `Tree` excluded by PR #5041. |
+| NCCL collective algorithm | `NCCL_ALGO=Ring` | 🟡 | Pins the algorithm, not the physical ring chosen for an allocation. It is insufficient by itself for floating-point reduction reproducibility; ordered reduction branches above are the guarantee. `Tree` remains excluded. |
 | TE non-deterministic algos | `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | 🟡 | Forces TE deterministic attention/norm kernels. |
 | CUDA caching allocator | (none) | 🟡 | Allocation pattern can influence kernel autotuning/selection; flagged in the roadmap as worth investigating. |
 | PP / VPP microbatch interleave | schedules and `p2p_communication.py` in `core/pipeline_parallel/` | 🟢→🟡 | Schedule is deterministic, but interleaving scrambles observed event order. Rank-local P2P trace events are semantically named and complete at existing waits, so comparison does not depend on cross-kind arrival order. |

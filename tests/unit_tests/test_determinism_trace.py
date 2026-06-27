@@ -347,6 +347,8 @@ def test_data_parallel_grad_collective_trace(
         assert len(collective) == 2
         expected_operation = "reduce_scatter_tensor" if use_distributed_optimizer else "all_reduce"
         assert all(event["payload"]["operation"] == expected_operation for event in collective)
+        if use_distributed_optimizer:
+            assert collective[0]["payload"]["fp32_accumulation"] is False
         assert collective[0]["payload"]["inputs"][0]["sha256"]
         assert collective[1]["payload"]["outputs"][0]["sha256"]
         assert events[-1]["payload"]["pending_collectives"] == 0
