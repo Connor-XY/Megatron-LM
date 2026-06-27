@@ -49,8 +49,8 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Top-k expert select | `moe_utils.py:758-788` | `torch.topk(sorted=is_grad_enabled())` | 🟡 | `sorted=True` in training pins order | `sorted=False` (inference) | grad-enabled | doc | `cub::DeviceRadixSort` 6.36 vs 1.23 ms over 3 steps (+5.13 ms) | Investigate deterministic top-k without the 5× dispatch-range amplification; check fused TE top-k parity. |
 | Group-limited top-k mask | `moe_utils.py:590-645` | `scatter_(1, group_idx, 1)` | 🟢 | unique group indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** bit-exact by `test_deepseek_model.py` (DSV3 group routing: `num_groups`/`group_topk`) across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
 | Aux-loss routing map | `moe_utils.py:888-901` | `scatter` | 🟢 | unique indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** via DSV3 proxy (`seq_aux_loss` enabled) — bit-exact. |
-| Capacity-drop mask | `moe_utils.py:950-962` | `scatter` | 🟡 | unique indices | — (no branch) | always | — | small | ⚠ verify under capacity factor. |
-| Router map (router.py) | `transformer/moe/router.py:261` | `scatter` | 🟡 | unique indices | — | always | — | small | ⚠ verify. |
+| Capacity-drop mask | `moe_utils.py:950-962` | `scatter` | 🟢 | unique indices | — (no branch) | capacity factor | code+**test** | small | **Verified** bit-exact for `probs` and `position` drop policies, including unpadded and fixed-capacity padded A2A dispatch, across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
+| Router map (Sinkhorn) | `transformer/moe/router.py:260` | `scatter` | 🟢 | unique top-k indices | — | Sinkhorn routing | code+**test** | small | **Verified** bit-exact with the DSV3 Sinkhorn preset across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
 | Pad routing map | `moe_utils.py:648-680` / `fusions/fused_pad_routing_map.py` | `cumsum` + mask write | 🟢 | ordered cumsum | — | always | doc | small | cumsum is deterministic. |
 | Token permute (dispatch) | `moe_utils.py:300-442`; `token_dispatcher.py:645-659`; `moe/ops/deterministic_index_select.py` | `argsort(stable=True)` + row gather | 🔵 | fixed-order Triton backward for dropless top-k ≥4 and hidden ≥2048 | PyTorch `index_select` backward / fused TE | deterministic algorithms + guarded shape | code+**test** | H100: `IndexSelectBackward0` 50.34→14.97 ms (**-70%**) over 3 profiled steps; GB200 isolated kernel: 6.5–55.4% lower latency | Model-level A2A top-k-8/top-k-6 presets are bit-exact. Extend the fast path only with shape-specific evidence; supported fallbacks remain unchanged. |
 | EP all-to-all dispatch/combine | `transformer/moe/token_dispatcher.py` | `all_to_all` | 🟢🟡 | fixed NCCL algo | — | env | doc+**test** | — | Bit-exact at EP≤4 (DSV3 + nemotron proxies). ⚠ EP>16 at scale unverified (DSV3 only diverges there). |
@@ -291,10 +291,15 @@ top-k-2 presets after fixing the harness to preserve their declared 8-expert
 topology, with the same 8 passed / 4 skipped result on each rank. The helper's
 fallback and dtype/shape matrix passed 20/20 cases per rank in job `516124`.
 
-**Still open:** capacity-drop mask, `router.py:261` scatter, EP all-to-all at
-**EP>16** (proxies cap at EP4 — needs the Tier-B mbridge e2e recipe to reach the
-scale where DSV3 empirically diverges), torch-norm backward fallback, DSA sparse
-masks, and the 8-GPU cells for the new A2A presets. AWS-DFW and AWS-CMH expose
-four GPUs per node to this fixture; HSG was unreachable during this run. Promote
-each to 🟢/🔵 or open a gap with a fix following the `moe_utils.py:530`
-det-branch pattern.
+**Verified (capacity and Sinkhorn routing):** AWS-DFW GB200 job `516442`
+reported 12 passed / 9 expected 8-GPU skips per rank. Draco H100 job `10429794`
+then passed all 21 selected cells on each of 8 ranks. Together these cover both
+capacity drop policies, padded and unpadded A2A dispatch, and the Sinkhorn
+router-local scatter across EP≤4 / TP / FSDP / PP / VPP.
+
+**Still open:** EP all-to-all at **EP>16** (proxies cap at EP4 — needs the Tier-B
+mbridge e2e recipe to reach the scale where DSV3 empirically diverges),
+torch-norm backward fallback, DSA sparse masks, and the 8-GPU cells for the new
+A2A presets. AWS-DFW and AWS-CMH expose four GPUs per node to this fixture; HSG
+was unreachable during this run. Promote each to 🟢/🔵 or open a gap with a fix
+following the `moe_utils.py:530` det-branch pattern.

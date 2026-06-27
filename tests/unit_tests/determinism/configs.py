@@ -212,7 +212,9 @@ HYBRID_CONFIGS = [
 
 # DeepSeek-V3 proxy presets. The A2A variant raises hidden size and top-k to
 # exercise the fixed-order deterministic index-select backward used by the
-# production dispatcher path.
+# production dispatcher path. The capacity variants cover both token-drop
+# policies plus the fixed-capacity padded permutation, and the Sinkhorn variant
+# covers the router-local scatter map outside the standard top-k helper.
 DEEPSEEK_CONFIGS = [
     pytest.param({}, id="dsv3-like"),
     pytest.param(
@@ -224,6 +226,28 @@ DEEPSEEK_CONFIGS = [
             moe_token_dispatcher_type="alltoall",
         ),
         id="dsv3-a2a-topk8",
+    ),
+    pytest.param(
+        dict(
+            moe_token_dispatcher_type="alltoall",
+            moe_expert_capacity_factor=0.5,
+            moe_token_drop_policy="probs",
+            moe_pad_expert_input_to_capacity=False,
+        ),
+        id="dsv3-capacity-probs",
+    ),
+    pytest.param(
+        dict(
+            moe_token_dispatcher_type="alltoall",
+            moe_expert_capacity_factor=0.5,
+            moe_token_drop_policy="position",
+            moe_pad_expert_input_to_capacity=True,
+        ),
+        id="dsv3-capacity-position-pad",
+    ),
+    pytest.param(
+        dict(moe_router_load_balancing_type="sinkhorn", moe_router_enable_expert_bias=False),
+        id="dsv3-sinkhorn",
     ),
 ]
 

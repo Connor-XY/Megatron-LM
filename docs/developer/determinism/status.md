@@ -185,10 +185,10 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    hooks still miss collectives, optimizer internals, recompute identity, and
    allocator-driven kernel selection → Workstream 4 still needs a typed runtime
    instrumentation API for those surfaces.
-4. **Scatter/cumsum sites without an explicit det branch** (e.g.
-   `moe_utils.py:633, 901, 957, 962`, `router.py:261`) — likely safe in
-   forward (unique indices) but their backward and large-scale behavior must be
-   confirmed with `BitExactRunner` (see catalog "⚠ verify" rows).
+4. **Remaining unverified operator families:** torch-norm fallback backward and
+   DSA sparse-attention mask construction. MoE group, auxiliary-loss, capacity,
+   padding, and Sinkhorn routing maps are now bit-exact across the EP≤4 / TP /
+   FSDP / PP / VPP proxy matrix; EP>16 remains part of the e2e gap above.
 
 ## 9. References
 
