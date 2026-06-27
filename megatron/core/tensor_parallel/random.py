@@ -17,7 +17,11 @@ from torch.utils.checkpoint import detach_variable
 from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
-from megatron.core.determinism_trace import begin_recompute_trace, record_recompute_phase
+from megatron.core.determinism_trace import (
+    begin_recompute_trace,
+    record_recompute_phase,
+    use_determinism_trace,
+)
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
@@ -620,7 +624,15 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            determinism_trace = (
+                ctx.determinism_trace_handle.trace
+                if ctx.determinism_trace_handle is not None
+                else None
+            )
+            with (
+                torch.enable_grad(),
+                use_determinism_trace(determinism_trace, collective_phase="recompute"),
+            ):
                 outputs = ctx.run_function(*detached_inputs)
         record_recompute_phase(ctx.determinism_trace_handle, "recompute", outputs)
 
@@ -631,7 +643,8 @@ class CheckpointFunction(torch.autograd.Function):
         outputs, args = zip(
             *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
         )
-        torch.autograd.backward(outputs, args)
+        with use_determinism_trace(determinism_trace, collective_phase="backward"):
+            torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
 
         _unset_checkpointing()

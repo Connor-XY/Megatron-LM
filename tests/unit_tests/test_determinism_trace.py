@@ -9,13 +9,17 @@ import torch
 from megatron.core.determinism_trace import (
     EventKind,
     active_trace,
+    begin_collective_trace,
     begin_recompute_trace,
+    record_collective_result,
     record_event,
     record_recompute_phase,
     record_tensor,
     trace_iteration,
 )
+from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.tensor_parallel.random import checkpoint
+from tests.unit_tests.test_utilities import Utils
 
 
 def _read_events(path):
@@ -37,6 +41,9 @@ def test_disabled_trace_is_a_noop(tmp_path):
         assert active_trace() is None
         record_event(EventKind.PHASE, "ignored")
         record_tensor("ignored", torch.ones(1))
+        handle = begin_collective_trace("ignored", "all_reduce", torch.ones(1))
+        assert handle is None
+        record_collective_result(handle, torch.ones(1))
 
     assert not list(tmp_path.rglob("*.jsonl"))
 
@@ -95,6 +102,25 @@ def test_nonfinite_payloads_remain_valid_json(tmp_path):
     assert optimizer["payload"]["grad_norm"] == "nan"
 
 
+def test_collective_trace_records_semantic_input_and_output(tmp_path):
+    input_tensor = torch.tensor([1.0, 2.0])
+    output_tensor = input_tensor + 1
+    with trace_iteration(tmp_path, 8, hash_tensors=True):
+        handle = begin_collective_trace(
+            "test.collective", "all_reduce", input_tensor, metadata={"async_op": False}
+        )
+        record_collective_result(handle, output_tensor)
+
+    events = _read_events(_trace_path(tmp_path, 8))
+    collective = [event for event in events if event["kind"] == "collective"]
+    assert [event["name"] for event in collective] == [
+        "test.collective.begin",
+        "test.collective.end",
+    ]
+    assert collective[0]["payload"]["inputs"][0]["sha256"]
+    assert collective[1]["payload"]["outputs"][0]["sha256"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_checkpoint_autograd_records_paired_recompute(tmp_path):
     x = torch.tensor([1.0, 2.0], device="cuda", requires_grad=True)
@@ -107,3 +133,85 @@ def test_checkpoint_autograd_records_paired_recompute(tmp_path):
     recompute = [event for event in events if event["name"] == "checkpoint.recompute"]
     assert len(forward) == len(recompute) == 1
     assert recompute[0]["payload"]["matches_forward"] is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_all_to_all_autograd_records_forward_and_backward(tmp_path):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+    try:
+        group = torch.distributed.group.WORLD
+        world_size = group.size()
+        rank = group.rank()
+        values = torch.arange(world_size, dtype=torch.float32, device="cuda") + 10 * rank
+        values.requires_grad_()
+
+        with trace_iteration(tmp_path, 9, hash_tensors=True):
+            output = all_to_all(group, values, trace_name="test.ep_all_to_all")
+            output.sum().backward()
+
+        expected = torch.arange(world_size, dtype=torch.float32, device="cuda") * 10 + rank
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(values.grad, torch.ones_like(values))
+        events = _read_events(_trace_path(tmp_path, 9))
+        collective = [event for event in events if event["kind"] == "collective"]
+        assert [event["name"] for event in collective] == [
+            "test.ep_all_to_all.forward.begin",
+            "test.ep_all_to_all.forward.end",
+            "test.ep_all_to_all.backward.begin",
+            "test.ep_all_to_all.backward.end",
+        ]
+        assert all(event["payload"]["group_size"] == world_size for event in collective)
+        assert all(event["payload"]["group_rank"] == rank for event in collective)
+        assert collective[1]["payload"]["outputs"][0]["sha256"]
+        assert collective[3]["payload"]["outputs"][0]["sha256"]
+
+        checkpointed_values = values.detach().clone().requires_grad_()
+        with trace_iteration(tmp_path, 10, hash_tensors=True):
+            checkpointed_output = checkpoint(
+                lambda tensor: all_to_all(
+                    group, tensor, trace_name="test.checkpointed_ep_all_to_all"
+                ),
+                False,
+                checkpointed_values,
+            )
+            checkpointed_output.sum().backward()
+
+        checkpointed_events = _read_events(_trace_path(tmp_path, 10))
+        checkpointed_collective = [
+            event for event in checkpointed_events if event["kind"] == "collective"
+        ]
+        assert [event["name"] for event in checkpointed_collective] == [
+            "test.checkpointed_ep_all_to_all.forward.begin",
+            "test.checkpointed_ep_all_to_all.forward.end",
+            "test.checkpointed_ep_all_to_all.recompute.begin",
+            "test.checkpointed_ep_all_to_all.recompute.end",
+            "test.checkpointed_ep_all_to_all.backward.begin",
+            "test.checkpointed_ep_all_to_all.backward.end",
+        ]
+        assert all(
+            (event["payload"].get("inputs") or event["payload"].get("outputs"))[0]["sha256"]
+            for event in checkpointed_collective
+        )
+        torch.testing.assert_close(checkpointed_output, expected)
+        torch.testing.assert_close(checkpointed_values.grad, torch.ones_like(checkpointed_values))
+
+        async_values = values.detach().clone().requires_grad_()
+        with trace_iteration(tmp_path, 11, hash_tensors=True):
+            async_output = all_to_all(
+                group, async_values, use_nccl_stream=True, trace_name="test.async_ep_all_to_all"
+            )
+            async_output.sum().backward()
+
+        async_events = _read_events(_trace_path(tmp_path, 11))
+        async_collective = [event for event in async_events if event["kind"] == "collective"]
+        assert [event["name"] for event in async_collective] == [
+            "test.async_ep_all_to_all.forward.begin",
+            "test.async_ep_all_to_all.forward.end",
+            "test.async_ep_all_to_all.backward.begin",
+            "test.async_ep_all_to_all.backward.end",
+        ]
+        assert all(event["payload"]["async_op"] is True for event in async_collective)
+        torch.testing.assert_close(async_output, expected)
+        torch.testing.assert_close(async_values.grad, torch.ones_like(async_values))
+    finally:
+        Utils.destroy_model_parallel()

@@ -32,6 +32,7 @@ class EventKind(str, Enum):
     RUNTIME = "runtime"
     PHASE = "phase"
     RECOMPUTE = "recompute"
+    COLLECTIVE = "collective"
     OPTIMIZER = "optimizer"
     TENSOR = "tensor"
 
@@ -73,8 +74,21 @@ class RecomputeTraceHandle:
     forward_fingerprints: list[dict[str, Any]] | None = None
 
 
+@dataclass
+class CollectiveTraceHandle:
+    """State shared by the begin and end events for one collective."""
+
+    trace: DeterminismTrace
+    name: str
+    operation: str
+    metadata: dict[str, Any]
+
+
 _ACTIVE_TRACE: ContextVar[DeterminismTrace | None] = ContextVar(
     "megatron_determinism_trace", default=None
+)
+_COLLECTIVE_PHASE: ContextVar[str] = ContextVar(
+    "megatron_determinism_collective_phase", default="forward"
 )
 
 
@@ -258,6 +272,29 @@ def active_trace() -> DeterminismTrace | None:
     return _ACTIVE_TRACE.get()
 
 
+def collective_trace_phase() -> str:
+    """Return the semantic execution phase for newly launched collectives."""
+    return _COLLECTIVE_PHASE.get()
+
+
+@contextmanager
+def use_determinism_trace(
+    trace: DeterminismTrace | None, *, collective_phase: str | None = None
+) -> Iterator[None]:
+    """Temporarily propagate an existing trace into an autograd execution context."""
+    if trace is None:
+        yield
+        return
+    trace_token = _ACTIVE_TRACE.set(trace)
+    phase_token = _COLLECTIVE_PHASE.set(collective_phase) if collective_phase is not None else None
+    try:
+        yield
+    finally:
+        if phase_token is not None:
+            _COLLECTIVE_PHASE.reset(phase_token)
+        _ACTIVE_TRACE.reset(trace_token)
+
+
 def trace_tensor_hashes_enabled() -> bool:
     """Return whether the active trace requests exact tensor byte hashes."""
     trace = active_trace()
@@ -280,6 +317,57 @@ def record_tensor(name: str, tensor: torch.Tensor, **payload: Any) -> None:
         EventKind.TENSOR,
         name,
         {**payload, **asdict(fingerprint_tensor(tensor, include_hash=trace.hash_tensors))},
+    )
+
+
+def begin_collective_trace(
+    name: str,
+    operation: str,
+    inputs: Any,
+    *,
+    group: torch.distributed.ProcessGroup | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    trace: DeterminismTrace | None = None,
+) -> CollectiveTraceHandle | None:
+    """Record collective inputs without introducing communication."""
+    trace = active_trace() if trace is None else trace
+    if trace is None:
+        return None
+    event_metadata = dict(metadata or {})
+    if group is not None:
+        event_metadata.update(
+            {
+                "group_size": group.size(),
+                "group_rank": group.rank(),
+                "backend": str(torch.distributed.get_backend(group)),
+            }
+        )
+    trace.record(
+        EventKind.COLLECTIVE,
+        f"{name}.begin",
+        {
+            "operation": operation,
+            **event_metadata,
+            "inputs": _tensor_tree(inputs, include_hash=trace.hash_tensors),
+        },
+    )
+    return CollectiveTraceHandle(
+        trace=trace, name=name, operation=operation, metadata=event_metadata
+    )
+
+
+def record_collective_result(handle: CollectiveTraceHandle | None, outputs: Any) -> None:
+    """Record collective outputs after the caller has made them ready."""
+    if handle is None:
+        return
+    handle.trace.record(
+        EventKind.COLLECTIVE,
+        f"{handle.name}.end",
+        {
+            "operation": handle.operation,
+            **handle.metadata,
+            "outputs": _tensor_tree(outputs, include_hash=handle.trace.hash_tensors),
+        },
     )
 
 

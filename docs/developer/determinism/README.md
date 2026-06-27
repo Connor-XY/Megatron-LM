@@ -59,10 +59,12 @@ pretrain_gpt.py ... \
 
 The trace records determinism-relevant runtime configuration, forward/backward
 and optimizer boundaries, Megatron activation-checkpoint forward/recompute
-identities, and (with `--determinism-trace-tensor-hashes`) exact wgrad, updated
-parameter, checkpoint-input, and checkpoint-output hashes. Exact hashing copies
+identities, and semantic MoE expert-parallel all-to-all boundaries. With
+`--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
+parameter, checkpoint, and all-to-all input/output hashes. Exact hashing copies
 device tensors to the CPU and synchronizes execution; use it only for targeted
-debug iterations. Without that flag, phase events and checkpoint tensor metadata
+debug iterations because those synchronizations can perturb communication
+overlap. Without that flag, phase, checkpoint, and collective tensor metadata
 remain available without the byte copies; optimizer boundary tensors are omitted.
 
 Run the same launch into a second directory, then align events by semantic
@@ -75,10 +77,11 @@ python tools/determinism/compare_traces.py \
 
 Exit codes match `compare_dumps.py`: 0 is a match, 1 is a divergence, and 2 is
 invalid input. Use `--json` for automation. The current integration covers the
-Megatron tensor-parallel activation-checkpoint implementation and optimizer
-inputs/outputs. Collective payloads, TE FP8/FP4 recompute, optimizer moment
-state, and actual selected kernel identities remain follow-up instrumentation
-surfaces.
+Megatron tensor-parallel activation-checkpoint implementation, optimizer
+inputs/outputs, and the standard MoE expert-parallel all-to-all dispatcher.
+Pipeline P2P, TP/DP reduction and gather payloads, TE FP8/FP4 recompute,
+optimizer moment state, and actual selected kernel identities remain follow-up
+instrumentation surfaces.
 
 ## Maintenance
 

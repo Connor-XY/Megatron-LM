@@ -53,7 +53,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Router map (Sinkhorn) | `transformer/moe/router.py:260` | `scatter` | 🟢 | unique top-k indices | — | Sinkhorn routing | code+**test** | small | **Verified** bit-exact with the DSV3 Sinkhorn preset across EP≤4/TP/FSDP/PP/VPP. ⚠ still unverified at EP>16. |
 | Pad routing map | `moe_utils.py:648-680` / `fusions/fused_pad_routing_map.py` | `cumsum` + mask write | 🟢 | ordered cumsum | — | always | doc | small | cumsum is deterministic. |
 | Token permute (dispatch) | `moe_utils.py:300-442`; `token_dispatcher.py:645-659`; `moe/ops/deterministic_index_select.py` | `argsort(stable=True)` + row gather | 🔵 | fixed-order Triton backward for dropless top-k ≥4 and hidden ≥2048 | PyTorch `index_select` backward / fused TE | deterministic algorithms + guarded shape | code+**test** | H100: `IndexSelectBackward0` 50.34→14.97 ms (**-70%**) over 3 profiled steps; GB200 isolated kernel: 6.5–55.4% lower latency | Model-level A2A top-k-8/top-k-6 presets are bit-exact. Extend the fast path only with shape-specific evidence; supported fallbacks remain unchanged. |
-| EP all-to-all dispatch/combine | `transformer/moe/token_dispatcher.py` | `all_to_all` | 🟢🟡 | fixed NCCL algo | — | env | doc+**test** | — | Bit-exact at EP≤4 (DSV3 + nemotron proxies). ⚠ EP>16 at scale unverified (DSV3 only diverges there). |
+| EP all-to-all dispatch/combine | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | `all_to_all` | 🟢🟡 | fixed NCCL algo | — | env | doc+**test** | — | Bit-exact at EP≤4 (DSV3 + nemotron proxies). Structured traces can fingerprint semantic dispatch/combine boundaries. ⚠ EP>16 at scale unverified (DSV3 only diverges there). |
 | Grouped GEMM (experts) | `extensions/transformer_engine.py` `TEGroupedLinear` | grouped matmul | 🟢🟡 | TE deterministic kernels | TE fast kernels | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | doc+**test** | `_GroupedLinearBackward` +19.2 ms (+20%) over 3 profiled steps | Bit-exact in DSV3 + nemotron proxies (`moe_grouped_gemm=True`). wgrad order remains a perf target ("optimized grouped GEMM", "fused GemmAdd"). |
 | Router replay | `transformer/moe/router_replay.py` | record/replay top-k | 🟢 | replay recorded indices | — | opt-in | code | — | A determinism *tool*, not default path. |
 
@@ -303,6 +303,14 @@ ranks, respectively). The matrix covers PyTorch LayerNorm/RMSNorm forward and
 backward at hidden 128/2048, DSA indexer-loss mask construction in forward and
 recomputed manual backward (dense and sparse loss), and unfused sparse-attention
 mask construction plus input gradients.
+
+**Verified (structured EP all-to-all trace):** AWS-DFW GB200 job `516965`
+passed all 21 focused trace/dump tests per rank, including synchronous and
+NCCL-stream all-to-all plus activation-recompute and backward propagation;
+AWS-CMH GB300 job `696891` passed the same final suite per rank. AWS-DFW job
+`516924` matched 984/984 events across two independent DSV3-style TP2×EP2 runs;
+288 were hashed collective boundary events spanning original forward, recompute,
+and backward.
 
 **Still open:** EP all-to-all at **EP>16** (proxies cap at EP4 — needs the Tier-B
 mbridge e2e recipe to reach the scale where DSV3 empirically diverges) and the

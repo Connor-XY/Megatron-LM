@@ -2,6 +2,12 @@
 
 import torch
 
+from megatron.core.determinism_trace import (
+    active_trace,
+    begin_collective_trace,
+    collective_trace_phase,
+    record_collective_result,
+)
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
 
@@ -419,19 +425,63 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes, use_nccl_stream=False):
+    def forward(
+        ctx,
+        group,
+        input,
+        output_split_sizes,
+        input_split_sizes,
+        use_nccl_stream,
+        trace_name,
+        trace_phase,
+        determinism_trace,
+    ):
         """Forward function."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
         ctx.use_nccl_stream = use_nccl_stream
+        ctx.trace_name = trace_name
 
         world_size = group.size()
+        trace_metadata = {
+            "async_op": use_nccl_stream,
+            "input_split_sizes": (
+                input_split_sizes.tolist()
+                if hasattr(input_split_sizes, "tolist")
+                else input_split_sizes
+            ),
+            "output_split_sizes": (
+                output_split_sizes.tolist()
+                if hasattr(output_split_sizes, "tolist")
+                else output_split_sizes
+            ),
+            "bypassed": world_size == 1,
+        }
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
+            trace_handle = begin_collective_trace(
+                f"{trace_name}.{trace_phase}",
+                "all_to_all_single",
+                input,
+                group=group,
+                metadata=trace_metadata,
+                trace=determinism_trace,
+            )
+            ctx.determinism_trace = trace_handle.trace if trace_handle is not None else None
+            record_collective_result(trace_handle, input)
             return input
 
         input = input.contiguous()
+        trace_handle = begin_collective_trace(
+            f"{trace_name}.{trace_phase}",
+            "all_to_all_single",
+            input,
+            group=group,
+            metadata=trace_metadata,
+            trace=determinism_trace,
+        )
+        ctx.determinism_trace = trace_handle.trace if trace_handle is not None else None
         if output_split_sizes is None:
             # Equal split (all2all)
             output = torch.empty_like(input)
@@ -460,6 +510,7 @@ class _AllToAll(torch.autograd.Function):
                 input_split_sizes=input_split_sizes,
                 group=group,
             )
+        record_collective_result(trace_handle, output)
         return output
 
     @staticmethod
@@ -473,7 +524,13 @@ class _AllToAll(torch.autograd.Function):
                 ctx.input_split_sizes,
                 ctx.output_split_sizes,
                 ctx.use_nccl_stream,
+                ctx.trace_name,
+                "backward",
+                ctx.determinism_trace,
             ),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -552,11 +609,25 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
 
 
 def all_to_all(
-    group, input_, output_split_sizes_=None, input_split_sizes=None, use_nccl_stream=False
+    group,
+    input_,
+    output_split_sizes_=None,
+    input_split_sizes=None,
+    use_nccl_stream=False,
+    trace_name="tensor_parallel.all_to_all",
 ):
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
+    return _AllToAll.apply(
+        group,
+        input_,
+        output_split_sizes_,
+        input_split_sizes,
+        use_nccl_stream,
+        trace_name,
+        collective_trace_phase(),
+        active_trace(),
+    )
 
 
 def all_to_all_sp2hp(input_, group=None):

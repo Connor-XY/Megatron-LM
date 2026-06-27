@@ -688,6 +688,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
             use_nccl_stream=self.use_nccl_stream,
+            trace_name="moe.ep_dispatch.tokens",
         )
         # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
         # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
@@ -701,6 +702,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
             use_nccl_stream=self.use_nccl_stream,
+            trace_name="moe.ep_dispatch.probs",
         )
 
         return global_input_tokens, global_probs
@@ -847,6 +849,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             self.output_splits,
             use_nccl_stream=self.use_nccl_stream,
+            trace_name="moe.ep_combine.tokens",
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)

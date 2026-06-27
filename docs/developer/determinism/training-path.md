@@ -56,7 +56,7 @@ Legend for the "Determinism" column:
 | Routing map / probs construction | `moe_utils.py:823-837` | 🔵 | det: `index_put_(accumulate=False)`; non-det: `scatter`. Also `compute_routing_scores_for_aux_loss:890` and capacity masks `946/951` use `scatter` with **no** det branch (**verify**). |
 | Capacity-factor drop | `moe_utils.py:940-951` | 🟡 | `scatter` of capacity mask; unique indices. |
 | Token permute (dispatch sort) | `moe_utils.py:299-431` (`argsort(stable=True)` + `index_select`, or fused TE permute) | 🟢 | Stable sort + gather is deterministic. |
-| EP all-to-all dispatch | `transformer/moe/token_dispatcher.py` | 🟡 | Collective itself is ordered; reproducible under fixed NCCL algo. Order of tokens is set by (deterministic) routing. |
+| EP all-to-all dispatch | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | 🟡 | Collective itself is ordered; reproducible under fixed NCCL algo. The structured trace can record semantic dispatch/combine input and output hashes in forward and backward. |
 | Grouped GEMM (expert FFN) | `extensions/transformer_engine.py` `TEGroupedLinear` | 🟡 | Forward deterministic; backward weight-grad accumulation order is the concern + a perf target (Longcat "optimized grouped GEMM"). |
 | Token unpermute (combine) | `moe_utils.py:513-531` | 🔵 | det: `index_add_` (CUDA-graph safe); non-det: `scatter_add_`. This is the `aten::fill_`/`empty`/`index_put` **hotspot**. |
 | Router replay (optional) | `transformer/moe/router_replay.py` | 🟢 | Records top-k indices once and replays them — forces identical routing across runs (a determinism *tool*, not on the default path). |
@@ -115,7 +115,7 @@ Legend for the "Determinism" column:
 | TE non-deterministic algos | `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | 🟡 | Forces TE deterministic attention/norm kernels. |
 | CUDA caching allocator | (none) | 🟡 | Allocation pattern can influence kernel autotuning/selection; flagged in the roadmap as worth investigating. |
 | PP / VPP microbatch interleave | schedules in `core/pipeline_parallel/` | 🟢→🟡 | Schedule is deterministic, but interleaving **scrambles observed event order** — the key reason a naive "first divergence" hook is hard (Workstream 4). |
-| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py` | 🟢 | Opt-in rank-local events add no collectives. Semantic comparison ignores arrival order and can hash recompute outputs plus optimizer boundary tensors on selected iterations. |
+| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py`, `tensor_parallel/mappings.py` | 🟢 | Opt-in rank-local events add no collectives. Semantic comparison ignores arrival order and can hash recompute outputs, MoE EP all-to-all inputs/outputs, and optimizer boundary tensors on selected iterations. |
 
 ---
 
