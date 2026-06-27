@@ -14,6 +14,13 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.determinism_trace import (
+    active_trace,
+    begin_collective_trace,
+    collective_trace_phase,
+    record_collective_result,
+    trace_collective_work,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_global_memory_buffer,
@@ -239,7 +246,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (
-            getattr(config, 'transformer_impl', None) == 'inference_optimized'
+            getattr(config, "transformer_impl", None) == "inference_optimized"
         )
 
         # Allocate weights and initialize.
@@ -364,6 +371,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
+        ctx.determinism_trace = active_trace()
         output = torch.matmul(input, weight.t())
         if bias is not None:
             output = output + bias
@@ -385,7 +393,16 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
+            trace_handle = begin_collective_trace(
+                "tensor_parallel.linear.frozen_dgrad_all_reduce.backward",
+                "all_reduce",
+                grad_input,
+                group=ctx.tp_group,
+                metadata={"async_op": False},
+                trace=getattr(ctx, "determinism_trace", None),
+            )
             torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            record_collective_result(trace_handle, grad_input)
 
         return grad_input, None, None, None, None
 
@@ -495,13 +512,26 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
         ctx.tp_group = tp_group
+        ctx.determinism_trace = active_trace()
 
         if sequence_parallel:
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * tp_group.size()
 
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            trace_handle = begin_collective_trace(
+                (
+                    "tensor_parallel.linear.sequence_parallel_all_gather."
+                    f"{collective_trace_phase()}"
+                ),
+                "all_gather_into_tensor",
+                input,
+                group=tp_group,
+                metadata={"async_op": False, "axis": "first"},
+                trace=ctx.determinism_trace,
+            )
             dist_all_gather_func(all_gather_buffer, input, group=tp_group)
+            record_collective_result(trace_handle, all_gather_buffer)
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -540,9 +570,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 all_gather_buffer = get_global_memory_buffer().get_tensor(
                     dim_size, input.dtype, "mpu"
                 )
+                trace_handle = begin_collective_trace(
+                    "tensor_parallel.linear.sequence_parallel_all_gather.backward",
+                    "all_gather_into_tensor",
+                    input,
+                    group=tp_group,
+                    metadata={"async_op": True, "axis": "first"},
+                    trace=getattr(ctx, "determinism_trace", None),
+                )
                 handle = dist_all_gather_func(
                     all_gather_buffer, input, group=tp_group, async_op=True
                 )
+                handle = trace_collective_work(handle, trace_handle, all_gather_buffer)
 
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
                 # gather is scheduled before the input gradient computation
@@ -562,7 +601,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
+            trace_handle = begin_collective_trace(
+                "tensor_parallel.linear.dgrad_all_reduce.backward",
+                "all_reduce",
+                grad_input,
+                group=tp_group,
+                metadata={"async_op": True},
+                trace=getattr(ctx, "determinism_trace", None),
+            )
             handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
+            handle = trace_collective_work(handle, trace_handle, grad_input)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 
@@ -573,9 +621,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
+            trace_handle = begin_collective_trace(
+                "tensor_parallel.linear.dgrad_reduce_scatter.backward",
+                "reduce_scatter_tensor",
+                grad_input,
+                group=tp_group,
+                metadata={"async_op": True, "axis": "first"},
+                trace=getattr(ctx, "determinism_trace", None),
+            )
             handle = dist_reduce_scatter_func(
                 sub_grad_input, grad_input, group=tp_group, async_op=True
             )
+            handle = trace_collective_work(handle, trace_handle, sub_grad_input)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
 
@@ -946,7 +1003,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter("bias", None)
 
         self.use_inference_optimized_all_gather = (
-            getattr(config, 'transformer_impl', None) == 'inference_optimized'
+            getattr(config, "transformer_impl", None) == "inference_optimized"
         )
 
         self.sequence_parallel = config.sequence_parallel
@@ -1116,7 +1173,7 @@ class ColumnParallelLinear(torch.nn.Module):
             {"weight": 0, "bias": 0},
             sharded_offsets,
             tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def set_extra_state(self, state: Any):
@@ -1379,7 +1436,7 @@ class RowParallelLinear(torch.nn.Module):
             {"weight": 1},
             sharded_offsets,
             tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def set_extra_state(self, state: Any):

@@ -41,8 +41,8 @@ Use `--json` for automation and `--max-details N` to bound the report. Exit code
 This avoids treating PP/VPP hook arrival order as execution order, but it only
 localizes surfaces that the existing dump hooks capture. Use the structured
 trace below for recompute, optimizer, and collective boundaries; async TP
-overlap payloads and selected kernel identities remain follow-up surfaces. Only
-compare trusted `.pth` files because PyTorch dump loading uses pickle
+userbuffer payloads and selected kernel identities remain follow-up surfaces.
+Only compare trusted `.pth` files because PyTorch dump loading uses pickle
 serialization.
 
 ## Gate external training recipes from their console logs
@@ -99,13 +99,15 @@ parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
 distributed-optimizer parameter-gather hashes. It also fingerprints the
 standard synchronous TP all-reduce, first/last-dimension all-gather, and
 first/last-dimension reduce-scatter paths in original forward, activation
-recompute, and backward. Async outputs are recorded only after their existing
-completion boundary; the tracer does not add a collective or distributed wait.
-Exact hashing copies device tensors to the CPU and synchronizes execution; use
-it only for targeted debug iterations because those synchronizations can
-perturb communication overlap. Without that flag, phase, checkpoint, and
-collective tensor metadata remain available without the byte copies; optimizer
-boundary tensors are omitted. The additional
+recompute, and backward. Core TP linear tracing additionally covers the
+synchronous sequence-parallel forward gather and the backward async gather,
+dgrad all-reduce, and dgrad reduce-scatter. Async outputs are recorded only when
+the existing work-handle wait completes; the tracer does not add a collective
+or distributed wait. Exact hashing copies device tensors to the CPU and
+synchronizes execution; use it only for targeted debug iterations because those
+synchronizations can perturb communication overlap. Without that flag, phase,
+checkpoint, and collective tensor metadata remain available without the byte
+copies; optimizer boundary tensors are omitted. The additional
 `--determinism-trace-optimizer-state` flag records local main parameters and
 direct tensor/scalar optimizer state entries before and after the step, keyed by
 stable optimizer, parameter-group, and parameter ordinals. It requires exact
@@ -130,11 +132,11 @@ Megatron tensor-parallel activation-checkpoint implementation, optimizer
 inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, pipeline
 P2P sends/receives, DP all-reduce/reduce-scatter, and distributed-optimizer
 parameter all-gather, synchronous TP mapping all-reduce/all-gather/
-reduce-scatter, plus opt-in local optimizer main parameters and moment state.
-Async TP overlap payloads, TE FP8/FP4 recompute, and actual selected kernel
-identities remain follow-up instrumentation surfaces. Native floating-point TP
-SUM ordering remains a determinism-path gap even though its payload is now
-observable.
+reduce-scatter, core TP linear synchronous/async collectives, plus opt-in local
+optimizer main parameters and moment state. TP userbuffer payloads, TE FP8/FP4
+recompute, and actual selected kernel identities remain follow-up
+instrumentation surfaces. Native floating-point TP SUM ordering remains a
+determinism-path gap even though its payload is now observable.
 
 For a scaled model run, use the stricter certifier instead of relying on a trace
 comparison alone:

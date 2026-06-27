@@ -23,6 +23,10 @@ from megatron.core.determinism_trace import (
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_pipeline_model_parallel_group
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.tensor_parallel.layers import (
+    linear_with_frozen_weight,
+    linear_with_grad_accumulation_and_async_allreduce,
+)
 from megatron.core.tensor_parallel.mappings import (
     all_gather_last_dim_from_tensor_parallel_region,
     all_to_all,
@@ -443,6 +447,136 @@ def test_tensor_parallel_collective_trace_records_forward_and_backward(tmp_path)
         )
         torch.testing.assert_close(
             checkpointed_values.grad, torch.full_like(checkpointed_values, world_size)
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_tensor_parallel_linear_collective_trace_records_existing_waits(tmp_path):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+    try:
+        group = torch.distributed.group.WORLD
+        world_size = group.size()
+
+        with trace_iteration(tmp_path, 20, hash_tensors=True):
+            frozen_input = torch.ones(2, 3, dtype=torch.float32, device="cuda", requires_grad=True)
+            frozen_weight = torch.ones(4, 3, dtype=torch.float32, device="cuda")
+            frozen_output = linear_with_frozen_weight(
+                frozen_input,
+                frozen_weight,
+                None,
+                gradient_accumulation_fusion=False,
+                allreduce_dgrad=True,
+                sequence_parallel=False,
+                tp_group=group,
+            )
+            frozen_output.sum().backward()
+
+            allreduce_input = torch.ones(
+                2, 3, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            allreduce_weight = torch.ones(
+                4, 3, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            allreduce_output = linear_with_grad_accumulation_and_async_allreduce(
+                allreduce_input,
+                allreduce_weight,
+                None,
+                gradient_accumulation_fusion=False,
+                allreduce_dgrad=True,
+                sequence_parallel=False,
+                tp_group=group,
+            )
+            allreduce_output.sum().backward()
+
+            sequence_input = torch.ones(
+                1, 3, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            sequence_weight = torch.ones(
+                4, 3, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            sequence_output = linear_with_grad_accumulation_and_async_allreduce(
+                sequence_input,
+                sequence_weight,
+                None,
+                gradient_accumulation_fusion=False,
+                allreduce_dgrad=False,
+                sequence_parallel=True,
+                tp_group=group,
+            )
+            sequence_output.sum().backward()
+
+        expected_grad = torch.full_like(frozen_input, 4 * world_size)
+        torch.testing.assert_close(frozen_input.grad, expected_grad)
+        torch.testing.assert_close(allreduce_input.grad, expected_grad)
+        torch.testing.assert_close(
+            sequence_input.grad, torch.full_like(sequence_input, 4 * world_size)
+        )
+
+        events = _read_events(_trace_path(tmp_path, 20))
+        collective = [event for event in events if event["kind"] == "collective"]
+        expected_names = [
+            "tensor_parallel.linear.frozen_dgrad_all_reduce.backward",
+            "tensor_parallel.linear.dgrad_all_reduce.backward",
+            "tensor_parallel.linear.sequence_parallel_all_gather.forward",
+            "tensor_parallel.linear.sequence_parallel_all_gather.backward",
+            "tensor_parallel.linear.dgrad_reduce_scatter.backward",
+        ]
+        assert [event["name"] for event in collective] == [
+            f"{name}.{edge}" for name in expected_names for edge in ("begin", "end")
+        ]
+        assert [event["payload"]["async_op"] for event in collective[::2]] == [
+            False,
+            True,
+            False,
+            True,
+            True,
+        ]
+        assert all(
+            (event["payload"].get("inputs") or event["payload"].get("outputs"))[0]["sha256"]
+            for event in collective
+        )
+        assert events[-1]["payload"]["pending_collectives"] == 0
+
+        checkpointed_input = torch.ones(
+            1, 3, dtype=torch.float32, device="cuda", requires_grad=True
+        )
+        checkpointed_weight = torch.ones(
+            4, 3, dtype=torch.float32, device="cuda", requires_grad=True
+        )
+        with trace_iteration(tmp_path, 21, hash_tensors=True):
+            checkpointed_output = checkpoint(
+                lambda value: linear_with_grad_accumulation_and_async_allreduce(
+                    value,
+                    checkpointed_weight,
+                    None,
+                    gradient_accumulation_fusion=False,
+                    allreduce_dgrad=False,
+                    sequence_parallel=True,
+                    tp_group=group,
+                ),
+                False,
+                checkpointed_input,
+            )
+            checkpointed_output.sum().backward()
+
+        checkpointed_events = _read_events(_trace_path(tmp_path, 21))
+        checkpointed_collective = [
+            event for event in checkpointed_events if event["kind"] == "collective"
+        ]
+        assert [event["name"] for event in checkpointed_collective] == [
+            "tensor_parallel.linear.sequence_parallel_all_gather.forward.begin",
+            "tensor_parallel.linear.sequence_parallel_all_gather.forward.end",
+            "tensor_parallel.linear.sequence_parallel_all_gather.recompute.begin",
+            "tensor_parallel.linear.sequence_parallel_all_gather.recompute.end",
+            "tensor_parallel.linear.sequence_parallel_all_gather.backward.begin",
+            "tensor_parallel.linear.sequence_parallel_all_gather.backward.end",
+            "tensor_parallel.linear.dgrad_reduce_scatter.backward.begin",
+            "tensor_parallel.linear.dgrad_reduce_scatter.backward.end",
+        ]
+        torch.testing.assert_close(
+            checkpointed_input.grad, torch.full_like(checkpointed_input, 4 * world_size)
         )
     finally:
         Utils.destroy_model_parallel()
