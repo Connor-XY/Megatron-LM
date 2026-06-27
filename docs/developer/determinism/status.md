@@ -177,13 +177,16 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    mcore (nemotron-3-ultra, DSV3) + full recipes in Megatron-Bridge (weekly).
 2. **~15% perf overhead** concentrated in MoE scatter/unpermute, FlashAttention
    backward (FAG), grouped GEMM, and top-k radix sort → Workstream 3.
-3. **No first-divergence debugging tool.** Non-determinism only appears at scale
-   under specific parallelism combos (DSV3 diverges only at EP>16 + PP/VPP). Plain
-   `nn.Module` hooks miss collectives, optimizer math, recompute, and
-   allocator-driven kernel selection; PP/VPP scramble event order so "first" is
-   ill-defined → Workstream 4: typed instrumentation API + first-divergence finder.
+3. **First-divergence tooling is partial.**
+   `tools/determinism/compare_dumps.py` now finds the first semantic byte-level
+   difference in existing activation/param/wgrad/dgrad dump trees, independent of
+   PP/VPP hook arrival order. Non-determinism only appears at scale under specific
+   parallelism combos (DSV3 diverges only at EP>16 + PP/VPP), and the existing
+   hooks still miss collectives, optimizer internals, recompute identity, and
+   allocator-driven kernel selection → Workstream 4 still needs a typed runtime
+   instrumentation API for those surfaces.
 4. **Scatter/cumsum sites without an explicit det branch** (e.g.
-   `moe_utils.py:622, 836-837, 890, 946, 951`, `router.py:261`) — likely safe in
+   `moe_utils.py:633, 901, 957, 962`, `router.py:261`) — likely safe in
    forward (unique indices) but their backward and large-scale behavior must be
    confirmed with `BitExactRunner` (see catalog "⚠ verify" rows).
 

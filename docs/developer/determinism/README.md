@@ -19,6 +19,31 @@ foundation artifact for the determinism roadmap (validation, performance, toolin
    (det? / det path / non-det path / how selected / evidence / perf Δ / gap), plus
    the perf hotspot priority list and the verification backlog.
 
+## Locate the first difference in existing training dumps
+
+Megatron can already save named activations, parameters, wgrads, and dgrads from
+selected iterations. Run the same job twice with the relevant save interval,
+then compare matching iteration directories:
+
+```bash
+python tools/determinism/compare_dumps.py \
+  /path/to/run-a/activations/iter_0000100 \
+  /path/to/run-b/activations/iter_0000100
+```
+
+The comparator matches relative rank-shard paths and semantic state-dict keys,
+sorts layer numbers numerically, and checks the underlying tensor bytes. The
+first reported difference includes tensor shape/dtype, SHA-256 hashes, mismatch
+count, first mismatching index and values, and maximum absolute/relative error.
+Use `--json` for automation and `--max-details N` to bound the report. Exit code
+0 means bit-exact, 1 means a difference, and 2 means invalid input.
+
+This avoids treating PP/VPP hook arrival order as execution order, but it only
+localizes surfaces that the existing dump hooks capture. Collectives, optimizer
+internals, recompute identities, and allocator decisions still require the typed
+instrumentation API described in [`status.md`](./status.md). Only compare trusted
+`.pth` files because PyTorch dump loading uses pickle serialization.
+
 ## Maintenance
 
 Keep the catalog **evidence-based**: classify each op via PyTorch/TE/NCCL docs, an
