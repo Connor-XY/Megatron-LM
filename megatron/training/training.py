@@ -133,6 +133,14 @@ except ImportError:
     has_nvidia_modelopt = False
 
 from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core.determinism_trace import (
+    EventKind,
+    active_trace,
+    record_event,
+    record_tensor,
+    trace_iteration,
+    trace_tensor_hashes_enabled,
+)
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -2159,8 +2167,73 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
-    """Single training step."""
+def _record_optimizer_boundary_tensors(model, attribute, label):
+    """Hash named optimizer inputs/outputs only when explicitly requested."""
+    if not trace_tensor_hashes_enabled():
+        return
+    for model_chunk_id, model_chunk in enumerate(model):
+        unwrapped_model_chunk = unwrap_model(model_chunk)
+        for param_name, param in unwrapped_model_chunk.named_parameters():
+            value = getattr(param, attribute, None)
+            if value is not None:
+                record_tensor(f"{label}/model_chunk{model_chunk_id}/{param_name}", value)
+
+
+def _trace_scalar(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().item() if value.numel() == 1 else repr(value)
+    return value
+
+
+def train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+):
+    """Run one training step, optionally under a rank-local determinism trace."""
+    args = get_args()
+    trace_iteration_number = iteration + 1
+    configured_trace_dir = getattr(args, "determinism_trace_dir", None)
+    configured_trace_interval = getattr(args, "determinism_trace_interval", None)
+    should_trace = (
+        configured_trace_dir is not None
+        and configured_trace_interval is not None
+        and trace_iteration_number % configured_trace_interval == 0
+    )
+    trace_dir = configured_trace_dir if should_trace else None
+    with trace_iteration(
+        trace_dir,
+        trace_iteration_number,
+        hash_tensors=getattr(args, "determinism_trace_tensor_hashes", False),
+    ):
+        return _train_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            config,
+            forward_backward_func,
+            iteration,
+        )
+
+
+def _train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+):
+    """Implementation of a single training step."""
     args = get_args()
     timers = get_timers()
 
@@ -2224,6 +2297,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        record_event(EventKind.PHASE, "forward_backward.begin")
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2236,6 +2310,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
         )
+        record_event(EventKind.PHASE, "forward_backward.end")
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2283,8 +2358,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    record_event(EventKind.OPTIMIZER, "optimizer.begin")
+    _record_optimizer_boundary_tensors(model, "main_grad", "optimizer.input.wgrad")
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    _record_optimizer_boundary_tensors(model, "data", "optimizer.output.param")
+    if active_trace() is not None:
+        record_event(
+            EventKind.OPTIMIZER,
+            "optimizer.end",
+            {
+                "update_successful": _trace_scalar(update_successful),
+                "grad_norm": _trace_scalar(grad_norm),
+                "num_zeros_in_grad": _trace_scalar(num_zeros_in_grad),
+            },
+        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

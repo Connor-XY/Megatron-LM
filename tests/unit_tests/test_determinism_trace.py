@@ -1,0 +1,109 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+import json
+import os
+
+import pytest
+import torch
+
+from megatron.core.determinism_trace import (
+    EventKind,
+    active_trace,
+    begin_recompute_trace,
+    record_event,
+    record_recompute_phase,
+    record_tensor,
+    trace_iteration,
+)
+from megatron.core.tensor_parallel.random import checkpoint
+
+
+def _read_events(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _trace_path(root, iteration):
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_initialized()
+        else int(os.environ.get("RANK", 0))
+    )
+    return root / f"iter_{iteration:07d}" / f"rank_{rank:05d}.jsonl"
+
+
+def test_disabled_trace_is_a_noop(tmp_path):
+    with trace_iteration(None, 1) as trace:
+        assert trace is None
+        assert active_trace() is None
+        record_event(EventKind.PHASE, "ignored")
+        record_tensor("ignored", torch.ones(1))
+
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+def test_trace_writes_versioned_rank_local_events_and_tensor_hash(tmp_path):
+    with trace_iteration(tmp_path, 7, hash_tensors=True) as trace:
+        assert active_trace() is trace
+        record_event(EventKind.PHASE, "forward.begin", {"microbatch": 0})
+        record_tensor("activation/layer.2", torch.tensor([1.0, 2.0]))
+
+    events = _read_events(_trace_path(tmp_path, 7))
+    assert [event["sequence"] for event in events] == list(range(len(events)))
+    assert all(event["schema_version"] == 1 for event in events)
+    tensor_event = next(event for event in events if event["kind"] == "tensor")
+    assert tensor_event["payload"]["shape"] == [2]
+    assert len(tensor_event["payload"]["sha256"]) == 64
+    assert events[-1]["name"] == "iteration.end"
+    assert active_trace() is None
+
+
+def test_recompute_trace_reports_forward_identity(tmp_path):
+    tensor = torch.tensor([1.0, 2.0])
+
+    def checkpointed(value):
+        return value.square()
+
+    with trace_iteration(tmp_path, 3, hash_tensors=True):
+        handle = begin_recompute_trace(checkpointed, (tensor,))
+        record_recompute_phase(handle, "forward", checkpointed(tensor))
+        record_recompute_phase(handle, "recompute", checkpointed(tensor))
+
+    events = _read_events(_trace_path(tmp_path, 3))
+    recompute = next(event for event in events if event["name"] == "checkpoint.recompute")
+    assert recompute["payload"]["checkpoint_id"] == 0
+    assert recompute["payload"]["matches_forward"] is True
+
+
+def test_recompute_trace_detects_changed_output(tmp_path):
+    tensor = torch.tensor([1.0, 2.0])
+    with trace_iteration(tmp_path, 4, hash_tensors=True):
+        handle = begin_recompute_trace(lambda value: value, (tensor,))
+        record_recompute_phase(handle, "forward", tensor)
+        record_recompute_phase(handle, "recompute", tensor + 1)
+
+    events = _read_events(_trace_path(tmp_path, 4))
+    recompute = next(event for event in events if event["name"] == "checkpoint.recompute")
+    assert recompute["payload"]["matches_forward"] is False
+
+
+def test_nonfinite_payloads_remain_valid_json(tmp_path):
+    with trace_iteration(tmp_path, 5):
+        record_event(EventKind.OPTIMIZER, "optimizer.end", {"grad_norm": float("nan")})
+
+    events = _read_events(_trace_path(tmp_path, 5))
+    optimizer = next(event for event in events if event["name"] == "optimizer.end")
+    assert optimizer["payload"]["grad_norm"] == "nan"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_checkpoint_autograd_records_paired_recompute(tmp_path):
+    x = torch.tensor([1.0, 2.0], device="cuda", requires_grad=True)
+    with trace_iteration(tmp_path, 6, hash_tensors=True):
+        output = checkpoint(lambda value: value.square(), False, x)
+        output.sum().backward()
+
+    events = _read_events(_trace_path(tmp_path, 6))
+    forward = [event for event in events if event["name"] == "checkpoint.forward"]
+    recompute = [event for event in events if event["name"] == "checkpoint.recompute"]
+    assert len(forward) == len(recompute) == 1
+    assert recompute[0]["payload"]["matches_forward"] is True

@@ -39,10 +39,46 @@ Use `--json` for automation and `--max-details N` to bound the report. Exit code
 0 means bit-exact, 1 means a difference, and 2 means invalid input.
 
 This avoids treating PP/VPP hook arrival order as execution order, but it only
-localizes surfaces that the existing dump hooks capture. Collectives, optimizer
-internals, recompute identities, and allocator decisions still require the typed
-instrumentation API described in [`status.md`](./status.md). Only compare trusted
+localizes surfaces that the existing dump hooks capture. Use the structured
+trace below for recompute and optimizer boundaries; collective payloads and
+selected kernel identities remain follow-up surfaces. Only compare trusted
 `.pth` files because PyTorch dump loading uses pickle serialization.
+
+## Trace recompute and optimizer boundaries during training
+
+The structured runtime tracer complements tensor dumps with semantic JSONL
+events. Select one or a few iterations; every rank writes independently, so the
+tool adds no collectives or cross-rank ordering constraints:
+
+```bash
+pretrain_gpt.py ... \
+  --determinism-trace-dir /path/to/run-a \
+  --determinism-trace-interval 100 \
+  --determinism-trace-tensor-hashes
+```
+
+The trace records determinism-relevant runtime configuration, forward/backward
+and optimizer boundaries, Megatron activation-checkpoint forward/recompute
+identities, and (with `--determinism-trace-tensor-hashes`) exact wgrad, updated
+parameter, checkpoint-input, and checkpoint-output hashes. Exact hashing copies
+device tensors to the CPU and synchronizes execution; use it only for targeted
+debug iterations. Without that flag, phase events and checkpoint tensor metadata
+remain available without the byte copies; optimizer boundary tensors are omitted.
+
+Run the same launch into a second directory, then align events by semantic
+identity rather than arrival order:
+
+```bash
+python tools/determinism/compare_traces.py \
+  /path/to/run-a /path/to/run-b
+```
+
+Exit codes match `compare_dumps.py`: 0 is a match, 1 is a divergence, and 2 is
+invalid input. Use `--json` for automation. The current integration covers the
+Megatron tensor-parallel activation-checkpoint implementation and optimizer
+inputs/outputs. Collective payloads, TE FP8/FP4 recompute, optimizer moment
+state, and actual selected kernel identities remain follow-up instrumentation
+surfaces.
 
 ## Maintenance
 

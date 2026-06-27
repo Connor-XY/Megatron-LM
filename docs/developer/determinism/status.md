@@ -173,6 +173,21 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   recomputed manual backward, and unfused attention backward. AWS-DFW job
   `516499` passed 7/7 cases on every GB200 rank; Draco job `10429898` passed 7/7
   on every H100 rank.
+- **Typed runtime trace (added):** `megatron/core/determinism_trace.py` writes a
+  versioned, rank-sharded semantic event stream for selected iterations.
+  `train_step` records forward/backward and optimizer boundaries plus optional
+  exact named wgrad/updated-parameter hashes; Megatron activation checkpointing
+  records paired forward/recompute fingerprints and reports their within-run
+  identity. `tools/determinism/compare_traces.py` aligns rank traces by semantic
+  event identity instead of PP/VPP arrival order. AWS-DFW job `516714` passed
+  all 19 focused trace/dump tests on every GB200 rank; Draco job `10430400`
+  passed the same 19 tests on every H100 rank. AWS-DFW job `516715` then ran two
+  independent deterministic DSV3-style TP2×EP2 training launches with full
+  activation recompute and matched all 696 events across 8 rank/iteration
+  shards, including 16 forward/recompute pairs. Draco job `10430403` matched all
+  1,392 events across 16 rank/iteration shards, including 32 recompute pairs.
+  Every recompute byte hash matched its original checkpoint forward on both
+  architectures.
 - **E2E full-recipe (WS2 Tier B — pending):** the real nemotron-3-ultra recipe
   lives in **Megatron-Bridge** (`zhiyul/nemotron-3-ultra-perf-recipe`); the
   weekly multi-node e2e + wandb dashboard is the remaining tier — it is the only
@@ -184,14 +199,14 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    mcore (nemotron-3-ultra, DSV3) + full recipes in Megatron-Bridge (weekly).
 2. **~15% perf overhead** concentrated in MoE scatter/unpermute, FlashAttention
    backward (FAG), grouped GEMM, and top-k radix sort → Workstream 3.
-3. **First-divergence tooling is partial.**
-   `tools/determinism/compare_dumps.py` now finds the first semantic byte-level
-   difference in existing activation/param/wgrad/dgrad dump trees, independent of
-   PP/VPP hook arrival order. Non-determinism only appears at scale under specific
-   parallelism combos (DSV3 diverges only at EP>16 + PP/VPP), and the existing
-   hooks still miss collectives, optimizer internals, recompute identity, and
-   allocator-driven kernel selection → Workstream 4 still needs a typed runtime
-   instrumentation API for those surfaces.
+3. **First-divergence tooling still has uncovered runtime surfaces.**
+   `compare_dumps.py` localizes existing activation/param/wgrad/dgrad dumps, and
+   the structured runtime trace now covers phase ordering, Megatron recompute
+   identity, optimizer boundary scalars, exact wgrad/parameter hashes, runtime
+   library/env settings, and allocator backend. Collective payloads, optimizer
+   moment state, TE FP8/FP4 recompute, and actual selected kernel identities are
+   still missing. DSV3's known EP>16 + PP/VPP divergence therefore still needs
+   the scaled e2e recipe plus collective instrumentation to localize fully.
 ## 9. References
 
 - Determinism roadmap & meeting notes (internal Google Docs).

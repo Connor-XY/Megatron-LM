@@ -17,6 +17,7 @@ from torch.utils.checkpoint import detach_variable
 from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
+from megatron.core.determinism_trace import begin_recompute_trace, record_recompute_phase
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
@@ -573,12 +574,14 @@ class CheckpointFunction(torch.autograd.Function):
 
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
+        ctx.determinism_trace_handle = begin_recompute_trace(run_function, args)
 
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
         with torch.no_grad():
             outputs = run_function(*args)
+        record_recompute_phase(ctx.determinism_trace_handle, "forward", outputs)
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
@@ -619,6 +622,7 @@ class CheckpointFunction(torch.autograd.Function):
             detached_inputs = detach_variable(inputs)
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs)
+        record_recompute_phase(ctx.determinism_trace_handle, "recompute", outputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

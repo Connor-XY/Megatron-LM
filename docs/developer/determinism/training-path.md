@@ -85,7 +85,7 @@ Legend for the "Determinism" column:
 | --- | --- | --- | --- |
 | Autograd traversal | PyTorch engine | 🟢 | Order is deterministic for a fixed graph. |
 | FlashAttention backward | TE, gated by `NVTE_ALLOW_NONDETERMINISTIC_ALGO` (`extensions/transformer_engine.py:1697`) | 🔵🟡 | **The classic non-determinism source** — atomic dQ/dK/dV accumulation. Deterministic TE path exists but is slower (Longcat "deterministic FAG" = independent accumulation buffers + global deterministic sum) — a top perf target. The 0.1% tolerance comments in `param_and_grad_buffer.py:326/334/345` exist for the *non-deterministic* default mode. |
-| LayerNorm/RMSNorm backward | TE / torch norm | 🟡 | Weight-grad reduction across the sequence; deterministic via TE deterministic kernels under the env var. |
+| LayerNorm/RMSNorm backward | TE / torch norm | 🟢 | PyTorch LayerNorm/RMSNorm fallback backward is bit-exact at hidden 128/2048 on H100 and GB200; TE norms are covered by the model proxies. |
 | Embedding backward | see 1a | 🔵 | det path = direct-index `index_put(accumulate=True)` (deterministic under `use_deterministic_algorithms`), not `F.embedding`'s atomic scatter. |
 | MoE unpermute/permute backward | see 1d | 🔵 | Mirror of forward `index_add_`/`scatter_add_` branch. |
 | Grouped-GEMM backward | TE `TEGroupedLinear` | 🟡 | wgrad accumulation order; perf target. |
@@ -115,6 +115,7 @@ Legend for the "Determinism" column:
 | TE non-deterministic algos | `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` | 🟡 | Forces TE deterministic attention/norm kernels. |
 | CUDA caching allocator | (none) | 🟡 | Allocation pattern can influence kernel autotuning/selection; flagged in the roadmap as worth investigating. |
 | PP / VPP microbatch interleave | schedules in `core/pipeline_parallel/` | 🟢→🟡 | Schedule is deterministic, but interleaving **scrambles observed event order** — the key reason a naive "first divergence" hook is hard (Workstream 4). |
+| Structured runtime trace | `core/determinism_trace.py`, `training.py`, `tensor_parallel/random.py` | 🟢 | Opt-in rank-local events add no collectives. Semantic comparison ignores arrival order and can hash recompute outputs plus optimizer boundary tensors on selected iterations. |
 
 ---
 

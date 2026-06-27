@@ -51,6 +51,15 @@ class TrainingConfig:
     0=off, 1=moderate, 2=aggressive.
     """
 
+    determinism_trace_dir: str | None = None
+    """Write rank-local structured determinism traces under this directory."""
+
+    determinism_trace_interval: int | None = None
+    """Number of training iterations between structured determinism traces."""
+
+    determinism_trace_tensor_hashes: bool = False
+    """Include exact tensor byte hashes in determinism traces. This synchronizes device tensors."""
+
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 

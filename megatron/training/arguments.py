@@ -1311,6 +1311,12 @@ def validate_args(args, defaults={}):
             assert args.save_retain_interval % args.save_interval == 0
         if args.save_params_interval is not None:
             assert not args.overlap_param_gather
+    if args.determinism_trace_dir is not None:
+        assert args.determinism_trace_interval is not None
+        assert args.determinism_trace_interval > 0
+    else:
+        assert args.determinism_trace_interval is None
+        assert not args.determinism_trace_tensor_hashes
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
