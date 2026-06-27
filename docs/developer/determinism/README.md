@@ -115,6 +115,45 @@ perform no inter-rank reduction. Exit code 0 is a certificate, 1 is a failed
 invariant or cross-run divergence, and 2 is invalid input. Use `--json` to retain
 the complete evidence report.
 
+## Profile one distributed rank with Nsight Systems
+
+Profiling every rank produces redundant reports and can exhaust host resources.
+Run `profile_rank.py` as the Python entrypoint under `torchrun` to wrap exactly
+one rank with Nsight Systems while the other ranks execute the training script
+directly:
+
+```bash
+python -m torch.distributed.run \
+  --nnodes "$NNODES" --nproc-per-node "$GPUS_PER_NODE" \
+  --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" --master-port 29500 \
+  tools/determinism/profile_rank.py \
+    --profile-rank 0 --output /shared/profiles/nemotron-rank0 -- \
+  pretrain_hybrid.py ... \
+    --profile --nvtx-ranges \
+    --profile-step-start 5 --profile-step-end 7
+```
+
+`nsys` must be on `PATH`, and the output path must be visible to the profiled
+rank. The wrapper intentionally uses `--capture-range-end=stop`: Megatron's
+CUDA-profiler range stops collection but the wrapped rank keeps running to the
+same distributed completion point as its peers. Using `stop-shutdown` here can
+terminate the profiled rank early and strand the rest of the worker group.
+
+When an aggregate operator still has multiple possible call sites, export the
+report to SQLite and print the same-thread NVTX containment chain for each
+matching range:
+
+```bash
+nsys stats --force-export=true /shared/profiles/nemotron-rank0.nsys-rep
+python tools/determinism/attribute_nsys_ranges.py \
+  /shared/profiles/nemotron-rank0.sqlite 'aten::index_put_'
+```
+
+Parents are listed nearest-first. Containing ranges overlap by definition, so
+their durations are attribution context and must not be added together. Use
+`--json` to retain the complete machine-readable report.
+
 ## Benchmark the deterministic data-parallel reduction
 
 Use the distributed microbenchmark to compare the native NCCL reduce-scatter

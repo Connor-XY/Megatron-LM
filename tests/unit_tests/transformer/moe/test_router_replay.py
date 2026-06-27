@@ -39,6 +39,50 @@ def test_no_grad_topk_order_is_stable_in_deterministic_mode(
     assert observed_sorted == [expected_sorted]
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
+def test_deterministic_dense_routing_matches_index_put_reference(dtype, score_function):
+    torch.manual_seed(1234)
+    candidate_logits = torch.randn(64, 32, device="cuda", dtype=dtype, requires_grad=True)
+    reference_logits = candidate_logits.detach().clone().requires_grad_(True)
+    grad_output = torch.randn_like(candidate_logits)
+
+    previous_deterministic_mode = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        candidate_probs, candidate_map = topk_routing_with_score_function(
+            logits=candidate_logits, topk=8, use_pre_softmax=False, score_function=score_function
+        )
+        selected_probs, top_indices = topk_routing_with_score_function(
+            logits=reference_logits,
+            topk=8,
+            use_pre_softmax=False,
+            score_function=score_function,
+            dense_output=True,
+        )
+        rows = torch.arange(reference_logits.shape[0], device="cuda").unsqueeze(1)
+        reference_probs = torch.zeros_like(reference_logits)
+        reference_probs.index_put_((rows, top_indices), selected_probs, accumulate=False)
+        reference_map = torch.zeros_like(reference_logits, dtype=reference_logits.dtype)
+        reference_map.index_put_(
+            (rows, top_indices),
+            torch.ones_like(selected_probs, dtype=reference_map.dtype),
+            accumulate=False,
+        )
+        reference_map = reference_map.bool()
+
+        candidate_grad = torch.autograd.grad(candidate_probs, candidate_logits, grad_output)[0]
+        reference_grad = torch.autograd.grad(reference_probs, reference_logits, grad_output)[0]
+    finally:
+        torch.use_deterministic_algorithms(previous_deterministic_mode)
+
+    assert torch.equal(candidate_probs, reference_probs)
+    assert torch.equal(candidate_map, reference_map)
+    assert torch.equal(candidate_grad, reference_grad)
+
+
 def test_record_mode_with_topk_routing_softmax_post():
     rr = RouterReplay()
     rr.set_router_replay_action(RouterReplayAction.RECORD)

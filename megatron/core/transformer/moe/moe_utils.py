@@ -836,16 +836,11 @@ def topk_routing_with_score_function(
         return probs, top_indices
 
     if torch.are_deterministic_algorithms_enabled():
-        # build [num_tokens, num_experts] from [num_tokens, topk]
+        # Top-k indices are unique within each row, so these scatters have no write collisions.
         routing_probs = torch.zeros_like(logits)
-        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
-        routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
-
-        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
-        routing_map.index_put_(
-            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
-        )
-        routing_map = routing_map.bool()
+        routing_probs.scatter_(1, top_indices, probs)
+        routing_map = torch.zeros_like(logits, dtype=torch.bool)
+        routing_map.scatter_(1, top_indices, True)
     else:
         # TODO Try using element-wise operations instead of scatter?
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)

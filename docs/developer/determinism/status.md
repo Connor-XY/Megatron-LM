@@ -69,6 +69,12 @@ allocation, so the remaining and currently allocation-sensitive gap is in the
 deterministic TE/MoE branches rather than Mamba or DP reduction. Direct
 full-mode A/B job `520311` confirms that conclusion: flat deterministic is
 66.5 ms and hierarchical deterministic is 66.7 ms on the same placement.
+The routing `index_put_`→collision-free `scatter_` change improves
+median-of-leg medians by 1.8% in direct ABBA job `520526`. Post-change
+native/deterministic ABBA job `520625` measures 56.4/59.4 ms (+5.3%), reaching
+the aggressive target on that allocation; its forward and reverse pairs are
++8.8% and +1.6%, so the result remains order/allocation-sensitive rather than a
+production-wide guarantee.
 
 ## 4. Control plane — how determinism is turned on
 
@@ -131,8 +137,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
 
 - **MoE unpermute** (`moe_utils.py:517`): `index_add_` (det, CUDA-graph safe) vs
   `scatter_add_` (fast).
-- **MoE routing map/probs** (`moe_utils.py:823`): `index_put_(accumulate=False)`
-  vs `scatter`.
+- **MoE routing map/probs** (`moe_utils.py:823`): collision-free in-place
+  `scatter_` for the deterministic probabilities/boolean map vs out-of-place
+  `scatter` in the normal path. The selected expert indices are unique within
+  each row; focused tests compare outputs and gradients byte-for-byte with the
+  former `index_put_(accumulate=False)` implementation.
 - **MoE top-k under activation checkpointing** (`moe_utils.py`): deterministic
   mode keeps `sorted=True` in both no-grad forward and grad-enabled recompute.
 - **Vocab embedding fwd** (`tensor_parallel/layers.py:299`): direct `weight[idx]`
@@ -214,6 +223,18 @@ small set of reductions and dispatch choices. They are fully enumerated in
   matched 1,352/1,352 events across two distributed-optimizer runs, including 48
   DP boundary events and zero pending collectives. Every completed model run
   reported byte-identical recompute outputs.
+- **Rank-scoped Nsight profiling (added):**
+  `tools/determinism/profile_rank.py` runs exactly one global `torchrun` rank
+  under nsys while every peer executes the Python training command directly.
+  It uses `--capture-range-end=stop` so ending the CUDA-profiler capture does
+  not terminate the wrapped rank and strand its distributed peers. AWS-DFW job
+  `520457` validated the launcher on the 32-GPU Nemotron topology and localized
+  a measurable forward delta to the former explicit routing
+  `index_put_`/`arange` path. Post-change job `520565` then showed that the
+  residual aggregate `index_put_` time spans routing-probability scatter, vocab
+  cross-entropy, and gather backward; it is not one monolithic routing cost.
+  `tools/determinism/attribute_nsys_ranges.py` makes that SQLite containment
+  analysis reusable for any NVTX range substring.
 - **Scaled MCore certification (WS2 Tier B):** AWS-DFW GB200 jobs `518849` and
   `518850` ran the final DSV3-style 32-GPU EP32 distributed-optimizer topology. Each
   two-launch comparison matched 6,080/6,080 semantic events, and the two
@@ -243,6 +264,17 @@ small set of reductions and dispatch choices. They are fully enumerated in
   multi-rank DP reduction and report zero missing reductions, zero pending
   collectives, and zero semantic divergences. Single-rank expert-DP reductions
   remain on the flat path because they perform no inter-rank reduction.
+- **Post-routing-optimization certification:** focused AWS-DFW job `520515`
+  verifies bf16/fp32 × sigmoid/softmax outputs and gradients against the former
+  `index_put_` reference on every rank; job `520692` extends the focused suite
+  to the rank profiler and Nsight attribution tool (12 passed on every rank).
+  Job `520569` reports 114 passed and 4 skipped on every rank for the expanded
+  hierarchy suite. Candidate DSV3 job
+  `520570` matches baseline allocation `520203` at 6,080/6,080 events, and
+  candidate Nemotron job `520561` matches baseline allocation `520204` at
+  9,664/9,664 events. Both cross-version reports have zero divergences, zero
+  pending collectives, exact recompute coverage, and no missing hierarchical
+  DP reductions.
 - **Full Megatron-Bridge evidence (not yet a gate):** branch
   `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
@@ -256,14 +288,18 @@ small set of reductions and dispatch choices. They are fully enumerated in
 1. **Scaled evidence is not yet CI-gated.** The EP32 MCore certificates close the
    immediate coverage gap, but the full Bridge recipe still needs a weekly gate,
    retained artifacts, and a same-mode control at 192/3,072 GPUs.
-2. **The production perf target is not fully closed.** The production
+2. **The production perf target is not consistently closed.** The production
    fixed-logical-rank hierarchy removes the measured DP penalty in job `520235`:
    hierarchical-DP-only is 55.4 ms versus 55.6 ms native and 57.8 ms flat
    ordered. It is exact across independent DSV3 and Nemotron allocations. Full
-   deterministic mode remains +16–19% in jobs `520235`/`520311`; the direct
-   full-mode A/B is 66.5 ms flat versus 66.7 ms hierarchical. The exposed DP
-   improvement is hidden by communication overlap, which moves the primary
-   target to the deterministic TE/MoE kernel set. Mamba's fixed
+   deterministic mode was +16–19% in jobs `520235`/`520311`; the direct
+   full-mode A/B was 66.5 ms flat versus 66.7 ms hierarchical. The routing
+   cleanup contributes a modest 1.8% in direct old/new ABBA, while post-change
+   native/deterministic ABBA job `520625` reaches +5.3% on one allocation
+   (56.4/59.4 ms). Its two order pairs are +8.8% and +1.6%, so topology/order
+   variance remains too large to declare the target closed globally. The
+   exposed DP improvement is hidden by communication overlap, which moves the
+   primary target to the deterministic TE/MoE kernel set. Mamba's fixed
    config/workspaces show no measurable slowdown in the paired attribution. The
    hierarchy also increases peak allocated memory in this proxy by about 140
    MiB because it materializes the locally permuted send buffer. Each further

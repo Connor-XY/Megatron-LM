@@ -45,7 +45,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Token unpermute (combine) | `transformer/moe/moe_utils.py:526-541` | scatter-accumulate | 🔵 | `index_add_` (CUDA-graph safe) | `scatter_add_` | `are_deterministic_algorithms_enabled()` | doc+code | `index_add_` +85.9 ms NVTX-range time over 3 profiled steps | The redundant second zero-allocation is removed. The cleanup is bit-exact but step-time neutral; the remaining reduction kernel is still a target. |
-| Routing map/probs | `moe_utils.py:834-849` | scatter vs index_put | 🔵 | `index_put_(accumulate=False)` ×2 | `scatter` ×2 | `are_deterministic_algorithms_enabled()` | code | `index_put_` +299.3 ms CPU NVTX-range time over 3 steps | An out-of-place `scatter` candidate is bit-exact and removes dispatch overhead, but did not improve proxy step time; held pending production-scale evidence. |
+| Routing map/probs | `moe_utils.py:834-849` | collision-free scatter | 🔵 | in-place `scatter_` for probabilities + boolean map | out-of-place `scatter` ×2 | `are_deterministic_algorithms_enabled()` | code+**test** | isolated forward 1.76–1.80× faster; full-step ABBA median -1.8%; post-change `scatter_` 5.79 ms over the profile capture | Top-k indices are unique within each row. The new path is byte-exact to the former explicit `index_put_(accumulate=False)` outputs and gradients. PyTorch deterministic `scatter_` still lowers the probability write through `index_put_`; a direct fused collision-free kernel is the next opportunity. |
 | Top-k expert select | `moe_utils.py` | `torch.topk(sorted=...)` | 🔵 | `sorted=True`, including no-grad checkpoint forward | `sorted=is_grad_enabled()` | deterministic algorithms | code+**test** | `cub::DeviceRadixSort` 6.36 vs 1.23 ms over 3 steps (+5.13 ms) | Fixes sigmoid top-k probability drift between original forward and grad-enabled recompute. Investigate a faster stable-select path. |
 | Group-limited top-k mask | `moe_utils.py:590-645` | `scatter_(1, group_idx, 1)` | 🟢 | unique group indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** by the DSV3 proxy across EP≤4/TP/FSDP/PP/VPP and by the final EP32 certificates (`518849`/`518850`). |
 | Aux-loss routing map | `moe_utils.py:888-901` | `scatter` | 🟢 | unique indices ⇒ det fwd | — (no branch) | always | code+**test** | small | **Verified** via DSV3 proxy and final EP32 certificates with `seq_aux_loss` enabled. |
@@ -157,6 +157,13 @@ script. Cluster-local artifacts are retained under:
 | production Nemotron hierarchy cross-allocation certificate | `520171` / `520204`, 32 GPUs each | `nemotron-hier-cross-allocation-520171-520204.json`, SHA256 `c93842d47013…` | 9,664/9,664 events exact; zero divergences; 128 multi-rank hierarchical DP reductions and zero missing per trace tree |
 | production Nemotron hierarchy attribution (GB200) | `520235`, 32 GPUs across four NVL72 domains | `perf-nemotron-hierarchy-520235.out`, SHA256 `1e83b9582b2d…` | native 55.6 ms; flat-DP-only 57.8 ms (+4.0%); hierarchical-DP-only 55.4 ms (-0.4%); full deterministic with hierarchy 66.4 ms (+19.4%). Steady medians use iterations 6–14. |
 | full-deterministic flat/hierarchy A/B (GB200) | `520311`, same 32-GPU placement as `520235` | `perf-nemotron-full-pair-520311.out`, SHA256 `47fa84b65289…` | native 57.2 ms; full deterministic flat 66.5 ms (+16.3%); full deterministic hierarchy 66.7 ms (+16.6%, +0.3% vs flat). The exposed DP win is hidden by overlap in the full stack. |
+| rank-scoped production Nemotron profile (GB200) | `520457`, 32 GPUs | `profile-nemotron-det-gap-520457/leaderboard.txt`, SHA256 `cc39eca7ea76…` | deterministic MLP +24.86 ms; `index_put_` +11.16 ms; `fill_` +20.33 ms; grouped-linear backward +0.99 ms over the captured steps. Only global rank 0 ran under nsys. |
+| deterministic routing construction microbenchmark (GB200) | `520492`, 1 rank on a 4-GPU allocation | `bench-det-route-map-520492.out`, SHA256 `87b3f623a4ba…` | bf16/fp32 × 16/512/4096 tokens, 512 experts, top-k 22: byte-exact outputs and gradients with one repeated hash per case; `scatter_` 1.76–1.80× faster forward and 1.51–1.53× faster forward+backward. |
+| production routing `index_put_`/`scatter_` ABBA (GB200) | `520526`, fixed 32-GPU allocation | `perf-nemotron-route-scatter-520526.out`, SHA256 `eb1f1923976b…` | median-of-leg medians 65.7→64.5 ms (-1.8%); forward pair -4.8%, reverse pair +1.2%; loss, sequence-aux-loss, and grad-norm sequences identical. |
+| post-change rank-scoped Nemotron profile (GB200) | `520565`, 32 GPUs | `profile-nemotron-det-gap-520565/leaderboard.txt`, SHA256 `b434ff1538dc…` | `scatter_` +5.79 ms and residual `index_put_` +8.97 ms. SQLite nesting attributes the residual to routing probability scatter, vocab cross-entropy, and gather backward rather than one source. |
+| post-change DSV3 cross-version certificate | `520203` / `520570`, independent 32-GPU allocations | `dsv3-routing-scatter-cross-version-520203-520570.json`, SHA256 `8148959a084b…` | 6,080/6,080 events exact; zero divergences; 64 recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions per tree. |
+| post-change Nemotron cross-version certificate | `520204` / `520561`, independent 32-GPU allocations | `nemotron-routing-scatter-cross-version-520204-520561.json`, SHA256 `dc492dfc3bf9…` | 9,664/9,664 events exact; zero divergences; 192 recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions per tree. |
+| post-change native/deterministic ABBA (GB200) | `520625`, fixed 32-GPU allocation | `perf-nemotron-route-gap-520625.out`, SHA256 `99a9aa6104f…` | median-of-leg medians: native 56.4 ms, deterministic 59.4 ms (+5.3%). Forward pair +8.8%; reverse pair +1.6%. This reaches the aggressive target on one allocation but remains order/allocation-sensitive. |
 
 The original DSV3 baseline `.nsys-rep` files were overwritten by the two
 follow-up cleanup experiments; its console leaderboard is retained and hashed.
@@ -208,8 +215,8 @@ contributors:
 | op-level range | det ms | nondet ms | Δ ms | Δ % | source |
 | --- | --- | --- | --- | --- | --- |
 | `aten::fill_` | 400.5 | 23.8 | **+376.7** | +1582% | `torch.zeros(...)` before index ops |
-| `aten::index_put_` | 305.8 | 6.5 | **+299.3** | +4624% | routing map `moe_utils.py:834-843` |
-| `aten::_index_put_impl_` | 332.0 | 22.5 | +309.5 | +1373% | (same) |
+| `aten::index_put_` | 305.8 | 6.5 | **+299.3** | +4624% | aggregate included explicit routing writes; later nesting also identifies loss/gather call sites |
+| `aten::_index_put_impl_` | 332.0 | 22.5 | +309.5 | +1373% | (same aggregate) |
 | `aten::empty` | 425.1 | 90.7 | +334.4 | +369% | det workspace alloc |
 | `aten::arange` | 156.5 | 28.8 | +127.7 | +444% | `rows=arange` for index_put `moe_utils.py:837` |
 | `aten::index_add_` | 88.2 | 2.3 | +85.9 | +3729% | unpermute `moe_utils.py:536` |
@@ -234,7 +241,8 @@ this proxy:
 - Adding the **routing `index_put_` → `scatter` candidate** (`moe_utils.py:834`,
   verified bit-exact and non-raising in production det mode) reduced the
   `index_put_`/`fill_`/`arange` dispatch ranges, but measured 232.2 / 186.4 ms
-  (1.25×). Neither change produced a repeatable step-time improvement.
+  (1.25×). Neither change produced a repeatable step-time improvement in these
+  H100 runs; the later production GB200 ABBA measures a modest 1.8% routing win.
 
 The remaining module/autograd deltas identify areas to isolate, but they are also
 overlapping NVTX ranges rather than an additive wall-clock decomposition:
@@ -317,12 +325,49 @@ hierarchy removes the exposed DP-only penalty but does not improve full-stack
 step time in this proxy; gradient communication is overlapped beneath the
 remaining deterministic TE/MoE work.
 
+### Measured — rank-scoped production Nemotron profile (32×GB200)
+
+Job `520457` used `tools/determinism/profile_rank.py` so that global rank 0 ran
+under Nsight Systems while the other 31 ranks executed normally. Over the
+captured steps, deterministic MLP forward was +24.86 ms, `aten::index_put_` was
++11.16 ms, `aten::fill_` was +20.33 ms, and `aten::arange` was +3.53 ms. The
+source path contained two dense routing writes per invocation: full
+`zeros_like` tensors followed by explicit `index_put_(accumulate=False)` calls
+for routing probabilities and the routing map.
+
+Because top-k expert indices are unique within a token row, job `520492` tested
+in-place `scatter_` as the collision-free replacement under
+`torch.use_deterministic_algorithms(True)`. All bf16/fp32 output and source-grad
+hashes matched the `index_put_` reference at 16, 512, and 4,096 tokens; isolated
+forward latency improved by 1.76–1.80×. The production ABBA in job `520526`
+then moved the median-of-leg medians from 65.7 to 64.5 ms (-1.8%). Its forward
+pair improved 4.8%, while its reverse pair regressed 1.2%, so the model-level
+benefit is real but small relative to allocation/overlap variance. Report the
+operator result and the ABBA result separately.
+
+Post-change job `520565` shows why the model-level gain is smaller than the
+isolated ratio: deterministic `scatter_` still lowers the probability write
+through PyTorch's generic `index_put_` implementation. NVTX containment in the
+exported SQLite attributes four ≈1.0–1.3 ms indexed writes to routing-probability
+scatter, two to vocab-cross-entropy backward, two to gather backward, and four
+small writes to cross-entropy forward. The remaining direct opportunity is a
+fused collision-free routing kernel that creates probabilities and the boolean
+map without the generic deterministic scatter machinery.
+
+Job `520625` measured the post-change full-stack gap with native/deterministic/
+deterministic/native ABBA ordering on one allocation. Median-of-leg medians were
+56.4 ms native and 59.4 ms deterministic (+5.3%); the forward pair was +8.8%
+and the reverse pair +1.6%. This is the first allocation to reach the aggressive
+≈5% target, but the pair spread and the earlier +16–19% results prohibit treating
+it as a topology-independent guarantee. The direct old/new ABBA from job
+`520526` remains the attribution for this code change: -1.8%.
+
 ### WS3 targets, by measured impact
 
-1. **Remaining deterministic TE/MoE kernel set** — about +9.5–10.8 ms
-   (+16–19%) in the paired Nemotron proxies after the DP penalty is removed.
-   Split grouped-GEMM/attention from scatter-add with GPU kernel timing before
-   changing another branch.
+1. **Remaining deterministic TE/MoE kernel set** — allocation-sensitive from
+   +3.0 ms (+5.3%) in post-change job `520625` to +9.5–10.8 ms (+16–19%) in
+   jobs `520235`/`520311`. Preserve ABBA ordering and report both pairs; a single
+   placement is not a production guarantee.
 2. **Cross-domain ordered fp32 reduce-scatter — closed for the EP32 proxies.**
    The production fixed-logical-rank hierarchy reduces isolated latency from
    3.110–3.118 ms to 1.324–1.346 ms in job `520160`, removes the paired step-time
@@ -330,25 +375,31 @@ remaining deterministic TE/MoE work.
    independent DSV3 and Nemotron allocations. Job `520311` shows no full-stack
    speedup because communication is hidden by other deterministic kernels.
    Retain the hierarchy as a performance and correctness gate.
-3. **Remaining deterministic scatter-add backward work** — `GatherBackward0`
-   remains ≈+75 ms over 3 steps, and `IndexAddBackward0` remains det-only. The
-   optimized index-select path closes its guarded slice, but top-k <4 and hidden
-   <2048 retain the PyTorch fallback.
-4. **MoE MLP range** (+262 ms over 3 steps) — isolate deterministic grouped GEMM
-   (`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`) from token unpermute before changing it.
-5. **Deterministic grouped GEMM** wgrad (`_GroupedLinearBackward` +18%).
-6. **MLA / attention deterministic kernels** (+20% module-range time).
-7. **`_VocabParallelCrossEntropy` deterministic backward** (+154%; all models).
+3. **Routing probability scatter** — `scatter_` contributes +5.79 ms over the
+   post-change capture and contains four ≈1.0–1.3 ms deterministic
+   `index_put_` writes. Evaluate a fused collision-free probability+map kernel.
+4. **Attention deterministic kernels** — self-attention +4.02 ms and core
+   attention +2.44 ms over the production capture.
+5. **Indexed loss/gather backward** — `_VocabParallelCrossEntropyBackward`
+   +2.84 ms and `GatherBackward0` +2.57 ms. The attribution tool separates these
+   from routing despite their shared `index_put_` implementation.
+6. **Deterministic grouped GEMM** — `_GroupedLinearBackward` +2.27 ms (+38.5%).
+7. **Mamba profile delta** — backward +7.31 ms in job `520565`, but the paired
+   Mamba-only attribution in job `519888` was step-time neutral. Re-isolate
+   before changing the fixed-config/workspace path.
 
-### Free cleanups found along the way (correct but ~wall-clock-neutral on the proxy)
+### Low-risk cleanups and measured outcomes
 
 - ✅ **Applied:** remove the redundant second `torch.zeros` in the det unpermute
   branch (`moe_utils.py`) — pure dead-allocation removal, bit-exact.
-- 🔬 **Held (candidate):** routing `index_put_` → `scatter` (`moe_utils.py:834`).
-  Proven bit-exact + non-raising in det mode, removes a `torch.zeros`+`arange`+
-  `index_put_`, but wall-clock-neutral on the 256-token proxy. Re-evaluate at
-  production scale (Tier-B / large `num_tokens × num_experts`) before changing a
-  deliberate determinism branch.
+- ✅ **Applied:** routing `index_put_` → collision-free in-place `scatter_`
+  (`moe_utils.py:834`). The optimized path removes the explicit row `arange`,
+  two Python `index_put_` calls, and the logits-dtype-to-bool map conversion. It is
+  byte-exact for outputs and gradients, 1.76–1.80× faster in isolation, and
+  improves the production ABBA median-of-leg medians by 1.8%. The full-step
+  result is overlap/order-sensitive, and PyTorch still implements the source
+  scatter through deterministic `index_put_`; retain the operator benchmark and
+  model certificate rather than treating 1.8% as a universal speedup.
 
 ## Verification backlog (the ⚠ rows)
 
