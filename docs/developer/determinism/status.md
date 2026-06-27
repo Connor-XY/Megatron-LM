@@ -166,6 +166,13 @@ of `config.deterministic_mode` branches. They are fully enumerated in
   8×H100). CI auto-discovers them via the `determinism/correctness/**/*.py` glob
   in `unit-tests.yaml`. **Note:** the branch pins `nvidia-resiliency-ext==0.6.0`;
   images older than that need an in-container upgrade to import mcore.
+- **Operator-level gaps (added):**
+  `test_torch_norm.py` directly certifies PyTorch LayerNorm and RMSNorm backward,
+  bypassing TE/Apex so the fallback is genuinely exercised. `test_dsa_paths.py`
+  certifies all three DSA sparse-mask scatter sites through indexer-loss forward,
+  recomputed manual backward, and unfused attention backward. AWS-DFW job
+  `516499` passed 7/7 cases on every GB200 rank; Draco job `10429898` passed 7/7
+  on every H100 rank.
 - **E2E full-recipe (WS2 Tier B — pending):** the real nemotron-3-ultra recipe
   lives in **Megatron-Bridge** (`zhiyul/nemotron-3-ultra-perf-recipe`); the
   weekly multi-node e2e + wandb dashboard is the remaining tier — it is the only
@@ -185,11 +192,6 @@ of `config.deterministic_mode` branches. They are fully enumerated in
    hooks still miss collectives, optimizer internals, recompute identity, and
    allocator-driven kernel selection → Workstream 4 still needs a typed runtime
    instrumentation API for those surfaces.
-4. **Remaining unverified operator families:** torch-norm fallback backward and
-   DSA sparse-attention mask construction. MoE group, auxiliary-loss, capacity,
-   padding, and Sinkhorn routing maps are now bit-exact across the EP≤4 / TP /
-   FSDP / PP / VPP proxy matrix; EP>16 remains part of the e2e gap above.
-
 ## 9. References
 
 - Determinism roadmap & meeting notes (internal Google Docs).

@@ -70,8 +70,8 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 
 | Op | File:line | Primitive | Det? | Det path | Non-det path | Selected by | Evidence | Perf Δ | Gap / TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| LayerNorm/RMSNorm fwd | `transformer/torch_norm.py`, TE norm | reduction | 🟢 | — | — | — | doc | — | — |
-| LayerNorm/RMSNorm bwd | TE / torch norm | weight-grad reduction | 🟡 | TE deterministic kernels | torch/TE fast | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | doc | TBD | ⚠ verify torch-norm fallback backward. |
+| LayerNorm/RMSNorm fwd | `transformer/torch_norm.py`, TE norm | reduction | 🟢 | — | — | backend | doc+**test** | — | PyTorch fallback verified directly; TE norms are exercised by model proxies. |
+| LayerNorm/RMSNorm bwd | TE / `transformer/torch_norm.py` | weight-grad reduction | 🟢 | PyTorch fallback / TE deterministic kernels | TE fast kernels | backend + `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | code+**test** | TBD | **Verified** bit-exact for PyTorch LayerNorm and RMSNorm at hidden 128/2048 on H100 and GB200; TE norms remain covered by the model proxies. |
 
 ### Embedding & TP linear
 
@@ -115,7 +115,7 @@ Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det b
 | DP inference coordinator scheduling | `inference/.../dynamic_engine.py:607`, `data_parallel_inference_coordinator.py:181` | 🔵 | sorted rank identities vs completion order |
 | RL rollout ordering | `rl/rl_utils.py:678` | 🔵 | sort by `problem_id` vs completion order |
 | Inference token sampling | `inference/sampling/torch_sampling.py:61-69` | 🟡 | `cumsum`/`scatter` in top-p; RNG-driven |
-| DSA sparse-attention masks | `transformer/experimental_attention_variant/dsa.py:214/385/950` | 🟡 | `scatter_` index masks; ⚠ verify for DSV3.x sparse attention |
+| DSA sparse-attention masks | `transformer/experimental_attention_variant/dsa.py:214/385/950` | 🟢 | Unique top-k `scatter_` masks are bit-exact in indexer-loss forward, recomputed manual backward, and unfused sparse-attention backward (`test_dsa_paths.py`). |
 
 ---
 
@@ -297,9 +297,16 @@ then passed all 21 selected cells on each of 8 ranks. Together these cover both
 capacity drop policies, padded and unpadded A2A dispatch, and the Sinkhorn
 router-local scatter across EP≤4 / TP / FSDP / PP / VPP.
 
+**Verified (torch norm and DSA masks):** AWS-DFW GB200 job `516499` and Draco
+H100 job `10429898` each passed all 7 selected cases on every rank (4 and 8
+ranks, respectively). The matrix covers PyTorch LayerNorm/RMSNorm forward and
+backward at hidden 128/2048, DSA indexer-loss mask construction in forward and
+recomputed manual backward (dense and sparse loss), and unfused sparse-attention
+mask construction plus input gradients.
+
 **Still open:** EP all-to-all at **EP>16** (proxies cap at EP4 — needs the Tier-B
-mbridge e2e recipe to reach the scale where DSV3 empirically diverges),
-torch-norm backward fallback, DSA sparse masks, and the 8-GPU cells for the new
-A2A presets. AWS-DFW and AWS-CMH expose four GPUs per node to this fixture; HSG
-was unreachable during this run. Promote each to 🟢/🔵 or open a gap with a fix
-following the `moe_utils.py:530` det-branch pattern.
+mbridge e2e recipe to reach the scale where DSV3 empirically diverges) and the
+8-GPU cells for the new A2A presets. AWS-DFW and AWS-CMH expose four GPUs per
+node to this fixture; HSG was unreachable during this run. Promote each to
+🟢/🔵 or open a gap with a fix following the `moe_utils.py:530` det-branch
+pattern.
