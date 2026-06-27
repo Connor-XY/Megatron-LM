@@ -241,6 +241,18 @@ small set of reductions and dispatch choices. They are fully enumerated in
   matched 1,352/1,352 events across two distributed-optimizer runs, including 48
   DP boundary events and zero pending collectives. Every completed model run
   reported byte-identical recompute outputs.
+- **Strict external-recipe log gate (added):**
+  `tools/determinism/compare_training_logs.py` compares every logged iteration
+  and every nonvolatile serialized metric, requires loss and grad norm by
+  default, and rejects missing or conflicting duplicate records. Its focused
+  suite passed its original 8/8 tests in AWS-DFW job `522790`, then 9/9 in HSG
+  job `3616185` and the final 10/10 in HSG job `3616466` (log SHA256
+  `aa6f7fe42ea1…`). Applied to the retained weekly logs from `522695` and
+  `522696`, it found two identical records for each of both iterations and
+  matched all 20 nonvolatile values per model; report SHA256 values are
+  `6bda80c6d699…` and `7e1cbe6f8142…`. This gate is intended for external
+  loops that do not yet enter the structured-trace context; equal printed
+  metrics remain weaker evidence than exact tensor hashes.
 - **Rank-scoped Nsight profiling (added):**
   `tools/determinism/profile_rank.py` runs exactly one global `torchrun` rank
   under nsys while every peer executes the Python training command directly.
@@ -404,15 +416,38 @@ small set of reductions and dispatch choices. They are fully enumerated in
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
   det-without-nsys divergence from iteration 3. The latter lacks a same-mode
   control, and these historical raw logs were not independently available in
-  this checkout. The remaining deliverable is a reproducible weekly gate and
-  dashboard on the current MCore commit.
+  this checkout. A current-MCore HSG smoke pair in job `3616252` then ran the
+  full Nemotron-3-Ultra 550B TP2×PP3×EP32 recipe twice, sequentially on the same
+  24-node/96-GPU allocation. Both launches reached all five iterations, and the
+  corrected strict comparator matched all 60 nonvolatile serialized metric
+  values exactly (report SHA256 `c8d0912328f3…`). The resolved configs differ
+  only in `save_config_filepath`. Both Slurm training steps report
+  `COMPLETED 0`, although `srun --wait=60` killed late cleanup ranks after the
+  first rank exited; the retained harness should use at least 180 seconds. The
+  top-level batch record is `FAILED 1` because the pre-fix comparator consumed
+  appended rank-memory fields; rerunning the corrected comparator on the
+  retained logs produced the exact report above. Current MCore also exposed a
+  Bridge integration gap: its DDP config sets the logical hierarchical group
+  size, but Bridge did not pass that value into
+  `initialize_model_parallel`. A minimal verification-only Bridge patch was
+  required to create the hierarchy. The remaining deliverable is a clean
+  50-step weekly gate and dashboard on the current MCore commit.
 
 ## 8. Known gaps (feeding the roadmap)
 
 1. **Full Bridge evidence is not yet CI-gated.** The checked-in weekly L3 GB200
    rows retain strict EP32 MCore certificates for both model proxies, but the
-   full Bridge recipe still needs its own weekly gate, retained artifacts, and
-   a same-mode control at 192/3,072 GPUs.
+   full Bridge recipe has only a five-step same-allocation 96-GPU smoke, not a
+   clean 50-step weekly gate or a same-mode control at 192/3,072 GPUs. Bridge
+   must also propagate `reduce_scatter_hierarchical_group_size` into MCore
+   process-group initialization. The scale gate should run two
+   deterministic, non-profiled jobs sequentially in one allocation, compare all
+   50 iterations with `compare_training_logs.py`, and retain both logs, both
+   resolved configs, the comparison JSON, source revisions, rank-to-host
+   placement, and hashes. Run that control weekly at 192 GPUs (48 GB200 nodes).
+   At 3,072 GPUs (768 nodes), run the same control under a reservation before
+   comparing nsys-on with nsys-off; instrumentation comparisons are diagnostics,
+   not substitutes for the no-nsys/no-nsys reproducibility control.
 2. **The production perf target is not consistently closed.** The production
    fixed-logical-rank hierarchy removes the measured DP penalty in job `520235`:
    hierarchical-DP-only is 55.4 ms versus 55.6 ms native and 57.8 ms flat

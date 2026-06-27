@@ -44,6 +44,38 @@ trace below for recompute and optimizer boundaries; collective payloads and
 selected kernel identities remain follow-up surfaces. Only compare trusted
 `.pth` files because PyTorch dump loading uses pickle serialization.
 
+## Gate external training recipes from their console logs
+
+Some launchers, including Megatron Bridge performance recipes, do not yet enter
+the MCore structured-trace context. Use the strict console-log comparator as an
+integration gate for two otherwise identical runs:
+
+```bash
+python tools/determinism/compare_training_logs.py \
+  /path/to/run-a.log /path/to/run-b.log \
+  --expected-iterations 50 --json
+```
+
+The comparator reads every logged iteration and compares the exact serialized
+value of every pipe-delimited metric. By default it requires `lm loss` and
+`grad norm`, and excludes only elapsed time, throughput, energy, and power.
+Only fields closed by a `|` delimiter and following Megatron's leading-space
+field convention belong to the iteration record. After the first metric, an
+adjacent rank prefix appended directly by Slurm terminates the record, so that
+rank's own pipe-delimited timing or memory fields are also ignored.
+Identical duplicate rank-zero records are accepted for aggregated distributed
+logs; conflicting duplicates, missing iterations, missing required metrics, or
+any other metric difference fail the gate. Additional required or volatile
+fields can be selected with repeatable `--require-metric` and
+`--ignore-metric` options. Exit code 0 is an exact serialized match, 1 is a
+complete but divergent comparison, and 2 is invalid or ambiguous input.
+
+This is stronger than sampling one loss value, but it is not a bitwise tensor
+certificate: equal printed metrics can hide an earlier tensor difference below
+the logging precision. Use it to gate an external training loop, then use
+`certify_traces.py` or `compare_dumps.py` when the loop exposes the corresponding
+MCore instrumentation.
+
 ## Trace recompute and optimizer boundaries during training
 
 The structured runtime tracer complements tensor dumps with semantic JSONL
