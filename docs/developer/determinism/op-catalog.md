@@ -204,6 +204,7 @@ script. Cluster-local artifacts are retained under:
 | final-source Nemotron EP32 certificate | AWS-DFW `522521`, 32 GPUs | `det-nemotron-fused-ep32-522521/certification.json`, SHA256 `b1f8b2688382…` | Two launches match 9,664/9,664 events with zero divergences, 192 exact recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
 | checked-in weekly DSV3 EP32 certificate | AWS-DFW `522695`, 32 GPUs across four NVL72 domains | `det-weekly-cert-dsv3-522695/determinism-certification/dsv3/certification.json`, SHA256 `9e887e0d821a…` | The weekly runner matches 6,080/6,080 events with zero divergences, 64 exact recomputes, 1,920 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
 | checked-in weekly Nemotron EP32 certificate | AWS-DFW `522696`, 32 GPUs in one NVL72 domain | `det-weekly-cert-nemotron-522696/determinism-certification/nemotron/certification.json`, SHA256 `fbb673910cfe…` | The weekly runner matches 9,664/9,664 events with zero divergences, 192 exact recomputes, 2,304 collective events, zero pending collectives, and zero missing hierarchical DP reductions. |
+| full-width A2A model matrix | Draco `10438654`, 8 H100 GPUs | `model-a2a-10438654/verification.json`, SHA256 `f808fe963e1c…`; pytest log SHA256 `24d2beab4b1e…` | All eight ranks pass all 12 DeepSeek top-k-8 and Nemotron top-k-6 cells (96/96 per-cell pass reports), including TP2×EP4, FSDP8×EP4, and FSDP8. GPU step `10438654.0` is `COMPLETED 0:0`; the batch wrapper alone is failed because its post-check regex omitted pytest's `33 deselected` field. |
 | strict serialized-training-log gate | HSG `3616466`; AWS-DFW `522790`; weekly logs `522695` / `522696` | `bridge-ultra-current/log-tests-3616466.out`, SHA256 `aa6f7fe42ea1…`; weekly reports SHA256 `6bda80c6d699…` / `7e1cbe6f8142…` | The final 10/10 focused tests pass, including a colon-bearing interleaved Slurm rank suffix with its own pipe-delimited memory metric. Both two-run weekly logs contain two exact records for each of two iterations; all 20 nonvolatile serialized metric values per model match. This is an external-loop integration gate, not a tensor-level certificate. |
 | local optimizer-state trace | HSG `3616865` / `3616898`, 4 GPUs | `optimizer-state-trace-tests-3616865.out` / `optimizer-state-trace-tests-3616898.out`, SHA256 `305373558100…` / `d9ff9c57175a…` | The full 18-test trace file passes on every rank, and final chained-optimizer coverage passes 2/2 focused tests per rank. The opt-in hashes local main parameters plus direct tensor/scalar state before and after the step using stable ordinals; it adds no communication and is disabled by default. |
 | synchronous TP collective trace | HSG `3617018` / final-source `3617133`, 4 GPUs; mapping regression `3617143`, 8 GPUs | `tp-trace-tests-3617018.out` / `full-trace-tests-3617133.out` / `tp-mappings-tests-3617143.out`, SHA256 `7a02f8827841…` / `fcd4b95dcd5b…` / `68688420008b…` | The focused forward/recompute/backward test passes on all four ranks, then the full 20-test trace file passes on every rank. The seven legacy mapping tests pass on all eight ranks across two nodes. It fingerprints all-reduce plus first/last-dimension all-gather and reduce-scatter, and covers size-one zero-stride autograd gradients. |
@@ -539,6 +540,11 @@ reported 8 passed / 4 expected 8-GPU skips. Job `516190` re-ran the existing
 top-k-2 presets after fixing the harness to preserve their declared 8-expert
 topology, with the same 8 passed / 4 skipped result on each rank. The helper's
 fallback and dtype/shape matrix passed 20/20 cases per rank in job `516124`.
+Draco H100 job `10438654` then closed the skipped full-width cells: all eight
+ranks passed all 12 A2A model cells, including TP2×EP4, FSDP8×EP4, and FSDP8.
+The strict retained report validates 96/96 per-cell `PASSED` records with no
+failed node or terminal summaries (report SHA256 `f808fe963e1c…`, pytest log
+SHA256 `24d2beab4b1e…`).
 
 **Verified (capacity and Sinkhorn routing):** AWS-DFW GB200 job `516442`
 reported 12 passed / 9 expected 8-GPU skips per rank. Draco H100 job `10429794`
@@ -587,8 +593,7 @@ pending operations, and 384 DP reductions using ordered fp32 accumulation. Job
 `519253` passed the final 48-test focused suite on every AWS-DFW GB200 rank;
 AWS-CMH GB300 job `697567` passed the same 48 tests on every rank.
 
-**Still open:** a retained weekly gate for the full Megatron-Bridge recipe;
+**Still open:** a retained weekly gate for the full Megatron-Bridge recipe and
 topology-independent native TP floating-point reductions and non-distributed-
-optimizer DP all-reduce; and the 8-GPU cells for the new
-A2A presets. AWS-DFW and AWS-CMH expose four GPUs per node to this fixture; HSG
-was unreachable during this run.
+optimizer DP all-reduce. The new A2A presets' 8-GPU cells are closed by Draco
+job `10438654` above.

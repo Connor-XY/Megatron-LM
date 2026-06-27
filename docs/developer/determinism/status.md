@@ -203,6 +203,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
   8×H100). CI auto-discovers them via the `determinism/correctness/**/*.py` glob
   in `unit-tests.yaml`. **Note:** the branch pins `nvidia-resiliency-ext==0.6.0`;
   images older than that need an in-container upgrade to import mcore.
+  The production-shape A2A presets are also closed at the full fixture width:
+  Draco H100 job `10438654` passed all 12 DeepSeek top-k-8 and Nemotron top-k-6
+  cells on every one of eight ranks (96/96 per-cell pass reports), including
+  TP2×EP4, FSDP8×EP4, and pure FSDP8. The retained strict verification report
+  has SHA256 `f808fe963e1c…`; the pytest log has SHA256 `24d2beab4b1e…`.
+  The GPU test step is `COMPLETED 0:0`; the top-level batch status is `FAILED`
+  only because its post-check regex omitted pytest's `33 deselected` field.
 - **Operator-level gaps (added):**
   `test_torch_norm.py` directly certifies PyTorch LayerNorm and RMSNorm backward,
   bypassing TE/Apex so the fallback is genuinely exercised. `test_dsa_paths.py`
