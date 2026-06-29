@@ -175,11 +175,20 @@ small set of reductions and dispatch choices. They are fully enumerated in
   `distributed/deterministic_collectives.py`): rank-indexed all-to-all or
   all-gather followed by a fixed local fp32 sum.
 - **Final TP/PP gradient synchronization**
-  (`distributed/finalize_model_grads.py`): native SUM/AVG reductions remain a
-  topology-sensitive gap. The opt-in trace fingerprints their exact inputs and
-  outputs, plus token-count synchronization, so a scaled run can establish
-  whether this boundary is the first divergence before an ordered replacement
-  is introduced.
+  (`distributed/finalize_model_grads.py`,
+  `distributed/deterministic_collectives.py`): deterministic floating SUM/AVG
+  keeps native collectives for groups of at most two, where there is at most one
+  addition per element, and uses bounded 64 MiB chunks with all-to-all, a fixed
+  logical-rank fp32 sum, optional post-sum division, and all-gather for larger
+  groups. The trace fingerprints exact inputs/outputs and records which path ran.
+  Draco job `10477843` passed all 11 SUM/AVG, dtype, chunking, and trace cases on
+  every H100 rank. Independent 16-GPU GB200 TP2×PP2×DP4 jobs `539519` and
+  `539562` match 1,856/1,856 events across allocations and select the native
+  two-rank exact path. Independent TP4×DP4 jobs `539611` and `539639` also match
+  2,432/2,432 events across allocations and record 32 fixed-logical-rank
+  final-gradient reductions per launch. Post-change EP32 jobs `539669` and
+  `539674` preserve the full DeepSeek-V3 and Nemotron certificates across
+  independent allocations: 6,720/6,720 and 10,304/10,304 events, respectively.
 - **Megatron-FSDP gradient reduction**
   (`distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py`) remains an
   unsupported cross-allocation path: it launches native SUM/AVG/premultiplied
@@ -265,9 +274,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
   outputs are recorded at the existing waits. Rank-process visibility captures
   autograd-worker launches; `iteration.end.pending_collectives` reports
   operations that outlive the selected window instead of writing to a closed
-  trace. End-of-backward finalization now records native TP SUM/AVG, PP
+  trace. End-of-backward finalization records deterministic TP SUM/AVG, PP
   embedding/replicated-parameter reductions, and token-count synchronization at
-  their existing synchronous completion points. AWS-CMH job `719032` passed the
+  their existing synchronous completion points, including implementation and
+  process-group size. AWS-CMH job `719032` passed the
   focused real-NCCL trace test on all four GB200 ranks with every Slurm step
   `COMPLETED 0:0` (console SHA256 `32c8d9751876…`, evidence-manifest SHA256
   `022414bbd4c2…`).
@@ -636,8 +646,9 @@ small set of reductions and dispatch choices. They are fully enumerated in
    deduplicating launches covered by nested ranges. TP userbuffer payloads, TE
    internal FP8/FP4 quantizer state, and in-process kernel selection are still
    missing; TE checkpoint inputs/outputs and forward/recompute identity are now
-   covered. Native floating-point TP reductions and the non-distributed-
-   optimizer DP all-reduce also lack topology-independent paths.
+   covered. Floating-point reductions inside TP mappings, TP linears, and
+   vocab-parallel cross-entropy, plus the non-distributed-optimizer DP
+   all-reduce, still lack topology-independent paths.
 
 ## 9. References
 

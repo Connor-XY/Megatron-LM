@@ -127,9 +127,9 @@ semantic MoE expert-parallel all-to-all boundaries. With
 `--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
 parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
 distributed-optimizer parameter-gather hashes. End-of-backward finalization
-additionally fingerprints native TP SUM/AVG, PP embedding/replicated-parameter
-all-reduces, token-count broadcast/reduction boundaries, and the exact integer
-SUM that drives router expert-bias updates. It also
+additionally fingerprints deterministic TP SUM/AVG, PP embedding/replicated-
+parameter all-reduces, token-count broadcast/reduction boundaries, and the exact
+integer SUM that drives router expert-bias updates. It also
 fingerprints the standard synchronous TP all-reduce, first/last-dimension
 all-gather, and
 first/last-dimension reduce-scatter paths in original forward, activation
@@ -174,9 +174,10 @@ are covered, but internal quantizer state is not independently fingerprinted.
 TP userbuffer payloads and in-process kernel selection remain follow-up
 instrumentation surfaces. Actual kernel identities from a captured iteration
 can be recovered from an Nsight Systems SQLite export with
-`attribute_nsys_ranges.py --kernels`. Native floating-point TP/PP SUM and AVG
-ordering remains a determinism-path gap even though its payload is now
-observable. Megatron-FSDP gradient reductions are a separate uninstrumented
+`attribute_nsys_ranges.py --kernels`. Final TP/PP gradient SUM and AVG use a
+topology-independent deterministic implementation, while floating reductions
+inside TP mappings, TP linears, and vocab-parallel cross-entropy remain open.
+Megatron-FSDP gradient reductions are a separate uninstrumented
 native-collective gap; its existing FSDP8 cells are same-topology tests, not
 cross-allocation certificates.
 

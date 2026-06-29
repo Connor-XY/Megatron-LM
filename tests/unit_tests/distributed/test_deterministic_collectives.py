@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from megatron.core.distributed.deterministic_collectives import all_reduce_avg, all_reduce_sum
+from megatron.core.distributed.deterministic_collectives import (
+    all_reduce_avg,
+    all_reduce_sum,
+    all_reduce_with_fp32_accumulation,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -36,4 +40,36 @@ def test_all_reduce_sum_uses_rank_ordered_accumulation():
         torch.testing.assert_close(local_value, expected_avg, rtol=0, atol=0)
     finally:
         torch.use_deterministic_algorithms(deterministic_algorithms_enabled)
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("op", "average"),
+    [(torch.distributed.ReduceOp.SUM, False), (torch.distributed.ReduceOp.AVG, True)],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_large_all_reduce_uses_bounded_rank_ordered_chunks(dtype, op, average):
+    Utils.initialize_model_parallel()
+    try:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        numel = world_size * 3 + 1
+        offsets = torch.arange(numel, dtype=torch.float32, device="cuda") % 4
+        tensor = (offsets + rank + 1).to(dtype)
+        expected = offsets * world_size + world_size * (world_size + 1) / 2
+        if average:
+            expected.div_(world_size)
+        expected = expected.to(dtype)
+
+        result = all_reduce_with_fp32_accumulation(
+            tensor,
+            op=op,
+            group=torch.distributed.group.WORLD,
+            max_chunk_bytes=world_size * tensor.element_size() * 2,
+        )
+
+        assert result is tensor
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+    finally:
         Utils.destroy_model_parallel()

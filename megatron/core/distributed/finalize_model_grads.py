@@ -14,6 +14,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core.determinism_trace import begin_collective_trace, record_collective_result
+from megatron.core.distributed.deterministic_collectives import all_reduce_with_fp32_accumulation
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -46,16 +47,38 @@ def _all_reduce_with_determinism_trace(
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
     metadata: Optional[Dict[str, object]] = None,
 ) -> None:
-    """Run an existing synchronous all-reduce with opt-in payload tracing."""
+    """Run a synchronous native or fixed-rank all-reduce with opt-in payload tracing."""
+    deterministic_floating_reduction = (
+        torch.are_deterministic_algorithms_enabled() and tensor.is_floating_point()
+    )
+    group_size = torch.distributed.get_world_size(group=group)
+    use_ordered_reduction = deterministic_floating_reduction and group_size > 2
+    if use_ordered_reduction:
+        implementation = "logical_rank_all_to_all_sum_all_gather"
+    elif deterministic_floating_reduction and group_size == 2:
+        # A two-rank reduction has exactly one addition per element, so no physical topology can
+        # change the floating-point accumulation order.
+        implementation = "native_two_rank_exact"
+    elif deterministic_floating_reduction:
+        implementation = "identity"
+    else:
+        implementation = "native"
     trace_metadata: Dict[str, object] = {
         "async_op": False,
         "reduce_op": "avg" if op == torch.distributed.ReduceOp.AVG else "sum",
+        "implementation": implementation,
+        "group_size": group_size,
     }
+    if use_ordered_reduction:
+        trace_metadata["accumulation_dtype"] = "torch.float32"
     trace_metadata.update(metadata or {})
     trace_handle = begin_collective_trace(
         trace_name, "all_reduce", tensor, group=group, metadata=trace_metadata
     )
-    torch.distributed.all_reduce(tensor, op=op, group=group)
+    if use_ordered_reduction:
+        all_reduce_with_fp32_accumulation(tensor, op=op, group=group)
+    else:
+        torch.distributed.all_reduce(tensor, op=op, group=group)
     record_collective_result(trace_handle, tensor)
 
 

@@ -292,10 +292,13 @@ def test_collective_trace_records_semantic_input_and_output(tmp_path):
     assert events[-1]["payload"]["pending_collectives"] == 0
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_finalize_model_grad_collectives_record_existing_completion_points(tmp_path):
+def test_finalize_model_grad_collectives_record_existing_completion_points(tmp_path, deterministic):
     Utils.initialize_model_parallel()
+    deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
     try:
+        torch.use_deterministic_algorithms(deterministic)
         group = torch.distributed.group.WORLD
         rank = torch.distributed.get_rank()
         reduced = torch.tensor([rank + 1.0], device="cuda")
@@ -331,6 +334,11 @@ def test_finalize_model_grad_collectives_record_existing_completion_points(tmp_p
         ]
         assert collective[0]["payload"]["operation"] == "all_reduce"
         assert collective[0]["payload"]["reduce_op"] == "sum"
+        assert collective[0]["payload"]["implementation"] == (
+            "logical_rank_all_to_all_sum_all_gather" if deterministic else "native"
+        )
+        if deterministic:
+            assert collective[0]["payload"]["accumulation_dtype"] == "torch.float32"
         assert collective[2]["payload"]["operation"] == "broadcast"
         assert collective[2]["payload"]["src"] == 0
         assert all(
@@ -339,6 +347,42 @@ def test_finalize_model_grad_collectives_record_existing_completion_points(tmp_p
         )
         assert events[-1]["payload"]["pending_collectives"] == 0
     finally:
+        torch.use_deterministic_algorithms(deterministic_algorithms_enabled)
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [(torch.distributed.ReduceOp.SUM, 3.0), (torch.distributed.ReduceOp.AVG, 1.5)],
+)
+def test_finalize_model_grad_two_rank_reduction_keeps_exact_native_collective(
+    tmp_path, op, expected
+):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        group = get_tensor_model_parallel_group()
+        group_rank = torch.distributed.get_rank(group=group)
+        reduced = torch.tensor([group_rank + 1.0], device="cuda")
+
+        with trace_iteration(tmp_path, 25, hash_tensors=True):
+            _all_reduce_with_determinism_trace(
+                reduced,
+                group=group,
+                trace_name="finalize_model_grads.tensor_parallel_sum.backward",
+                op=op,
+            )
+
+        torch.testing.assert_close(reduced, torch.tensor([expected], device="cuda"))
+        events = _read_events(_trace_path(tmp_path, 25))
+        collective = [event for event in events if event["kind"] == "collective"]
+        assert collective[0]["payload"]["implementation"] == "native_two_rank_exact"
+        assert collective[0]["payload"]["group_size"] == 2
+        assert events[-1]["payload"]["pending_collectives"] == 0
+    finally:
+        torch.use_deterministic_algorithms(deterministic_algorithms_enabled)
         Utils.destroy_model_parallel()
 
 
