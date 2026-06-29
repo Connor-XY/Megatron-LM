@@ -3,7 +3,11 @@
 import json
 import subprocess
 
-from tools.determinism.audit_sensitive_ops import main, scan_sensitive_operations
+from tools.determinism.audit_sensitive_ops import (
+    main,
+    operation_fingerprint,
+    scan_sensitive_operations,
+)
 
 
 def _write_fixture(tmp_path):
@@ -56,6 +60,10 @@ def test_category_filter_and_json_report(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["schema_version"] == 1
     assert report["operation_count"] == 2
+    assert report["source_file_count"] == 1
+    assert report["operation_fingerprint"] == operation_fingerprint(
+        scan_sensitive_operations(source_root, categories=("indexed_reduction",))
+    )
     assert report["category_counts"] == {"indexed_reduction": 2}
     assert [operation["call"] for operation in report["operations"]] == [
         "tensor.scatter_add_",
@@ -108,3 +116,28 @@ def test_missing_or_empty_source_root_has_distinct_exit_codes(tmp_path, capsys):
     (source_root / "safe.py").write_text("value = 1\n", encoding="utf-8")
     assert main([str(source_root), "--fail-empty"]) == 1
     assert capsys.readouterr().out == "TOTAL 0\n"
+
+
+def test_verify_catalog_requires_exact_snapshot_and_every_source_path(tmp_path, capsys):
+    source_root = _write_fixture(tmp_path)
+    operations = scan_sensitive_operations(source_root)
+    fingerprint = operation_fingerprint(operations)
+    catalog = tmp_path / "catalog.md"
+    catalog.write_text(
+        f"<!-- sensitive-op-audit count={len(operations)} files=2 "
+        f"fingerprint={fingerprint} -->\n"
+        "megatron/training.py\nmegatron/inference/sampling.py\n",
+        encoding="utf-8",
+    )
+
+    assert main([str(source_root), "--verify-catalog", str(catalog)]) == 0
+    assert "CATALOG VERIFIED" in capsys.readouterr().out
+
+    (source_root / "new_path.py").write_text(
+        "torch.distributed.all_reduce(tensor)\n", encoding="utf-8"
+    )
+    assert main([str(source_root), "--verify-catalog", str(catalog)]) == 1
+    error = capsys.readouterr().err
+    assert "operation count changed" in error
+    assert "operation fingerprint changed" in error
+    assert "megatron/new_path.py" in error

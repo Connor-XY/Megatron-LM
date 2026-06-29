@@ -21,13 +21,16 @@ foundation artifact for the determinism roadmap (validation, performance, toolin
 
 ## Audit source candidates for the operation catalog
 
-Run the zero-dependency AST audit after changing collective, routing, indexing,
-or sorting code:
+Run the zero-dependency AST audit with the repository Python after changing
+collective, routing, indexing, or sorting code:
 
 ```bash
-python tools/determinism/audit_sensitive_ops.py megatron --git-tracked-only
-python tools/determinism/audit_sensitive_ops.py megatron \
+uv run python tools/determinism/audit_sensitive_ops.py megatron --git-tracked-only
+uv run python tools/determinism/audit_sensitive_ops.py megatron \
   --git-tracked-only --category floating_collective_reduction --json
+uv run python tools/determinism/audit_sensitive_ops.py megatron \
+  --git-tracked-only \
+  --verify-catalog docs/developer/determinism/op-catalog.md
 ```
 
 The report is stable by file, line, column, and enclosing class/function. It
@@ -45,7 +48,11 @@ This is a candidate inventory, not a determinism verdict: whether a call is on
 the training path, has unique indices, reduces integer-valued data, or is
 protected by a deterministic branch still requires code/runtime analysis. Use
 the audit to find missing catalog rows, then record the classification and
-evidence in [`op-catalog.md`](./op-catalog.md).
+evidence in [`op-catalog.md`](./op-catalog.md). The catalog-verification mode
+requires an explicit disposition for every audited source file and matches a
+line-number-independent fingerprint of every path, symbol, category, and call;
+new or changed sensitive operations therefore require a deliberate catalog
+refresh.
 
 ## Locate the first difference in existing training dumps
 

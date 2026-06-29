@@ -366,7 +366,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
   the fixed-order unpermute argsort/gather/fallback; both semantic operations
   are classified in the catalog above. AWS-DFW job `540456` passed all five
   focused scanner tests (`COMPLETED 0:0`; pytest SHA256 `2fdd72bfa913…`). The
-  retained tracked report has SHA256 `7c27d7021da5…`.
+  retained tracked report has SHA256 `7c27d7021da5…`. The catalog now records an
+  explicit disposition for all 88 audited files and embeds the canonical
+  284-operation fingerprint `bc95302609a9…`; `--verify-catalog` fails on a
+  changed operation identity, count, file set, or missing disposition. Exact-source
+  AWS-CMH job `721643` passed all six focused tests plus the full catalog gate,
+  and every Slurm step completed `0:0` (console SHA256 `5fe2c3de94a5…`, sbatch
+  SHA256 `1328269cbb30…`).
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by

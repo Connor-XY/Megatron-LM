@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import ast
 import fnmatch
+import hashlib
 import json
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -70,6 +72,11 @@ _DETERMINISM_CONTROLS = {
     "set_determinism_debug_mode",
     "use_deterministic_algorithms",
 }
+
+_CATALOG_AUDIT_PATTERN = re.compile(
+    r"<!--\s*sensitive-op-audit\s+count=(?P<count>\d+)\s+"
+    r"files=(?P<files>\d+)\s+fingerprint=(?P<fingerprint>[0-9a-f]{64})\s*-->"
+)
 
 
 def _tensor_operation_category(call_name: str, leaf: str) -> str | None:
@@ -226,9 +233,65 @@ def _report(source_root: str | Path, operations: Sequence[SensitiveOperation]) -
         "schema_version": 1,
         "source_root": str(source_root),
         "operation_count": len(operations),
+        "source_file_count": len({operation.path for operation in operations}),
+        "operation_fingerprint": operation_fingerprint(operations),
         "category_counts": dict(sorted(category_counts.items())),
         "operations": [asdict(operation) for operation in operations],
     }
+
+
+def operation_fingerprint(operations: Sequence[SensitiveOperation]) -> str:
+    """Return a line-number-independent fingerprint of the audited operations."""
+    canonical_operations = [
+        {
+            "call": operation.call,
+            "category": operation.category,
+            "path": operation.path,
+            "symbol": operation.symbol,
+        }
+        for operation in operations
+    ]
+    payload = json.dumps(canonical_operations, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def verify_catalog_snapshot(
+    catalog_path: str | Path, operations: Sequence[SensitiveOperation]
+) -> list[str]:
+    """Return catalog coverage or snapshot errors for the audited operations."""
+    catalog_path = Path(catalog_path)
+    catalog_text = catalog_path.read_text(encoding="utf-8")
+    match = _CATALOG_AUDIT_PATTERN.search(catalog_text)
+    if match is None:
+        return [
+            "catalog is missing '<!-- sensitive-op-audit count=N files=N fingerprint=SHA256 -->'"
+        ]
+
+    errors = []
+    expected_count = int(match.group("count"))
+    expected_files = int(match.group("files"))
+    expected_fingerprint = match.group("fingerprint")
+    actual_count = len(operations)
+    actual_files = len({operation.path for operation in operations})
+    actual_fingerprint = operation_fingerprint(operations)
+    if expected_count != actual_count:
+        errors.append(f"operation count changed: catalog={expected_count}, audit={actual_count}")
+    if expected_files != actual_files:
+        errors.append(f"source file count changed: catalog={expected_files}, audit={actual_files}")
+    if expected_fingerprint != actual_fingerprint:
+        errors.append(
+            "operation fingerprint changed: "
+            f"catalog={expected_fingerprint}, audit={actual_fingerprint}"
+        )
+
+    missing_paths = sorted(
+        {operation.path for operation in operations if operation.path not in catalog_text}
+    )
+    if missing_paths:
+        errors.append("catalog has no disposition for: " + ", ".join(missing_paths))
+    return errors
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -258,6 +321,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="Emit a machine-readable report")
     parser.add_argument("--fail-empty", action="store_true", help="Return 1 when no calls match")
+    parser.add_argument(
+        "--verify-catalog",
+        metavar="PATH",
+        help="Require PATH to cover every source file and match this audit snapshot",
+    )
     return parser
 
 
@@ -275,6 +343,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     report = _report(args.source_root, operations)
+    if args.verify_catalog:
+        try:
+            catalog_errors = verify_catalog_snapshot(args.verify_catalog, operations)
+        except OSError as error:
+            print(f"error: cannot read catalog {args.verify_catalog}: {error}", file=sys.stderr)
+            return 2
+        if catalog_errors:
+            for error in catalog_errors:
+                print(f"catalog verification failed: {error}", file=sys.stderr)
+            return 1
+        if not args.json:
+            print(
+                "CATALOG VERIFIED "
+                f"(operations={report['operation_count']}, files={report['source_file_count']}, "
+                f"fingerprint={report['operation_fingerprint']})"
+            )
+            return 0
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

@@ -31,6 +31,117 @@ from async/control-plane `put`, `gather`, and module `embedding` calls.
 Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det branch ·
 🟡 conditional (verify) · 🔴 gap (no det path).
 
+<!-- sensitive-op-audit count=284 files=88 fingerprint=bc95302609a9e145033c7e83cec3ffb0be91202a3ad2087779056eb76fa0bc12 -->
+
+### Repository-wide audit disposition index
+
+The static audit currently finds **284 sensitive calls in 88 tracked source
+files**. The detailed tables below remain the authority for operation-level
+verdicts and performance evidence. This index gives every audited file an
+explicit disposition, including paths outside the DeepSeek-V3 / Nemotron-3-Ultra
+training target. `--verify-catalog` checks the count, the line-number-independent
+operation fingerprint, and the presence of every path, so a new or changed call
+cannot silently fall out of the review queue.
+
+Run the gate with:
+
+```bash
+uv run python tools/determinism/audit_sensitive_ops.py megatron \
+  --git-tracked-only \
+  --verify-catalog docs/developer/determinism/op-catalog.md
+```
+
+| Audited source file | Disposition | Current conclusion |
+| --- | --- | --- |
+| `megatron/core/datasets/data_schedule.py` | target deterministic | Hybrid-CP sequence lengths and routes use integer rank-ordered gathers, a stable Python sort, and rank-indexed all-to-all copies; no floating reduction. |
+| `megatron/core/determinism_trace.py` | diagnostic | Reads the deterministic-algorithms flag; tracing adds no numerical operation. |
+| `megatron/core/dist_checkpointing/exchange_utils.py` | checkpoint/control | Rank-indexed tensor exchange; checkpoint load is outside the per-step numerical certificate. |
+| `megatron/core/dist_checkpointing/strategies/async_utils.py` | checkpoint/control | Completion-state reductions do not feed model arithmetic. |
+| `megatron/core/dist_checkpointing/strategies/filesystem_async.py` | checkpoint/control | Deterministic size/type ordering for I/O scheduling. |
+| `megatron/core/dist_checkpointing/strategies/state_dict_saver.py` | checkpoint/control | Metadata agreement and rank-indexed broadcast; no optimizer value reduction. |
+| `megatron/core/distributed/deterministic_collectives.py` | detailed below | Fixed logical-rank floating reductions and rank-indexed collectives implement several deterministic branches. |
+| `megatron/core/distributed/distributed_data_parallel.py` | target deterministic | Initial parameter synchronization is a rank-zero broadcast. |
+| `megatron/core/distributed/finalize_model_grads.py` | detailed below | Final TP/PP gradients use the ordered deterministic reduction branch. |
+| `megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py` | target forbidden | Megatron-FSDP is rejected by deterministic CLI mode; this file contributes rank-indexed parameter broadcast only. |
+| `megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py` | target forbidden | Megatron-FSDP is rejected; its FP8 amax reduction has no target certificate. |
+| `megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py` | target forbidden | Native floating gradient collectives are the reason deterministic mode rejects Megatron-FSDP. |
+| `megatron/core/distributed/fsdp/src/megatron_fsdp/uneven_dtensor.py` | target forbidden | Megatron-FSDP is rejected; uneven-DTensor validation/materialization is not certified. |
+| `megatron/core/distributed/param_and_grad_buffer.py` | detailed below | Ordered distributed-optimizer reduce-scatter is covered; the non-distributed-optimizer native DP all-reduce remains a gap. |
+| `megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py` | detailed below | Fixed flat or hierarchical logical-rank fp32 accumulation. |
+| `megatron/core/energy_monitor.py` | reporting/control | Integer energy counters are summed for telemetry and never feed training state. |
+| `megatron/core/export/trtllm/trtllm_weights_converter/distributed_trtllm_model_weights_converter.py` | outside target | Export-only vocabulary-padding metadata reduction. |
+| `megatron/core/fault_injector.py` | diagnostic | Rank-indexed fault-control broadcast. |
+| `megatron/core/fp8_utils.py` | conditional | Finite amax uses order-independent MAX, but internal FP8/FP4 quantizer state is not yet covered by a cross-allocation target certificate. |
+| `megatron/core/fusions/fused_cross_entropy.py` | target forbidden | Fused cross-entropy remains forbidden in deterministic mode. |
+| `megatron/core/inference/batch_dimensions_utils.py` | outside target | Inference-only shape agreement and deterministic batch-dimension ordering. |
+| `megatron/core/inference/communication_utils.py` | outside target | Inference-only rank-indexed broadcasts. |
+| `megatron/core/inference/contexts/dynamic_context.py` | outside target | Inference allocator agreement, not model training arithmetic. |
+| `megatron/core/inference/contexts/kv_block_allocator.py` | outside target | Inference LRU ordering. |
+| `megatron/core/inference/contexts/mamba_slot_allocator.py` | outside target | Inference LRU ordering. |
+| `megatron/core/inference/engines/dynamic_engine.py` | outside target | Inference completion ordering has its own deterministic branch. |
+| `megatron/core/inference/sampling/torch_sampling.py` | outside target | RNG-driven sampling; top-k/top-p ordering is not a training determinism claim. |
+| `megatron/core/inference/text_generation_controllers/text_generation_controller.py` | outside target | Inference top-k and collision-free gathers. |
+| `megatron/core/inference/text_generation_server/dynamic_text_gen_server/endpoints/common.py` | outside target | Inference command broadcast. |
+| `megatron/core/inference/text_generation_server/endpoints/common.py` | outside target | Inference command broadcast. |
+| `megatron/core/inference/unified_memory.py` | outside target | Inference allocator metadata all-gather. |
+| `megatron/core/models/common/embeddings/rope_utils.py` | target deterministic | Context-parallel positional embeddings use collision-free `index_select`. |
+| `megatron/core/models/common/language_module/language_module.py` | target deterministic | Tied embedding initialization reduces one initialized copy with one zero copy across the embedding group. |
+| `megatron/core/models/hybrid/hybrid_layer_allocation.py` | target deterministic | Python attribute-name sort fixes hybrid-layer construction order. |
+| `megatron/core/models/mimo/comm/colocated_communicator.py` | outside target | MIMO rank-indexed all-gather. |
+| `megatron/core/models/mimo/optimizer.py` | outside target gap | MIMO uses native floating grad-norm / success reductions and has no ordered target path. |
+| `megatron/core/models/mimo/partition/utils.py` | outside target | MIMO collision-free context-parallel index selection. |
+| `megatron/core/models/multimodal/context_parallel.py` | outside target gap | Multimodal native floating reduce-scatter has no ordered path; gathers/all-to-all are rank-indexed. |
+| `megatron/core/models/multimodal/llava_model.py` | outside target | LLaVA collision-free token selection. |
+| `megatron/core/models/vision/radio.py` | outside target | Vision positional-encoding gather. |
+| `megatron/core/num_microbatches_calculator.py` | target deterministic | Step schedule is sorted by explicit iteration key. |
+| `megatron/core/optimizer/clip_grads.py` | detailed below | Global norm uses ordered scalar reduction in deterministic mode; zero counts are integer reductions. |
+| `megatron/core/optimizer/distrib_optimizer.py` | detailed below | State movement is rank-indexed and parameter ordering is explicit. |
+| `megatron/core/optimizer/layer_wise_optimizer.py` | outside target gap | Alternative layer-wise optimizer has no DeepSeek/Ultra certificate. |
+| `megatron/core/optimizer/optimizer.py` | target deterministic | The audited collective combines the finite/overflow control flag, not gradients. |
+| `megatron/core/optimizer/qk_clip.py` | conditional | Finite QK maxima use order-independent MAX; NaN-containing training is outside the certificate. |
+| `megatron/core/pipeline_parallel/bridge_communicator.py` | target deterministic | Pipeline bridge transfers are rank-indexed broadcasts without floating reduction. |
+| `megatron/core/pipeline_parallel/hybrid_cp_schedule.py` | target deterministic | Hybrid-CP schedule metadata uses rank-indexed broadcast. |
+| `megatron/core/rerun_state_machine.py` | reporting/control | Rerun decisions reduce integer booleans; sample sorting affects diagnostics only. |
+| `megatron/core/resharding/nvshmem_copy_service/planning/communication_scheduler.py` | checkpoint/control | Explicit deterministic copy-schedule ordering. |
+| `megatron/core/resharding/nvshmem_copy_service/planning/workload_packer.py` | checkpoint/control | Explicit deterministic copy-work ordering. |
+| `megatron/core/resharding/planner.py` | checkpoint/control | Explicit destination-offset ordering for resharding. |
+| `megatron/core/ssm/gated_delta_net.py` | detailed below | Deterministic SSM fallback plus collision-free index selection. |
+| `megatron/core/ssm/mamba_context_parallel.py` | target deterministic | Attention-load balancing uses collision-free `index_select`. |
+| `megatron/core/ssm/ops/determinism.py` | detailed below | Reads the deterministic flag and fixes Triton configuration/workspaces. |
+| `megatron/core/tensor_parallel/cross_entropy.py` | detailed below gap | Local selected-class update is closed; native TP floating reductions remain topology-sensitive. |
+| `megatron/core/tensor_parallel/data.py` | target deterministic | Batch dictionaries and tensors are rank-zero broadcasts. |
+| `megatron/core/tensor_parallel/layers.py` | detailed below gap | Embedding backward and TP linear native floating reductions remain cataloged gaps. |
+| `megatron/core/tensor_parallel/mappings.py` | detailed below gap | Rank-indexed mappings are stable; native TP SUM/reduce-scatter remains topology-sensitive. |
+| `megatron/core/transformer/attention.py` | diagnostic | Real-time checks all-gather rank-indexed values and do not update the model. |
+| `megatron/core/transformer/experimental_attention_variant/dsa.py` | detailed below | DSA masks are collision-free; logging reductions do not feed model state. |
+| `megatron/core/transformer/moe/moe_utils.py` | detailed below | Routing, top-k, permute, unpermute, and expert-bias families have individual rows. |
+| `megatron/core/transformer/moe/ops/deterministic_index_select.py` | detailed below | Fixed-order deterministic permute/unpermute helpers. |
+| `megatron/core/transformer/moe/ops/deterministic_routing.py` | detailed below | Collision-free fused routing writes. |
+| `megatron/core/transformer/moe/paged_stash.py` | reporting/control | Overflow decisions sum integer flags; no floating model value is reduced. |
+| `megatron/core/transformer/moe/router.py` | detailed below | Sinkhorn/top-k routing has target proxy coverage. |
+| `megatron/core/transformer/moe/router_replay.py` | conditional | Replay gathers are collision-free, but router replay has no target model certificate. |
+| `megatron/core/transformer/moe/token_dispatcher.py` | target forbidden | Deterministic mode rejects flex/DeepEP dispatch and uses certified standard all-to-all. |
+| `megatron/core/transformer/moe/token_dispatcher_inference.py` | outside target | Inference-only native reduce-scatter remains outside the training certificate. |
+| `megatron/core/transformer/multi_token_prediction.py` | conditional | TP argmax is rank-indexed and deterministic; floating MTP loss reductions affect logging only and may vary in low bits. |
+| `megatron/core/utils.py` | target deterministic | Audited calls are rank-indexed diagnostics/batch movement or collision-free context-parallel selection. |
+| `megatron/elastification/flextron_elasticity_hooks.py` | outside target conditional | Flextron routing is cataloged separately but lacks a target model certificate. |
+| `megatron/elastification/loss_func.py` | outside target gap | Elastification loss reporting uses native floating reduction. |
+| `megatron/elastification/router/hybrid_flex_router.py` | outside target conditional | Alternate elasticity router uses sorted top-k and collision-free selection but has no target certificate. |
+| `megatron/post_training/loss_func.py` | outside target gap | Post-training loss reporting uses native floating reduction. |
+| `megatron/rl/agent/api.py` | outside target | Explicit rollout grouping order. |
+| `megatron/rl/agent/weighted_multi_task.py` | outside target | Explicit task-count distribution order. |
+| `megatron/rl/rl_utils.py` | outside target | RL rollout ordering has a deterministic branch; RL reductions/gathers are not target-certified. |
+| `megatron/rl/sequence_packing_utils.py` | outside target | RL packing metadata all-gathers. |
+| `megatron/training/checkpointing.py` | checkpoint/control | Metadata agreement reduction does not combine model values. |
+| `megatron/training/datasets/fim_dataset.py` | target deterministic | FIM boundaries are explicitly sorted. |
+| `megatron/training/determinism.py` | detailed below | Enables deterministic algorithms after validating/overriding unsupported features. |
+| `megatron/training/dist_signal_handler.py` | reporting/control | Signal-state all-gather. |
+| `megatron/training/ft_integration.py` | diagnostic | Fault-tolerance control broadcast. |
+| `megatron/training/gpu_sniff_test.py` | diagnostic | Communication benchmark, not a training numerical path. |
+| `megatron/training/inprocess_restart.py` | reporting/control | Zero-valued collective eagerly initializes NCCL; it does not update training state. |
+| `megatron/training/training.py` | detailed below | Setup/control collectives and ordered loss/metric reporting are classified in the training-path rows. |
+| `megatron/training/utils/common_utils.py` | reporting/control | Parameter norms and max/boolean statistics are diagnostics; native floating diagnostic reductions may vary in low bits. |
+
 ---
 
 ## Control plane
