@@ -28,7 +28,14 @@ class _RouterExpertBiasModel(torch.nn.Module):
         self.ddp_config = DistributedDataParallelConfig()
         self.router = torch.nn.Module()
         self.router.register_buffer("local_tokens_per_expert", local_tokens_per_expert)
-        self.router.register_buffer("expert_bias", torch.zeros_like(local_tokens_per_expert))
+        self.router.register_buffer(
+            "expert_bias",
+            torch.zeros(
+                local_tokens_per_expert.shape,
+                dtype=torch.float32,
+                device=local_tokens_per_expert.device,
+            ),
+        )
         self.finish_grad_sync_calls = 0
 
     def finish_grad_sync(self, force_all_reduce=False):
@@ -84,7 +91,7 @@ class TestFinalizeModelGradsMoEExpertBias:
         config = _router_expert_bias_config()
         device = torch.device("cuda", torch.cuda.current_device())
         local_tokens = torch.tensor(
-            [0.0, 2.0] if dist.get_rank() == 0 else [0.0, 0.0], device=device
+            [0, 2] if dist.get_rank() == 0 else [0, 0], dtype=torch.int64, device=device
         )
         model = _RouterExpertBiasModel(config, local_tokens)
 
@@ -111,7 +118,9 @@ class TestFinalizeModelGradsMoEExpertBias:
         pg_collections[1].tp_dp_cp = None
 
         for pg_collection in pg_collections:
-            model = _RouterExpertBiasModel(config, torch.tensor([1.0, 0.0], device=device))
+            model = _RouterExpertBiasModel(
+                config, torch.tensor([1, 0], dtype=torch.int64, device=device)
+            )
             with pytest.raises(AssertionError, match="tp_dp_cp"):
                 finalize_model_grads([model], pg_collection=pg_collection)
             assert model.finish_grad_sync_calls == 0

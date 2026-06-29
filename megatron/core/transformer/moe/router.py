@@ -176,7 +176,9 @@ class TopKRouter(Router):
                 'local_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    # Token counts must remain exact above fp32's 2**24 integer range when
+                    # they are accumulated and all-reduced at large global batch sizes.
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,

@@ -125,7 +125,8 @@ semantic MoE expert-parallel all-to-all boundaries. With
 parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
 distributed-optimizer parameter-gather hashes. End-of-backward finalization
 additionally fingerprints native TP SUM/AVG, PP embedding/replicated-parameter
-all-reduces, and token-count broadcast/reduction boundaries. It also
+all-reduces, token-count broadcast/reduction boundaries, and the exact integer
+SUM that drives router expert-bias updates. It also
 fingerprints the standard synchronous TP all-reduce, first/last-dimension
 all-gather, and
 first/last-dimension reduce-scatter paths in original forward, activation
@@ -185,6 +186,7 @@ python tools/determinism/certify_traces.py \
   --expected-ranks 32 \
   --expected-iterations 2 \
   --require-collective-prefix moe.ep_ \
+  --require-collective-prefix moe.router_expert_bias. \
   --require-collective-prefix data_parallel. \
   --require-dp-fp32-accumulation \
   --require-dp-hierarchical-fp32-accumulation
@@ -220,8 +222,8 @@ bash tests/functional_tests/shell_test_utils/determinism/run_model_certification
 `tests/test_utils/recipes/gb200/determinism-certification.yaml` registers both
 32-GPU certificates as weekly L3 GB200 workloads. Each workload fails unless
 all 32 ranks and both iterations are present, recomputes are exact, MoE and DP
-collective surfaces are covered, no collective remains pending, and every
-multi-rank DP reduction used hierarchical fp32 accumulation.
+collective surfaces include expert-bias token counts, no collective remains
+pending, and every multi-rank DP reduction used hierarchical fp32 accumulation.
 
 ## Profile one distributed rank with Nsight Systems
 

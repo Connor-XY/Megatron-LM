@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.determinism_trace import begin_collective_trace, record_collective_result
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -1112,10 +1113,34 @@ def get_updated_expert_bias(
                 with_context_parallel=True
             )
 
-        # All Reduce Across TPxCPxDP group
+        trace_handle = begin_collective_trace(
+            "moe.router_expert_bias.token_count",
+            "all_reduce",
+            tokens_per_expert,
+            group=tp_dp_cp_group,
+            metadata={
+                "async_op": False,
+                "reduce_op": "sum",
+                "value_kind": "token_count",
+                "exact_integer_accumulation": not tokens_per_expert.is_floating_point(),
+            },
+        )
+        # All Reduce Across TPxCPxDP group. Production routers use int64 so the SUM is
+        # independent of the physical NCCL reduction order.
         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
-        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
-        offset = average_tokens - tokens_per_expert
+        record_collective_result(trace_handle, tokens_per_expert)
+        if tokens_per_expert.is_floating_point():
+            average_tokens = (
+                tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+            )
+            offset = average_tokens - tokens_per_expert
+        else:
+            # Only the sign is consumed below. Compare each count with the mean in integer
+            # space so near-ties above fp32's exact range cannot collapse to equality.
+            offset = (
+                tokens_per_expert.sum(dim=-1, keepdim=True)
+                - tokens_per_expert * tokens_per_expert.shape[-1]
+            )
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
         return updated_expert_bias
 

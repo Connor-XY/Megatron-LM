@@ -155,6 +155,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
   out-of-place `scatter` path.
 - **MoE top-k under activation checkpointing** (`moe_utils.py`): deterministic
   mode keeps `sorted=True` in both no-grad forward and grad-enabled recompute.
+- **Router expert-bias counts** (`transformer/moe/router.py`,
+  `transformer/moe/moe_utils.py`): int64 local accumulation plus an exact
+  TP×CP×DP integer SUM and integer-space mean comparison prevent large-batch
+  counts and near-tie bias decisions from crossing fp32's exact integer range;
+  the existing collective is also visible in structured traces.
 - **Vocab embedding fwd** (`tensor_parallel/layers.py:299`): direct `weight[idx]`
   (det backward) vs `F.embedding` (non-det backward).
 - **Vocab-parallel CE backward** (`tensor_parallel/cross_entropy.py`,
@@ -487,6 +492,19 @@ small set of reductions and dispatch choices. They are fully enumerated in
   collectives, and zero multi-rank DP reductions missing hierarchical fp32
   accumulation. This gates the scaled MCore proxies; it is not a substitute for
   the full Megatron-Bridge recipe.
+- **Exact router expert-bias counts and gate:** Draco H100 job `10475888`
+  passes the large-count trace, finalize-time update, and production EP8 router
+  cases on all eight ranks (console SHA256 `3d32a7971763…`, manifest SHA256
+  `7762d0dc0f61…`). The near-tie case differs by one token after the all-reduce
+  while both counts map to the same fp32 value, proving that the int64 SUM and
+  integer-space mean comparison preserve the intended opposite bias updates.
+  AWS-DFW GB200 job `539206` then runs the checked-in weekly DSV3 and Nemotron
+  certificates sequentially on one 32-GPU allocation with the expert-bias
+  trace prefix required. DSV3 matches 6,720/6,720 events and Nemotron matches
+  10,304/10,304; each report contains 128 expert-bias collective events, exact
+  recomputes, zero divergences or pending collectives, and no DP reductions
+  missing ordered or hierarchical fp32 accumulation (report SHA256
+  `1221e09002b9…` / `98a78a304897…`, manifest SHA256 `03ba6c436edb…`).
 - **Vocab-embedding backward experiment (rejected):** AWS-DFW job `521744`
   compares the current deterministic direct-index backward with a stable-sort,
   fixed-order segmented reduction across 12 shape, dtype, and duplicate-token

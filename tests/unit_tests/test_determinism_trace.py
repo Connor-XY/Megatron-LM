@@ -51,6 +51,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
 from tests.unit_tests.distributed.test_param_and_grad_buffer import get_model_and_buffers
 from tests.unit_tests.test_utilities import Utils
 
@@ -336,6 +337,48 @@ def test_finalize_model_grad_collectives_record_existing_completion_points(tmp_p
             event["payload"].get("inputs", event["payload"].get("outputs"))[0]["sha256"]
             for event in collective
         )
+        assert events[-1]["payload"]["pending_collectives"] == 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_router_expert_bias_trace_preserves_large_integer_counts(tmp_path):
+    Utils.initialize_model_parallel()
+    try:
+        group = torch.distributed.group.WORLD
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        tokens_per_expert = torch.tensor(
+            [2**24 + int(rank == 0), 2**24], dtype=torch.int64, device="cuda"
+        )
+        expert_bias = torch.zeros(2, dtype=torch.float32, device="cuda")
+
+        with trace_iteration(tmp_path, 24, hash_tensors=True):
+            updated_bias = get_updated_expert_bias(
+                tokens_per_expert, expert_bias, expert_bias_update_rate=0.1, tp_dp_cp_group=group
+            )
+
+        expected_counts = torch.tensor(
+            [world_size * 2**24 + 1, world_size * 2**24], dtype=torch.int64, device="cuda"
+        )
+        torch.testing.assert_close(tokens_per_expert, expected_counts)
+        assert expected_counts.to(torch.float32).unique().numel() == 1
+        expected_offset = expected_counts.sum() - expected_counts * expected_counts.numel()
+        expected_bias = torch.sign(expected_offset).to(expert_bias.dtype) * 0.1
+        torch.testing.assert_close(updated_bias, expected_bias)
+
+        events = _read_events(_trace_path(tmp_path, 24))
+        collective = [event for event in events if event["kind"] == "collective"]
+        assert [event["name"] for event in collective] == [
+            "moe.router_expert_bias.token_count.begin",
+            "moe.router_expert_bias.token_count.end",
+        ]
+        assert collective[0]["payload"]["operation"] == "all_reduce"
+        assert collective[0]["payload"]["reduce_op"] == "sum"
+        assert collective[0]["payload"]["exact_integer_accumulation"] is True
+        assert collective[0]["payload"]["inputs"][0]["dtype"] == "torch.int64"
+        assert collective[1]["payload"]["outputs"][0]["sha256"]
         assert events[-1]["payload"]["pending_collectives"] == 0
     finally:
         Utils.destroy_model_parallel()

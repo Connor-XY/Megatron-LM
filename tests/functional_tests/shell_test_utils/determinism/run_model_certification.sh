@@ -203,6 +203,7 @@ if ((NODE_RANK == 0)); then
         --expected-ranks 32 \
         --expected-iterations 2 \
         --require-collective-prefix moe.ep_ \
+        --require-collective-prefix moe.router_expert_bias. \
         --require-collective-prefix data_parallel. \
         --require-dp-fp32-accumulation \
         --require-dp-hierarchical-fp32-accumulation \

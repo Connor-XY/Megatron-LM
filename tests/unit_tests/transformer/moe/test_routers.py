@@ -429,6 +429,7 @@ class TestAuxLossFreeTop2Router:
         self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
+        assert self.router.local_tokens_per_expert.dtype == torch.int64
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
