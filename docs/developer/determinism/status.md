@@ -682,9 +682,15 @@ small set of reductions and dispatch choices. They are fully enumerated in
    core TP linear synchronous/async collective payloads, and opt-in local
    optimizer parameters and moment state. Nsight SQLite attribution now maps
    selected NVTX ranges to the exact causally launched CUDA kernel identities,
-   deduplicating launches covered by nested ranges. TP userbuffer payloads, TE
-   internal FP8/FP4 quantizer state, and in-process kernel selection are still
-   missing; TE checkpoint inputs/outputs and forward/recompute identity are now
+   deduplicating launches covered by nested ranges. The runtime event now records
+   installed TE/Triton/Mamba/FlashAttention versions and the TE-attention,
+   Mamba, and Triton selection controls without importing optional packages;
+   AWS-CMH job `722022` passed the full trace, comparator, and certifier suite
+   (47 tests on each of four ranks; every Slurm step `COMPLETED 0:0`, console
+   SHA256 `0232e9690b7b…`, sbatch SHA256 `ab8db5925dd9…`). TP
+   userbuffer payloads, TE internal FP8/FP4 quantizer state, and the actual
+   backend selected inside an auto-dispatching kernel library are still missing;
+   TE checkpoint inputs/outputs and forward/recompute identity are now
    covered. Floating-point reductions inside TP mappings, TP linears, and
    vocab-parallel cross-entropy, plus the non-distributed-optimizer DP
    all-reduce, still lack topology-independent paths.

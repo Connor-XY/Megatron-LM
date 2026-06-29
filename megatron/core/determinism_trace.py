@@ -19,12 +19,15 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass
 from enum import Enum
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
 import torch
 
 TRACE_SCHEMA_VERSION = 1
+
+_RUNTIME_PACKAGES = ("flash-attn", "mamba-ssm", "transformer-engine", "triton")
 
 
 class EventKind(str, Enum):
@@ -183,9 +186,17 @@ def _same_tensor_values(left: list[dict[str, Any]], right: list[dict[str, Any]])
 
 
 def _runtime_payload() -> dict[str, Any]:
+    package_versions = {}
+    for package_name in _RUNTIME_PACKAGES:
+        try:
+            package_versions[package_name] = importlib_metadata.version(package_name)
+        except importlib_metadata.PackageNotFoundError:
+            package_versions[package_name] = None
+
     payload: dict[str, Any] = {
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "package_versions": package_versions,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
         "environment": {
@@ -193,8 +204,13 @@ def _runtime_payload() -> dict[str, Any]:
             for name in (
                 "CUBLAS_WORKSPACE_CONFIG",
                 "CUDA_DEVICE_MAX_CONNECTIONS",
+                "MAMBA_DETERMINISTIC",
                 "NCCL_ALGO",
                 "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+                "NVTE_FLASH_ATTN",
+                "NVTE_FUSED_ATTN",
+                "NVTE_UNFUSED_ATTN",
+                "TRITON_CACHE_AUTOTUNING",
             )
         },
     }

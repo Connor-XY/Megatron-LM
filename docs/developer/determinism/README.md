@@ -131,7 +131,12 @@ pretrain_gpt.py ... \
 The trace records determinism-relevant runtime configuration, forward/backward
 and optimizer boundaries, Megatron and Transformer Engine activation-checkpoint
 forward/recompute identities, output-discarding checkpoint recomputation, and
-semantic MoE expert-parallel all-to-all boundaries. With
+semantic MoE expert-parallel all-to-all boundaries. Runtime metadata includes
+PyTorch/CUDA/cuDNN, device and allocator properties, installed
+Transformer-Engine/Triton/Mamba/FlashAttention package versions, and the
+cuBLAS, NCCL, TE-attention, Mamba, and Triton environment controls that govern
+deterministic or autotuned kernel selection. Package discovery uses installed
+metadata and does not import optional kernel libraries. With
 `--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
 parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
 distributed-optimizer parameter-gather hashes. End-of-backward finalization

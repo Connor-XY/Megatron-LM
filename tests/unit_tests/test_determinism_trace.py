@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import determinism_trace as trace_module
 from megatron.core.determinism_trace import (
     EventKind,
     active_trace,
@@ -96,6 +97,37 @@ def test_trace_writes_versioned_rank_local_events_and_tensor_hash(tmp_path):
     assert len(tensor_event["payload"]["sha256"]) == 64
     assert events[-1]["name"] == "iteration.end"
     assert active_trace() is None
+
+
+def test_runtime_trace_records_kernel_selection_inputs(tmp_path, monkeypatch):
+    environment = {
+        "MAMBA_DETERMINISTIC": "1",
+        "NVTE_FLASH_ATTN": "1",
+        "NVTE_FUSED_ATTN": "0",
+        "NVTE_UNFUSED_ATTN": "0",
+        "TRITON_CACHE_AUTOTUNING": "0",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    def package_version(name):
+        if name == "flash-attn":
+            raise trace_module.importlib_metadata.PackageNotFoundError(name)
+        return f"{name}-version"
+
+    monkeypatch.setattr(trace_module.importlib_metadata, "version", package_version)
+    with trace_iteration(tmp_path, 23):
+        pass
+
+    events = _read_events(_trace_path(tmp_path, 23))
+    runtime = next(event for event in events if event["name"] == "runtime")["payload"]
+    assert {name: runtime["environment"][name] for name in environment} == environment
+    assert runtime["package_versions"] == {
+        "flash-attn": None,
+        "mamba-ssm": "mamba-ssm-version",
+        "transformer-engine": "transformer-engine-version",
+        "triton": "triton-version",
+    }
 
 
 def test_trace_hashes_size_one_zero_stride_tensor(tmp_path):
