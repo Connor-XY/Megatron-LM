@@ -495,6 +495,12 @@ small set of reductions and dispatch choices. They are fully enumerated in
   artifact retention, same-mode failure gate, and nsys-only diagnostic policy.
   They also exposed and fixed the empty-array Bash 3.2 failure in the single-run
   launcher and collective AVG inherited by the deterministic Llama wrappers.
+  Bridge commit `e09d3ef6` adds the separate allocation-internal certificate
+  harness required by the scale gate. It executes two non-profiled runs
+  sequentially, requires exact node/rank placement, normalizes and compares
+  resolved configs, invokes the strict metric comparator, and retains source,
+  allocation, placement, config, log, accounting, and hash evidence. Its four
+  fail-closed contract cases pass on both macOS and AWS-CMH Linux.
 
   HSG job `3616801` then qualified the full recipe for 50 steps: two
   deterministic, non-profiled launches ran sequentially on the same
@@ -521,8 +527,9 @@ small set of reductions and dispatch choices. They are fully enumerated in
    Bridge commit `5793e80a` propagates
    `reduce_scatter_hierarchical_group_size` into MCore process-group
    initialization; commits `7ef03732` and `23e7fc8c` align Bridge validation,
-   environment setup, and the Ultra launchers with that certified MCore path.
-   The remaining scale gate should repeat the same two
+   environment setup, and the Ultra launchers with that certified MCore path,
+   while `e09d3ef6` checks in the allocation-internal certificate harness. The
+   remaining scale gate should use that harness to repeat the same two
    deterministic, non-profiled jobs sequentially in one allocation, compare all
    50 iterations with `compare_training_logs.py`, and retain both logs, both
    resolved configs, the comparison JSON, source revisions, rank-to-host
