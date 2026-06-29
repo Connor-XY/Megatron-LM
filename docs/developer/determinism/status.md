@@ -300,7 +300,12 @@ small set of reductions and dispatch choices. They are fully enumerated in
   `COMPLETED 0:0` (console SHA256 `32c8d9751876…`, evidence-manifest SHA256
   `022414bbd4c2…`).
   `tools/determinism/compare_traces.py` aligns rank traces by semantic event
-  identity instead of PP/VPP arrival order. `certify_traces.py` additionally
+  identity instead of PP/VPP arrival order. It now orders differences within a
+  rank by the earliest recorded local sequence and reports both left/right
+  sequence numbers, so lexical event names cannot hide an earlier causal
+  boundary. AWS-CMH job `721836` passed all 17 comparator/certifier tests on
+  each of four ranks with every Slurm step `COMPLETED 0:0` (console SHA256
+  `b70cda722423…`, sbatch SHA256 `513c34d7c5f2…`). `certify_traces.py` additionally
   enforces rank/iteration coverage, deterministic runtime state, recompute
   identity, completed collective hashes, zero pending collectives, requested
   semantic surfaces, and ordered DP accumulation before comparing two trees. It

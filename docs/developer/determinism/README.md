@@ -169,7 +169,12 @@ python tools/determinism/compare_traces.py \
 ```
 
 Exit codes match `compare_dumps.py`: 0 is a match, 1 is a divergence, and 2 is
-invalid input. Use `--json` for automation. The current integration covers the
+invalid input. Use `--json` for automation. Matching remains independent of
+cross-kind arrival order, but differences within each rank trace are reported
+by the earliest local event sequence present on either side. Human and JSON
+reports include the left/right sequence numbers, so the first displayed
+difference is a causal boundary rather than the lexically first event name.
+The current integration covers the
 Megatron tensor-parallel and Transformer Engine activation-checkpoint
 implementations, output-discarding checkpoint recomputation, optimizer
 inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, pipeline

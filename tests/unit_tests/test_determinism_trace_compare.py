@@ -68,6 +68,30 @@ def test_reports_first_semantic_event_value_difference(tmp_path):
     assert "name=optimizer.end" in divergence["event"]
 
 
+def test_reports_differences_in_local_trace_sequence_order(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    early_left = _event(0, "z-early", {"hash": "left-early"})
+    early_right = _event(0, "z-early", {"hash": "right-early"})
+    late_left = _event(1, "a-late", {"grad_norm": 1.0})
+    late_right = _event(1, "a-late", {"grad_norm": 2.0})
+    early_left["kind"] = early_right["kind"] = "tensor"
+    late_left["kind"] = late_right["kind"] = "optimizer"
+    _write_trace(left, [early_left, late_left])
+    _write_trace(right, [early_right, late_right])
+
+    report = compare_trace_paths(left, right)
+
+    assert [divergence["left_event"]["name"] for divergence in report["divergences"]] == [
+        "z-early",
+        "a-late",
+    ]
+    assert [
+        (divergence["left_sequence"], divergence["right_sequence"])
+        for divergence in report["divergences"]
+    ] == [(0, 0), (1, 1)]
+
+
 def test_reports_missing_rank_trace(tmp_path):
     left = tmp_path / "left"
     right = tmp_path / "right"

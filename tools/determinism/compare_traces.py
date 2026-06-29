@@ -54,7 +54,7 @@ def _load_events(path: Path) -> dict[str, dict[str, Any]]:
                     f"Unsupported schema version in {path}:{line_number}: "
                     f"{event.get('schema_version')!r}"
                 )
-            required = ("iteration", "rank", "kind", "name", "payload")
+            required = ("sequence", "iteration", "rank", "kind", "name", "payload")
             missing = [key for key in required if key not in event]
             if missing:
                 raise ValueError(f"Missing keys in {path}:{line_number}: {', '.join(missing)}")
@@ -81,12 +81,15 @@ def _load_events(path: Path) -> dict[str, dict[str, Any]]:
                 )
             )
             events[semantic_key] = {
-                "schema_version": event["schema_version"],
-                "iteration": event["iteration"],
-                "rank": event["rank"],
-                "kind": event["kind"],
-                "name": event["name"],
-                "payload": event["payload"],
+                "sequence": event["sequence"],
+                "event": {
+                    "schema_version": event["schema_version"],
+                    "iteration": event["iteration"],
+                    "rank": event["rank"],
+                    "kind": event["kind"],
+                    "name": event["name"],
+                    "payload": event["payload"],
+                },
             }
     return events
 
@@ -128,27 +131,48 @@ def compare_trace_paths(
         report["matched_files"] += 1
         left_events = _load_events(left_files[relative_path])
         right_events = _load_events(right_files[relative_path])
-        all_events = sorted(set(left_events) | set(right_events), key=_natural_key)
+
+        def event_order(event_key: str) -> tuple:
+            sequences = [
+                events[event_key]["sequence"]
+                for events in (left_events, right_events)
+                if event_key in events
+            ]
+            return (min(sequences), _natural_key(event_key))
+
+        all_events = sorted(set(left_events) | set(right_events), key=event_order)
         for event_key in all_events:
             if event_key not in left_events:
                 add_divergence(
-                    {"file": relative_path, "event": event_key, "reason": "event_missing_left"}
+                    {
+                        "file": relative_path,
+                        "event": event_key,
+                        "reason": "event_missing_left",
+                        "right_sequence": right_events[event_key]["sequence"],
+                    }
                 )
                 continue
             if event_key not in right_events:
                 add_divergence(
-                    {"file": relative_path, "event": event_key, "reason": "event_missing_right"}
+                    {
+                        "file": relative_path,
+                        "event": event_key,
+                        "reason": "event_missing_right",
+                        "left_sequence": left_events[event_key]["sequence"],
+                    }
                 )
                 continue
             report["events_compared"] += 1
-            if left_events[event_key] != right_events[event_key]:
+            if left_events[event_key]["event"] != right_events[event_key]["event"]:
                 add_divergence(
                     {
                         "file": relative_path,
                         "event": event_key,
                         "reason": "event_values",
-                        "left_event": left_events[event_key],
-                        "right_event": right_events[event_key],
+                        "left_sequence": left_events[event_key]["sequence"],
+                        "right_sequence": right_events[event_key]["sequence"],
+                        "left_event": left_events[event_key]["event"],
+                        "right_event": right_events[event_key]["event"],
                     }
                 )
     return report
@@ -171,6 +195,12 @@ def _print_human_report(report: dict) -> None:
             location += f" :: {divergence['event']}"
         print(f"{index}. {location}")
         print(f"   reason: {divergence['reason']}")
+        if "left_sequence" in divergence or "right_sequence" in divergence:
+            print(
+                "   local sequence: "
+                f"left={divergence.get('left_sequence', 'missing')} "
+                f"right={divergence.get('right_sequence', 'missing')}"
+            )
 
 
 def _build_parser() -> argparse.ArgumentParser:
