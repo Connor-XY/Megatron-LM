@@ -317,6 +317,12 @@ small set of reductions and dispatch choices. They are fully enumerated in
   `empty_like` (14.0%), `_to_copy` (12.0%), and `zeros` (8.6%), showing that the
   aggregate fill delta is distributed rather than one removable allocation.
   AWS-DFW job `522195` passes all six attribution-tool tests.
+  Kernel attribution on the retained AWS-CMH `699916` SQLite pair then maps 32
+  nested CE-backward ranges to 160/128 unique deterministic/native launches.
+  It identifies `_cross_entropy_backward` only in deterministic mode and two
+  index-elementwise kernel identities only in native mode; report SHA256 values
+  are `9187b0e27912…` and `66ed6e4a937f…`. The final eight-test suite passes in
+  HSG job `3632378` (`COMPLETED 0:0`; log SHA256 `2b5a417d25c4…`).
   Fresh dense profiles on HSG GB200 (`3614788`) and AWS-CMH GB300 (`699350`)
   then exposed a batch-2 vocab-CE fallback: deterministic CE backward was
   17.808 and 18.713 ms, respectively. With direct 2D-strided gradient loads,
@@ -535,8 +541,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
    outputs, pipeline P2P sends/receives, DP gradient reduction, and distributed-
    optimizer parameter gather, synchronous TP mapping reduction/gather payloads,
    core TP linear synchronous/async collective payloads, and opt-in local
-   optimizer parameters and moment state. TP userbuffer payloads, TE FP8/FP4
-   recompute, and actual selected kernel identities are still missing. Native
+   optimizer parameters and moment state. Nsight SQLite attribution now maps
+   selected NVTX ranges to the exact causally launched CUDA kernel identities,
+   deduplicating launches covered by nested ranges. TP userbuffer payloads, TE
+   FP8/FP4 recompute, and in-process kernel selection are still missing. Native
    floating-point TP reductions and the non-distributed-optimizer DP all-reduce
    also lack topology-independent paths.
 

@@ -134,9 +134,11 @@ P2P sends/receives, DP all-reduce/reduce-scatter, and distributed-optimizer
 parameter all-gather, synchronous TP mapping all-reduce/all-gather/
 reduce-scatter, core TP linear synchronous/async collectives, plus opt-in local
 optimizer main parameters and moment state. TP userbuffer payloads, TE FP8/FP4
-recompute, and actual selected kernel identities remain follow-up
-instrumentation surfaces. Native floating-point TP SUM ordering remains a
-determinism-path gap even though its payload is now observable.
+recompute, and in-process kernel selection remain follow-up instrumentation
+surfaces. Actual kernel identities from a captured iteration can be recovered
+from an Nsight Systems SQLite export with `attribute_nsys_ranges.py --kernels`.
+Native floating-point TP SUM ordering remains a determinism-path gap even though
+its payload is now observable.
 
 For a scaled model run, use the stricter certifier instead of relying on a trace
 comparison alone:
@@ -238,6 +240,23 @@ python tools/determinism/attribute_nsys_ranges.py \
 are removed before grouping, so repeated invocations share one row. Every
 matched range contributes to exactly one group; unlike nested parent durations,
 the grouped matched durations can be compared and summed.
+
+To identify the CUDA kernels actually launched by a matching NVTX range, join
+the contained same-thread CUDA runtime calls to GPU activities by Nsight process
+and correlation ID:
+
+```bash
+python tools/determinism/attribute_nsys_ranges.py \
+  /shared/profiles/nemotron-rank0.sqlite \
+  '_VocabParallelCrossEntropyBackward' \
+  --kernels --top 20
+```
+
+This reports exact demangled kernel identities, launch counts, stream IDs, and
+the matching canonical NVTX ranges. A launch covered by nested matching ranges
+is counted once. Reported kernel durations are summed GPU activity time; kernels
+on different streams can overlap, so the total is attribution evidence rather
+than wall-clock step time. Use `--json` to retain the machine-readable report.
 
 ## Benchmark the deterministic data-parallel reduction
 
