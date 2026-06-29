@@ -85,6 +85,24 @@ class _HierarchicalReduceScatterWithFP32AccumulationWorkHandle:
         self.local_recv = None
 
 
+class _SingleRankReduceScatterWorkHandle:
+    """Preserve the async wait contract for an identity reduce-scatter."""
+
+    def __init__(self, completion_event: torch.cuda.Event | None):
+        self.completion_event = completion_event
+
+    def wait(self):
+        """Make the current stream wait for an earlier asynchronous device copy, if any."""
+        if self.completion_event is not None:
+            self.completion_event.wait()
+            self.completion_event = None
+
+
+def _native_two_rank_reduce_scatter_is_exact(input_tensor: torch.Tensor, world_size: int) -> bool:
+    """Return whether native two-rank SUM preserves this helper's fp32-accumulation result."""
+    return world_size == 2 and input_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+
 def reduce_scatter_with_fp32_accumulation(
     output_tensor: torch.Tensor,
     input_tensor: torch.Tensor,
@@ -97,8 +115,11 @@ def reduce_scatter_with_fp32_accumulation(
 ):
     """Reduce-scatter with FP32 accumulation.
 
-    Collects input_tensor in lower precision using an all-to-all, then locally accumulates in FP32
-    precision, then downcasts the final sum into output_tensor.
+    A one-rank reduction is the identity. A two-rank reduction has exactly one addition per output
+    element, so the native collective is already independent of physical topology and produces
+    the same rounded output as adding the two lower-precision inputs in FP32 before downcasting.
+    Larger flat groups collect input_tensor with an all-to-all and then accumulate in FP32
+    precision before downcasting the final sum into output_tensor.
 
 
     Args:
@@ -122,6 +143,30 @@ def reduce_scatter_with_fp32_accumulation(
 
     # Make sure input_tensor size is divisible by world size.
     assert input_tensor.numel() % world_size == 0
+    assert output_tensor.numel() == input_tensor.numel() // world_size
+
+    if world_size == 1:
+        # A one-rank reduce-scatter is the identity. Production distributed-optimizer output is a
+        # view of the input buffer, so this normally avoids every kernel and allocation. Keep the
+        # general helper correct for distinct tensors and preserve cross-stream async semantics.
+        completion_event = None
+        if not output_tensor.is_set_to(input_tensor):
+            output_tensor.copy_(input_tensor.view_as(output_tensor))
+            if async_op and output_tensor.is_cuda:
+                completion_event = torch.cuda.Event()
+                completion_event.record()
+        if async_op:
+            return _SingleRankReduceScatterWorkHandle(completion_event)
+        return None
+
+    if _native_two_rank_reduce_scatter_is_exact(input_tensor, world_size):
+        # With two ranks each output element has exactly two operands, hence one addition. There
+        # is no reduction-tree order for the physical topology to change. The native path also
+        # preserves the original synchronous/asynchronous return contract while avoiding the
+        # all-to-all receive buffer and explicit local reduction.
+        return torch.distributed.reduce_scatter_tensor(
+            output_tensor, input_tensor, op=op, group=group, async_op=async_op
+        )
 
     if hierarchical_groups is not None:
         local_group, inter_group = hierarchical_groups

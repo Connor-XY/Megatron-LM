@@ -35,7 +35,10 @@ from ..fp8_utils import (
 from ..optimizer.param_layout import pad_bucket_end, pad_param_start
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
+from .reduce_scatter_with_fp32_accumulation import (
+    _native_two_rank_reduce_scatter_is_exact,
+    reduce_scatter_with_fp32_accumulation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -712,11 +715,31 @@ class _ParamAndGradBucketGroup:
         else:
             communication_group = self.data_parallel_group
 
-        # Coalesce communication kernels across buckets in the bucket group.
+        # Coalesce communication kernels across buckets in the bucket group. Custom work handles
+        # must remain directly waitable; native reduce-scatter returns an IllegalWork placeholder
+        # when launched inside PyTorch's coalescing manager.
         grad_reduce_handle = None
+        exact_small_group_reduce_scatter = (
+            self.ddp_config.use_distributed_optimizer
+            and self.ddp_config.reduce_scatter_with_fp32_accumulation
+            and (
+                communication_group.size() == 1
+                or all(
+                    _native_two_rank_reduce_scatter_is_exact(
+                        bucket.grad_data, communication_group.size()
+                    )
+                    for bucket in self.buckets
+                )
+            )
+            and not force_all_reduce
+        )
         coalescing_context = (
             nullcontext()
-            if self.hierarchical_reduce_scatter_groups is not None and not force_all_reduce
+            if (
+                self.hierarchical_reduce_scatter_groups is not None
+                or exact_small_group_reduce_scatter
+            )
+            and not force_all_reduce
             else _coalescing_manager(communication_group, async_ops=async_op)
         )
         with stream_context, coalescing_context as cm:
@@ -729,6 +752,18 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+                    if not self.ddp_config.reduce_scatter_with_fp32_accumulation:
+                        reduce_scatter_implementation = "native"
+                    elif communication_group.size() == 1:
+                        reduce_scatter_implementation = "single_rank_identity"
+                    elif _native_two_rank_reduce_scatter_is_exact(
+                        bucket.grad_data, communication_group.size()
+                    ):
+                        reduce_scatter_implementation = "native_two_rank_exact"
+                    elif self.hierarchical_reduce_scatter_groups is not None:
+                        reduce_scatter_implementation = "hierarchical_fixed_rank_fp32"
+                    else:
+                        reduce_scatter_implementation = "fixed_rank_fp32"
                     self._trace_bucket_collective(
                         self._grad_reduce_trace_results,
                         "data_parallel.grad_reduce",
@@ -743,6 +778,7 @@ class _ParamAndGradBucketGroup:
                         hierarchical_fp32_accumulation=(
                             self.hierarchical_reduce_scatter_groups is not None
                         ),
+                        implementation=reduce_scatter_implementation,
                         reduce_op=str(reduce_op),
                     )
                     reduce_scatter_func = (
