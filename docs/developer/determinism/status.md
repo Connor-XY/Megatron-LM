@@ -244,7 +244,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
   identity instead of PP/VPP arrival order. `certify_traces.py` additionally
   enforces rank/iteration coverage, deterministic runtime state, recompute
   identity, completed collective hashes, zero pending collectives, requested
-  semantic surfaces, and ordered DP accumulation before comparing two trees.
+  semantic surfaces, and ordered DP accumulation before comparing two trees. It
+  rejects unsupported/incomplete schemas, mixed per-file identities, sequence
+  gaps, malformed runtime/iteration boundaries, explicit iteration errors, and
+  unmatched collective begin/end events. The hardened certifier replayed the
+  retained weekly DSV3 and Nemotron trees without changing their verdicts:
+  6,080/6,080 and 9,664/9,664 events remain exact, respectively. HSG job
+  `3617620` passed all 16 final-source certifier/comparator tests (log SHA256
+  `cfe1b0944ee6…`).
   The final 22-test focused suite
   passed on every rank in AWS-DFW GB200 job `517022`, AWS-CMH GB300 job `696943`,
   and Draco H100 job `10430851`. Two independent DSV3-style TP2×EP2 launches
@@ -439,7 +446,7 @@ small set of reductions and dispatch choices. They are fully enumerated in
   only 0.61–0.69× as fast. The source remains `weight[masked_input]`; the older
   dense/Hopper `IndexBackward0` hotspot should be refreshed before another
   implementation is attempted.
-- **Full Megatron-Bridge evidence (not yet a gate):** branch
+- **Full Megatron-Bridge evidence (96-GPU qualification complete):** branch
   `zhiyul/nemotron-3-ultra-perf-recipe` records exact 96-GPU results across eight
   allocations, 5/7 exact 192-GPU trials, and a 3,072-GPU det+nsys versus
   det-without-nsys divergence from iteration 3. The latter lacks a same-mode
@@ -457,18 +464,34 @@ small set of reductions and dispatch choices. They are fully enumerated in
   retained logs produced the exact report above. Current MCore also exposed a
   Bridge integration gap: its DDP config sets the logical hierarchical group
   size, but Bridge did not pass that value into
-  `initialize_model_parallel`. A minimal verification-only Bridge patch was
-  required to create the hierarchy. The remaining deliverable is a clean
-  50-step weekly gate and dashboard on the current MCore commit.
+  `initialize_model_parallel`. Bridge commit `fc23554a` now propagates that
+  value and creates the requested fixed logical hierarchy.
+
+  HSG job `3616801` then qualified the full recipe for 50 steps: two
+  deterministic, non-profiled launches ran sequentially on the same
+  24-node/96-GPU allocation and every Slurm record, including both hour-long
+  training steps and the top-level batch, completed `0:0`. The strict comparator
+  matched all 50 iterations and all 600 nonvolatile serialized metric values
+  (12 per iteration; report SHA256 `2674e83f9f63…`). The configs are deeply
+  identical after removing only `logger.save_config_filepath`; placement covers
+  ranks 0–95 exactly, four per host across the retained 24-node list. Both runs
+  report zero skipped and zero NaN iterations. Source revisions, deterministic
+  environment, configs, logs, comparison, placement, and their hashes are
+  retained under `bridge-ultra-current/pair-3616801/`. The only log noise is
+  three/five TCPStore watchdog warnings during post-training process cleanup,
+  after iteration 50; there are no rank errors or tracebacks. This is a clean
+  qualification artifact, but the full Bridge recipe still needs a checked-in
+  weekly schedule/dashboard and same-mode controls at 192 and 3,072 GPUs.
 
 ## 8. Known gaps (feeding the roadmap)
 
 1. **Full Bridge evidence is not yet CI-gated.** The checked-in weekly L3 GB200
    rows retain strict EP32 MCore certificates for both model proxies, but the
-   full Bridge recipe has only a five-step same-allocation 96-GPU smoke, not a
-   clean 50-step weekly gate or a same-mode control at 192/3,072 GPUs. Bridge
-   must also propagate `reduce_scatter_hierarchical_group_size` into MCore
-   process-group initialization. The scale gate should run two
+   full Bridge recipe's clean 50-step same-allocation 96-GPU qualification is a
+   retained cluster artifact, not yet a checked-in weekly schedule/dashboard.
+   Bridge commit `fc23554a` propagates
+   `reduce_scatter_hierarchical_group_size` into MCore process-group
+   initialization. The remaining scale gate should repeat the same two
    deterministic, non-profiled jobs sequentially in one allocation, compare all
    50 iterations with `compare_training_logs.py`, and retain both logs, both
    resolved configs, the comparison JSON, source revisions, rank-to-host
