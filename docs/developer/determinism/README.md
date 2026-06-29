@@ -19,6 +19,30 @@ foundation artifact for the determinism roadmap (validation, performance, toolin
    (det? / det path / non-det path / how selected / evidence / perf Δ / gap), plus
    the perf hotspot priority list and the verification backlog.
 
+## Audit source candidates for the operation catalog
+
+Run the zero-dependency AST audit after changing collective, routing, indexing,
+or sorting code:
+
+```bash
+python tools/determinism/audit_sensitive_ops.py megatron
+python tools/determinism/audit_sensitive_ops.py megatron \
+  --category floating_collective_reduction --json
+```
+
+The report is stable by file, line, column, and enclosing class/function. It
+resolves common `torch.distributed` import aliases and separates floating
+collective reductions, rank-indexed permutation collectives, indexed
+reductions, indexed writes/gathers, ordering operations, and explicit
+determinism-control calls. Repeat `--category` to select multiple classes and
+`--exclude` to omit a source-root-relative glob.
+
+This is a candidate inventory, not a determinism verdict: whether a call is on
+the training path, has unique indices, reduces integer-valued data, or is
+protected by a deterministic branch still requires code/runtime analysis. Use
+the audit to find missing catalog rows, then record the classification and
+evidence in [`op-catalog.md`](./op-catalog.md).
+
 ## Locate the first difference in existing training dumps
 
 Megatron can already save named activations, parameters, wgrads, and dgrads from

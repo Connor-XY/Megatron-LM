@@ -306,6 +306,18 @@ small set of reductions and dispatch choices. They are fully enumerated in
   real CUDA/TE autograd checkpoint and output-discarding recompute; every Slurm
   step completed `0:0` (log SHA256 `0cbe18944114…`, source-manifest SHA256
   `55657144c167…`).
+- **Static sensitive-operation audit (added):**
+  `tools/determinism/audit_sensitive_ops.py` parses the source without importing
+  Megatron and emits stable file/function candidates for floating collective
+  reductions, rank-indexed collectives, indexed reductions/writes, ordering
+  operations, and determinism controls. It is deliberately a review queue, not
+  an automatic verdict; the audit exposed the previously conflated
+  Megatron-FSDP reduction surface. AWS-CMH job `719179` passed all three
+  focused tests and audited a clean source snapshot into 318 candidates (82
+  floating reductions, 79 rank-indexed collectives, 12 indexed reductions, 74
+  indexed writes/gathers, 59 ordering calls, and 12 controls); every Slurm step
+  completed `0:0` (report SHA256 `c06b713309ba…`, evidence-manifest SHA256
+  `7c984304b982…`).
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by

@@ -19,6 +19,13 @@ on a real recipe, and the determinism verdict from one of:
 - **test** — confirmed by `BitExactRunner` (toggle `deterministic_mode`; same input
   must give bit-identical out+grad). Rows still needing this are marked **⚠ verify**.
 
+Before declaring the catalog complete, run
+`python tools/determinism/audit_sensitive_ops.py megatron`. The AST report is a
+review queue for collective reductions, indexed operations, ordering calls, and
+determinism controls; every training-path candidate needs either a row here or
+an explicit reason it is out of scope. The scanner intentionally does not infer
+a verdict.
+
 Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det branch ·
 🟡 conditional (verify) · 🔴 gap (no det path).
 
