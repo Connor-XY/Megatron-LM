@@ -69,8 +69,8 @@ def _reduce(input_, group, *, trace_name=None, trace_phase=None, determinism_tra
     collective_input = input_.contiguous()
     torch.distributed.all_reduce(collective_input, group=group)
 
-    record_collective_result(trace_handle, input_)
-    return input_
+    record_collective_result(trace_handle, collective_input)
+    return collective_input
 
 
 def _split_along_last_dim(input_, group):

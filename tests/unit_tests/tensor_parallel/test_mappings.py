@@ -51,6 +51,19 @@ def test_ReduceFromModelParallelRegion():
 
 
 @pytest.mark.internal
+def test_ReduceFromModelParallelRegion_noncontiguous_input():
+    Utils.initialize_model_parallel(4, 2)
+    input_data = torch.full((3, 2), Utils.rank, dtype=torch.float32, device="cuda").t()
+    assert not input_data.is_contiguous()
+
+    output_data = mappings.reduce_from_tensor_model_parallel_region(input_data)
+
+    group_sum = 22 if Utils.rank >= 4 else 6
+    assert torch.equal(output_data, torch.full_like(output_data, group_sum))
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
 def test_ScatterToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).cuda()
