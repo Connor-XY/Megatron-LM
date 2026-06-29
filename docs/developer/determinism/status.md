@@ -481,6 +481,21 @@ small set of reductions and dispatch choices. They are fully enumerated in
   Bridge process-group tests, including forwarding and unsupported-MCore
   coverage (log SHA256 `061fb09951f5…`).
 
+  Bridge commits `7ef03732` and `23e7fc8c` then close the remaining launcher
+  control-plane mismatch. Deterministic config validation rejects Tree NCCL,
+  multiple distributed-optimizer instances, and collective AVG; disables TP
+  overlap; and enables ordered fp32 reduce-scatter. The performance environment
+  also sets the two early Mamba controls. Both Ultra launchers now enter the
+  common deterministic override path, use the fixed four-rank DP hierarchy,
+  and disable Triton autotuning only in deterministic runs. AWS-CMH job
+  `718578` passed 5 config-safety, 1 environment-plugin, 2 deterministic-recipe,
+  and 4 dynamic launcher tests; every Slurm step completed `0:0` (log SHA256
+  `7660df732eda…`, manifest SHA256 `8a37a8ef86a2…`). The dynamic launcher tests
+  execute all four fake Slurm runs and prove the det/non-det config separation,
+  artifact retention, same-mode failure gate, and nsys-only diagnostic policy.
+  They also exposed and fixed the empty-array Bash 3.2 failure in the single-run
+  launcher and collective AVG inherited by the deterministic Llama wrappers.
+
   HSG job `3616801` then qualified the full recipe for 50 steps: two
   deterministic, non-profiled launches ran sequentially on the same
   24-node/96-GPU allocation and every Slurm record, including both hour-long
@@ -505,7 +520,9 @@ small set of reductions and dispatch choices. They are fully enumerated in
    retained cluster artifact, not yet a checked-in weekly schedule/dashboard.
    Bridge commit `5793e80a` propagates
    `reduce_scatter_hierarchical_group_size` into MCore process-group
-   initialization. The remaining scale gate should repeat the same two
+   initialization; commits `7ef03732` and `23e7fc8c` align Bridge validation,
+   environment setup, and the Ultra launchers with that certified MCore path.
+   The remaining scale gate should repeat the same two
    deterministic, non-profiled jobs sequentially in one allocation, compare all
    50 iterations with `compare_training_logs.py`, and retain both logs, both
    resolved configs, the comparison JSON, source revisions, rank-to-host
