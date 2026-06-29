@@ -10,9 +10,9 @@ orphan: true
 >
 > This page intentionally describes supported behavior, limitations, and the
 > evidence required for a claim. It does not contain cluster names, job IDs, or
-> artifact hashes. Maintainers can consult the
-> [internal validation evidence](./internal-evidence.md) ledger when they need
-> that provenance.
+> artifact hashes. The tracked [validation evidence](./validation-evidence.md)
+> page reports findings and conclusions; detailed run provenance remains only in
+> an ignored local record.
 
 ## Documentation boundaries
 
@@ -20,7 +20,7 @@ orphan: true
 | --- | --- | --- |
 | Training user | [Deterministic Training](../../user-guide/deterministic-training.md) | Enable the mode, understand its constraints, and validate a run. |
 | Developer | [training-path.md](./training-path.md) and [op-catalog.md](./op-catalog.md) | Follow the control flow and review deterministic versus ordinary operation paths. |
-| Maintainer / reviewer | [internal-evidence.md](./internal-evidence.md) | Inspect retained cluster provenance, measurements, certificates, and raw validation records. |
+| Maintainer / reviewer | [validation-evidence.md](./validation-evidence.md) | Review findings, limits, and the standard required for a determinism claim. |
 
 Acronyms used in the developer references are defined in the
 [glossary](./glossary.md).
@@ -79,8 +79,8 @@ priority over the lowest-latency native collective.
 
 Use the profiler workflow in the developer reference to measure a representative
 workload before changing a deterministic branch. Record the workload, software
-versions, and comparison method; raw run provenance belongs in the maintainer
-ledger, not this status page.
+versions, and comparison method; detailed run provenance is intentionally not
+tracked in this repository.
 
 ## Evidence policy
 
@@ -93,5 +93,5 @@ A determinism claim needs all of the following:
 4. A recorded performance comparison when the branch changes runtime cost.
 
 The [operation catalog](./op-catalog.md) records the required evidence by
-operation. The [internal validation evidence](./internal-evidence.md) ledger
-retains the detailed provenance for maintainers.
+operation. [Validation evidence](./validation-evidence.md) summarizes the
+findings and conclusions without retaining environment-specific provenance.

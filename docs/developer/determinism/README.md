@@ -9,9 +9,9 @@ orphan: true
 > launching training.
 >
 > Start with the [Deterministic Training user guide](../../user-guide/deterministic-training.md)
-> for supported setup and constraints. Cluster-specific provenance is kept out
-> of this reading path and retained in the
-> [maintainer evidence ledger](./internal-evidence.md).
+> for supported setup and constraints. The tracked documentation contains
+> conclusion-level evidence only; raw run provenance is deliberately local and
+> excluded from version control.
 
 ## Contents
 
@@ -25,8 +25,9 @@ orphan: true
    the perf hotspot priority list and the verification backlog.
 4. **[`glossary.md`](./glossary.md)** — expansion of the parallelism and kernel
    abbreviations used by the developer references.
-5. **[`internal-evidence.md`](./internal-evidence.md)** — maintainer-only cluster
-   records, job identifiers, artifact hashes, and historical measurements.
+5. **[`validation-evidence.md`](./validation-evidence.md)** — findings,
+   conclusions, limits, and the evidence standard. Raw provenance is retained
+   only in an ignored local record.
 
 ## Audit source candidates for the operation catalog
 
