@@ -60,7 +60,7 @@ Legend for the "Determinism" column:
 | Token permute (dispatch sort) | `moe_utils.py:299-431` (`argsort(stable=True)` + `index_select`, or fused TE permute) | 🟢 | Stable sort + gather is deterministic. |
 | EP all-to-all dispatch | `transformer/moe/token_dispatcher.py`, `tensor_parallel/mappings.py` | 🟢 | All-to-all is a rank-indexed permutation, not a floating-point reduction. EP32 traces certify exact dispatch/combine payloads when the inputs match. |
 | Grouped GEMM (expert FFN) | `extensions/transformer_engine.py` `TEGroupedLinear` | 🟡 | Forward deterministic; backward weight-grad accumulation order is the concern + a perf target (Longcat "optimized grouped GEMM"). |
-| Token unpermute (combine) | `moe_utils.py:513-531` | 🔵 | det: `index_add_` (CUDA-graph safe); non-det: `scatter_add_`. The post-change rank profile separates routing-probability scatter, vocab cross-entropy, and gather backward as distinct indexed-write costs; do not attribute the aggregate `index_put_` range to this combine branch. |
+| Token unpermute (combine) | `moe_utils.py`, `moe/ops/deterministic_index_select.py` | 🔵 | Dropless, unpadded deterministic A2A with top-k ≥4 and hidden ≥2,048 uses a fixed-order Triton segment sum and collision-free gather backward. It stably sorts the expert-major row map back into token order and downcasts after every addition to preserve `index_add_` rounding exactly. Unsupported shapes retain CUDA-graph-safe deterministic `index_add_`; normal mode uses `scatter_add_`. |
 | Router replay (optional) | `transformer/moe/router_replay.py` | 🟢 | Records top-k indices once and replays them — forces identical routing across runs (a determinism *tool*, not on the default path). |
 
 ### 1e. SSM / Mamba (hybrid models: nemotron-3-ultra)
@@ -89,7 +89,7 @@ Legend for the "Determinism" column:
 | TE attention backend + backward | TE, gated by `NVTE_ALLOW_NONDETERMINISTIC_ALGO` (`extensions/transformer_engine.py:1697`) | 🔵🟡 | TE filters Flash/Fused/Unfused backends by deterministic support. Dense dropout 0.1 selects deterministic Flash versus native fused because no deterministic fused backend supports that input; dropout 0 selects fused in both modes. Forcing one backend globally is therefore unsafe and shows no measured benefit. With both modes fixed to Flash, forward is neutral but deterministic Flash backward is +37.4%; with auto fused at dropout 0, deterministic fused backward is +24.7%. The remaining kernel optimization belongs in TE (Longcat "deterministic FAG" = independent accumulation buffers + global deterministic sum). |
 | LayerNorm/RMSNorm backward | TE / torch norm | 🟢 | PyTorch LayerNorm/RMSNorm fallback backward is bit-exact at hidden 128/2048 on H100 and GB200; TE norms are covered by the model proxies. |
 | Embedding backward | see 1a | 🔵 | det path = direct-index `index_put(accumulate=True)` (deterministic under `use_deterministic_algorithms`), not `F.embedding`'s atomic scatter. |
-| MoE unpermute/permute backward | see 1d | 🔵 | Mirror of forward `index_add_`/`scatter_add_` branch. |
+| MoE unpermute/permute backward | see 1d | 🔵 | The fast unpermute's custom backward is a collision-free row gather. Unsupported unpermute shapes retain PyTorch `IndexAddBackward`; the optimized token-permute backward independently uses the same fixed-order segment-sum kernel. |
 | Grouped-GEMM backward | TE `TEGroupedLinear` | 🟡 | wgrad accumulation order; perf target. |
 
 ## Stage 4 — Gradient reduction (DP / FSDP)

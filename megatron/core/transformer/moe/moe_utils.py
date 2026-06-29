@@ -22,7 +22,10 @@ from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_para
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
-from megatron.core.transformer.moe.ops.deterministic_index_select import deterministic_index_select
+from megatron.core.transformer.moe.ops.deterministic_index_select import (
+    deterministic_index_select,
+    deterministic_unpermute,
+)
 from megatron.core.transformer.moe.ops.deterministic_routing import (
     deterministic_routing_probs_and_map,
 )
@@ -455,6 +458,7 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    dropless_topk: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -480,6 +484,9 @@ def unpermute(
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
             and is required when unpermuting padded outputs. Defaults to None.
+        dropless_topk (int, optional): The uniform number of experts selected per token.
+            Enables an optimized fixed-order segment sum when every output token occurs
+            exactly this many times. Defaults to None.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
@@ -527,22 +534,36 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+    deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
+    use_fixed_order_segment_sum = (
+        deterministic_algorithms
+        and dropless_topk is not None
+        and dropless_topk >= 4
+        and hidden >= 2048
+        and not drop_and_pad
     )
-    if torch.are_deterministic_algorithms_enabled():
-        # index_add accumulates into the already-zeroed output_tokens above; it is
-        # deterministic when torch.use_deterministic_algorithms(True) is set and is
-        # CUDA graph compatible unlike scatter_add. The allocation above already
-        # covers both branches, so a second torch.zeros would redundantly allocate
-        # and fill the destination in deterministic mode.
-        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
-    else:
-        # Scatter add the permuted_input back to the original positions
-        output_tokens.scatter_add_(
-            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+    if use_fixed_order_segment_sum:
+        assert dropless_topk is not None
+        output_tokens = deterministic_unpermute(
+            permuted_tokens, sorted_indices, num_tokens=restore_shape[0], topk=dropless_topk
         )
+    else:
+        # Create an output tensor filled with zeros.
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        if deterministic_algorithms:
+            # index_add accumulates into the already-zeroed output_tokens above; it is
+            # deterministic when torch.use_deterministic_algorithms(True) is set and is
+            # CUDA graph compatible unlike scatter_add. The allocation above already
+            # covers both branches, so a second torch.zeros would redundantly allocate
+            # and fill the destination in deterministic mode.
+            output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+        else:
+            # Scatter add the permuted_input back to the original positions
+            output_tokens.scatter_add_(
+                0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+            )
     return output_tokens.to(dtype=input_dtype)
 
 

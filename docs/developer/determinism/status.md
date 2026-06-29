@@ -144,8 +144,16 @@ The kernel-level determinism surface in `megatron/core` is concentrated in a
 small set of reductions and dispatch choices. They are fully enumerated in
 [`op-catalog.md`](./op-catalog.md); the load-bearing ones:
 
-- **MoE unpermute** (`moe_utils.py:517`): `index_add_` (det, CUDA-graph safe) vs
-  `scatter_add_` (fast).
+- **MoE unpermute** (`moe_utils.py`,
+  `moe/ops/deterministic_index_select.py`): dropless, unpadded deterministic A2A
+  with top-k ≥4 and hidden ≥2,048 uses a fixed-order Triton segment sum with a
+  collision-free gather backward;
+  unsupported shapes retain deterministic `index_add_`, and normal mode uses
+  `scatter_add_`. The optimized path is CUDA-graph safe and exactly preserves
+  the former accumulation order. GB200 job `539787` measures a 1.63–4.48×
+  isolated speedup with 42–47% lower peak allocation; H100 profile `10478093`
+  passes the 1.25× step gate, and final EP32 job `539876` remains byte-exact
+  against the pre-optimization DeepSeek-V3 and Nemotron traces.
 - **MoE routing map/probs** (`moe_utils.py`,
   `moe/ops/deterministic_routing.py`): deterministic mode uses one row-wise
   Triton kernel to initialize dense probabilities and the boolean map and write

@@ -878,6 +878,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            # The matching pre-A2A permutation contains exactly topk rows per token
+            # only for dropless, unpadded routing.
+            dropless_topk=(
+                self.config.moe_router_topk
+                if self.config.moe_expert_capacity_factor is None
+                and not self.config.moe_router_padding_for_quantization
+                else None
+            ),
         )
 
         # Reshape the output tensor

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Deterministic backward for dropless MoE token permutation."""
+"""Fixed-order token reductions for deterministic dropless MoE."""
 
 from unittest.mock import MagicMock
 
@@ -78,6 +78,37 @@ class _DeterministicIndexSelect(torch.autograd.Function):
         return grad_input, None, None
 
 
+class _DeterministicUnpermute(torch.autograd.Function):
+    """Unpermute uniform-topk tokens with a fixed-order segment sum."""
+
+    @staticmethod
+    def forward(
+        ctx, input_: torch.Tensor, indices: torch.Tensor, num_tokens: int, topk: int
+    ) -> torch.Tensor:
+        ctx.save_for_backward(indices)
+        input_ = input_.contiguous()
+        hidden_size = input_.shape[1]
+        inverse_indices = torch.argsort(indices, stable=True)
+        output = torch.empty((num_tokens, hidden_size), dtype=input_.dtype, device=input_.device)
+        block_size = 512
+        grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+        _fixed_order_index_select_backward[grid](
+            input_,
+            inverse_indices,
+            output,
+            hidden_size=hidden_size,
+            topk=topk,
+            block_size=block_size,
+            num_warps=4,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (indices,) = ctx.saved_tensors
+        return grad_output.index_select(0, indices), None, None, None
+
+
 def deterministic_index_select(
     input_: torch.Tensor, indices: torch.Tensor, topk: int
 ) -> torch.Tensor:
@@ -112,4 +143,40 @@ def deterministic_index_select(
     return _DeterministicIndexSelect.apply(input_, indices, topk)
 
 
-__all__ = ["HAVE_TRITON", "deterministic_index_select"]
+def deterministic_unpermute(
+    input_: torch.Tensor, indices: torch.Tensor, num_tokens: int, topk: int
+) -> torch.Tensor:
+    """Sum uniform-topk token rows in stable input order.
+
+    ``indices`` maps each input row to an output token. The fast path is valid
+    when every output token occurs exactly ``topk`` times, as it does for the
+    first unpermutation in dropless MoE. Unsupported environments retain the
+    deterministic PyTorch ``index_add_`` path.
+    """
+    if input_.dim() != 2 or indices.dim() != 1:
+        raise ValueError(
+            f"Expected a 2D input and 1D indices, got {input_.shape=} and {indices.shape=}"
+        )
+    if num_tokens < 1:
+        raise ValueError(f"Expected num_tokens >= 1, got {num_tokens}")
+    if topk < 1:
+        raise ValueError(f"Expected topk >= 1, got {topk}")
+
+    expected_indices = num_tokens * topk
+    if input_.shape[0] != expected_indices or indices.numel() != expected_indices:
+        raise ValueError(
+            f"Expected {expected_indices} input rows and indices for dropless topk={topk}, "
+            f"got {input_.shape[0]} rows and {indices.numel()} indices"
+        )
+
+    supported_dtype = input_.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    if not (HAVE_TRITON and input_.is_cuda and supported_dtype):
+        output = torch.zeros(
+            (num_tokens, input_.shape[1]), dtype=input_.dtype, device=input_.device
+        )
+        output.index_add_(0, indices, input_)
+        return output
+    return _DeterministicUnpermute.apply(input_, indices, num_tokens, topk)
+
+
+__all__ = ["HAVE_TRITON", "deterministic_index_select", "deterministic_unpermute"]
