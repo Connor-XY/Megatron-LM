@@ -217,9 +217,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
   fail-closed MCore and Bridge validation tests passed in AWS-CMH job `719072`
   (`COMPLETED 0:0`; console SHA256 `1cb105e7ecf0…`, evidence-manifest SHA256
   `47638ad5d151…`).
-- **TE attention** (`extensions/transformer_engine.py:1697`): asserts
+- **TE attention** (`extensions/transformer_engine.py`): asserts
   `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` when `deterministic_mode` is on, then TE
   filters Flash/Fused/Unfused backends by input-specific deterministic support.
+  The opt-in structured trace records the backend/sub-backend selected after a
+  real TE forward, plus configured selector, layer, forward/recompute phase,
+  mask, QKV layout, and tensor metadata. A version-incompatible private
+  diagnostic state emits `te.attention.backend.unavailable` instead of guessing.
   The backend must not be globally forced: dropout, layout, dtype, mask, and
   architecture change which deterministic kernels are eligible.
 - **Inference/RL scheduling** (`dynamic_engine.py:607`,
@@ -278,7 +282,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
   divergence without adding communication. Megatron and Transformer Engine
   activation checkpointing plus `CheckpointWithoutOutput` record paired
   forward/recompute fingerprints and report their within-run identity. The
-  shared MoE all-to-all wrapper records semantically named
+  TE attention wrapper records the actual selected backend/sub-backend after
+  each traced forward and emits a separate unavailable event when the installed
+  TE diagnostic contract cannot be read. The shared MoE all-to-all wrapper
+  records semantically named
   dispatch/combine inputs and outputs in original forward, activation
   recompute, and backward. Pipeline P2P tracing records sends and completed
   receives at the schedule's existing synchronous, batched, or overlapped wait
@@ -308,7 +315,8 @@ small set of reductions and dispatch choices. They are fully enumerated in
   `b70cda722423…`, sbatch SHA256 `513c34d7c5f2…`). `certify_traces.py` additionally
   enforces rank/iteration coverage, deterministic runtime state, recompute
   identity, completed collective hashes, zero pending collectives, requested
-  semantic surfaces, and ordered DP accumulation before comparing two trees. It
+  semantic event/collective surfaces, actual TE backend visibility, and ordered
+  DP accumulation before comparing two trees. It
   rejects unsupported/incomplete schemas, mixed per-file identities, sequence
   gaps, malformed runtime/iteration boundaries, explicit iteration errors, and
   unmatched collective begin/end events. The hardened certifier replayed the
@@ -469,9 +477,35 @@ small set of reductions and dispatch choices. They are fully enumerated in
   overlap. DSV3 EP32 jobs `520170`/`520203` matched 6,080/6,080 events across
   independent allocations; Nemotron EP32 jobs `520171`/`520204` matched
   9,664/9,664. The strict reports require the hierarchical fp32 path for every
-  multi-rank DP reduction and report zero missing reductions, zero pending
-  collectives, and zero semantic divergences. Single-rank expert-DP reductions
-  remain on the flat path because they perform no inter-rank reduction.
+  DP reduction larger than two ranks and report zero missing reductions, zero
+  pending collectives, and zero semantic divergences. Groups of at most two do
+  not need a hierarchy because they contain at most one floating-point addition.
+- **Small-group target-topology and TE-backend certification:** AWS-CMH jobs `723347`
+  and `723417` independently certify the native two-rank reduce-scatter path at
+  TP2×EP16. DSV3 matches 12,864/12,864 events and Nemotron matches
+  17,984/17,984 both within and across allocations; group-2 reductions report
+  `native_two_rank_exact`, while group-16 reductions retain the hierarchy.
+  Primitive job `723271` matches native and ordered paths in all 288 randomized
+  fp16/bf16/fp32 sync/async cells, and job `723241` measures native 1.56–1.89×
+  faster at 8/64/160 MiB. Later exact-source trace job `723738` then matches
+  13,120/13,120 DSV3 and 18,240/18,240 Nemotron events with 256 actual-backend
+  events per run and zero unavailable events: DSV3 MLA selects unfused under
+  auto, while Nemotron selects fused `NVTE_F16_arbitrary_seqlen`. AWS-DFW
+  GB200 probe `544156` independently records that fused sub-backend under TE
+  2.17. The TP1 target path also had large expert-DP groups of size one
+  unnecessarily entering all-to-all plus fp32 sum. Job `723921` measures the
+  no-op identity 23.5–42.4×
+  faster on the 32–160 MiB target buckets. Cleaned final-source job `724148`
+  then certifies DSV3 and Nemotron at TP1×EP32 with 6,848/6,848 and
+  10,432/10,432 exact events and every expert reduction labeled
+  `single_rank_identity` (certificate SHA256 `2e45875de123…` /
+  `a6771a4d3f44…`). Final-source focused job `724146` passes all 36 CPU/CUDA,
+  alias/copy, sync/async, dtype, and certifier cases per rank, including the
+  fp16/bf16/fp32 native guard and a float64 regression that must retain explicit
+  fp32 accumulation.
+  Same-allocation DSV3 ABBA job `723987` improves median-of-leg medians from
+  53.625 to 52.85 ms (-1.45%); both order pairs improve (2.72% and 0.19%), and
+  all 12 serialized loss values match across all four legs.
 - **Post-routing-optimization certification:** focused AWS-DFW job `520515`
   verifies bf16/fp32 × sigmoid/softmax outputs and gradients against the former
   `index_put_` reference on every rank; job `520692` extends the focused suite
@@ -667,7 +701,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
    while deterministic Flash/Fused backward, TE LayerNormLinear, and compiled
    BDA remain measured kernel costs. Expert-score gather and grouped GEMM remain
    MoE targets. Vocab-CE's local backward is closed, while TP collective
-   ordering remains open. Mamba's fixed config/workspaces show no measurable
+   ordering above two ranks remains open. The target TP2 distributed-optimizer
+   path now uses native exact reduce-scatter and is 1.56–1.89× faster than the
+   former ordered helper without weakening the two-allocation certificate. The
+   TP1×EP32 expert-DP identity now avoids three unnecessary large reductions per
+   rank/iteration, is 23.5–42.4× faster in the synchronized primitive gate, and
+   improves same-allocation DSV3 median step time by 1.45% with both ABBA order
+   pairs positive.
+   Mamba's fixed config/workspaces show no measurable
    slowdown in the paired attribution. The
    hierarchy also increases peak allocated memory in this proxy by about 140
    MiB because it materializes the locally permuted send buffer. Each further
@@ -688,10 +729,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
    AWS-CMH job `722022` passed the full trace, comparator, and certifier suite
    (47 tests on each of four ranks; every Slurm step `COMPLETED 0:0`, console
    SHA256 `0232e9690b7b…`, sbatch SHA256 `ab8db5925dd9…`). TP
-   userbuffer payloads, TE internal FP8/FP4 quantizer state, and the actual
-   backend selected inside an auto-dispatching kernel library are still missing;
-   TE checkpoint inputs/outputs and forward/recompute identity are now
-   covered. Floating-point reductions inside TP mappings, TP linears, and
+   userbuffer payloads, TE internal FP8/FP4 quantizer state, and selection state
+   for auto-dispatching libraries other than TE attention are still missing.
+   TE checkpoint inputs/outputs, forward/recompute identity, and the actual
+   attention backend/sub-backend are now covered. Floating-point reductions
+   inside TP mappings, TP linears, and
    vocab-parallel cross-entropy, plus the non-distributed-optimizer DP
    all-reduce, still lack topology-independent paths.
 

@@ -136,7 +136,12 @@ PyTorch/CUDA/cuDNN, device and allocator properties, installed
 Transformer-Engine/Triton/Mamba/FlashAttention package versions, and the
 cuBLAS, NCCL, TE-attention, Mamba, and Triton environment controls that govern
 deterministic or autotuned kernel selection. Package discovery uses installed
-metadata and does not import optional kernel libraries. With
+metadata and does not import optional kernel libraries. After every traced TE
+attention forward, the wrapper also records the backend TE actually selected,
+its sub-backend, the configured selector, forward/recompute phase, layer, mask,
+QKV layout, and tensor shapes/dtypes. If the installed TE version no longer
+exposes the diagnostic state, it emits a separate
+`te.attention.backend.unavailable` event instead of guessing. With
 `--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
 parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
 distributed-optimizer parameter-gather hashes. End-of-backward finalization
@@ -189,8 +194,9 @@ reduce-scatter, core TP linear synchronous/async collectives, final TP/PP
 gradient and token-count synchronization, plus opt-in local
 optimizer main parameters and moment state. TE FP8/FP4 checkpoint boundaries
 are covered, but internal quantizer state is not independently fingerprinted.
-TP userbuffer payloads and in-process kernel selection remain follow-up
-instrumentation surfaces. Actual kernel identities from a captured iteration
+TE attention selection is covered at runtime; TP userbuffer payloads and other
+auto-dispatching libraries remain follow-up instrumentation surfaces. Actual
+kernel identities from a captured iteration
 can be recovered from an Nsight Systems SQLite export with
 `attribute_nsys_ranges.py --kernels`. Final TP/PP gradient SUM and AVG use a
 topology-independent deterministic implementation, while floating reductions
@@ -207,6 +213,7 @@ python tools/determinism/certify_traces.py \
   /path/to/run-a /path/to/run-b \
   --expected-ranks 32 \
   --expected-iterations 2 \
+  --require-event-prefix te.attention.backend.selected \
   --require-collective-prefix moe.ep_ \
   --require-collective-prefix moe.router_expert_bias. \
   --require-collective-prefix data_parallel. \
@@ -217,16 +224,20 @@ python tools/determinism/certify_traces.py \
 `certify_traces.py` checks both trees independently before comparing them. It
 requires deterministic runtime state, the requested rank/iteration/file counts,
 matching activation recomputes, completed collective output hashes, zero pending
-collectives, the requested semantic collective surfaces, and (optionally) the
-ordered fp32 and hierarchical multi-rank data-parallel reduction paths.
+collectives, requested semantic event/collective surfaces, and (optionally) the
+ordered fp32 and hierarchical data-parallel reduction paths. A traced
+`te.attention.backend.unavailable` event fails closed instead of allowing a
+backend-blind certificate.
 It also rejects unsupported or incomplete event schemas, mixed rank/iteration
 identities within one file, sequence gaps, duplicate or missing runtime and
 iteration boundary markers, explicit `iteration.error` events, and collective
 begins/ends that are not balanced within the trace window.
-Single-rank reductions are excluded from the hierarchy requirement because they
-perform no inter-rank reduction. Exit code 0 is a certificate, 1 is a failed
-invariant or cross-run divergence, and 2 is invalid input. Use `--json` to retain
-the complete evidence report.
+Groups of at most two are excluded from the hierarchy requirement: one rank has
+no reduction and two ranks have exactly one floating-point addition per output,
+so there is no reduction-tree order for physical topology to change. They still
+must use fp32 accumulation when that invariant is requested. Exit code 0 is a
+certificate, 1 is a failed invariant or cross-run divergence, and 2 is invalid
+input. Use `--json` to retain the complete evidence report.
 
 ## Run the checked-in EP32 model certificates
 
