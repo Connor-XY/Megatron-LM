@@ -53,7 +53,6 @@ _TENSOR_OPERATIONS = {
     "index_copy_": "indexed_write_or_gather",
     "index_put": "indexed_write_or_gather",
     "index_put_": "indexed_write_or_gather",
-    "put": "indexed_write_or_gather",
     "put_": "indexed_write_or_gather",
     "scatter": "indexed_write_or_gather",
     "scatter_": "indexed_write_or_gather",
@@ -70,6 +69,18 @@ _DETERMINISM_CONTROLS = {
     "set_determinism_debug_mode",
     "use_deterministic_algorithms",
 }
+
+
+def _tensor_operation_category(call_name: str, leaf: str) -> str | None:
+    """Classify a tensor operation while rejecting common non-tensor name collisions."""
+    category = _TENSOR_OPERATIONS.get(leaf)
+    if category is None:
+        return None
+    if leaf in {"embedding", "embedding_bag"} and not call_name.startswith("torch."):
+        return None
+    if leaf == "gather" and "asyncio" in call_name.split("."):
+        return None
+    return category
 
 
 @dataclass(frozen=True, order=True)
@@ -147,7 +158,7 @@ class _SensitiveOperationVisitor(ast.NodeVisitor):
             if category is None and leaf in _DETERMINISM_CONTROLS:
                 category = "determinism_control"
             if category is None:
-                category = _TENSOR_OPERATIONS.get(leaf)
+                category = _tensor_operation_category(call_name, leaf)
             if category is not None:
                 self.operations.append(
                     SensitiveOperation(

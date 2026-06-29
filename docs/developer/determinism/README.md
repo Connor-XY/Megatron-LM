@@ -34,8 +34,11 @@ The report is stable by file, line, column, and enclosing class/function. It
 resolves common `torch.distributed` import aliases and separates floating
 collective reductions, rank-indexed permutation collectives, indexed
 reductions, indexed writes/gathers, ordering operations, and explicit
-determinism-control calls. Repeat `--category` to select multiple classes and
-`--exclude` to omit a source-root-relative glob.
+determinism-control calls. Common control-plane collisions such as queue
+`put`, `asyncio.gather`, and arbitrary module `embedding` calls are filtered;
+tensor `put_`, tensor/`torch.gather`, and PyTorch embedding calls remain in the
+review queue. Repeat `--category` to select multiple classes and `--exclude`
+to omit a source-root-relative glob.
 
 This is a candidate inventory, not a determinism verdict: whether a call is on
 the training path, has unique indices, reduces integer-valued data, or is

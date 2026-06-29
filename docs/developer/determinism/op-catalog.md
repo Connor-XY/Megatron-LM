@@ -24,7 +24,8 @@ Before declaring the catalog complete, run
 review queue for collective reductions, indexed operations, ordering calls, and
 determinism controls; every training-path candidate needs either a row here or
 an explicit reason it is out of scope. The scanner intentionally does not infer
-a verdict.
+a verdict and filters known non-tensor collisions from async/control-plane
+`put`, `gather`, and module `embedding` calls.
 
 Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det branch ·
 🟡 conditional (verify) · 🔴 gap (no det path).

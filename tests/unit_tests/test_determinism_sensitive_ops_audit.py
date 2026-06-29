@@ -62,6 +62,24 @@ def test_category_filter_and_json_report(tmp_path, capsys):
     ]
 
 
+def test_scan_filters_common_non_tensor_name_collisions(tmp_path):
+    source_root = tmp_path / "megatron"
+    source_root.mkdir()
+    (source_root / "control_plane.py").write_text(
+        """
+import asyncio
+
+def schedule(module, queue, coroutine):
+    asyncio.gather(coroutine)
+    queue.put(coroutine)
+    module.embedding(coroutine)
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    assert scan_sensitive_operations(source_root) == []
+
+
 def test_missing_or_empty_source_root_has_distinct_exit_codes(tmp_path, capsys):
     assert main([str(tmp_path / "missing")]) == 2
     assert "Source root does not exist" in capsys.readouterr().err

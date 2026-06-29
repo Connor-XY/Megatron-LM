@@ -322,7 +322,13 @@ small set of reductions and dispatch choices. They are fully enumerated in
   floating reductions, 79 rank-indexed collectives, 12 indexed reductions, 74
   indexed writes/gathers, 59 ordering calls, and 12 controls); every Slurm step
   completed `0:0` (report SHA256 `c06b713309ba…`, evidence-manifest SHA256
-  `7c984304b982…`).
+  `7c984304b982…`). Draco job `10476456` passes the expanded four-test suite
+  and filters 40 known non-tensor name collisions from that same clean source
+  surface: queue/NVSHMEM `put`, async `gather`, and module-level `embedding`.
+  The resulting 278 candidates retain 82 floating reductions, 79 rank-indexed
+  collectives, 3 indexed reductions, 43 indexed writes/gathers, 59 ordering
+  calls, and 12 controls (report SHA256 `d16379e25326…`, manifest SHA256
+  `9c55455b1f70…`).
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by
