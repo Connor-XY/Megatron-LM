@@ -464,8 +464,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
   retained logs produced the exact report above. Current MCore also exposed a
   Bridge integration gap: its DDP config sets the logical hierarchical group
   size, but Bridge did not pass that value into
-  `initialize_model_parallel`. Bridge commit `fc23554a` now propagates that
-  value and creates the requested fixed logical hierarchy.
+  `initialize_model_parallel`. Bridge commit `5793e80a` recovers the validated
+  production source byte-for-byte, propagates that value, and creates the
+  requested fixed logical hierarchy. HSG job `3632202` passed all 31 focused
+  Bridge process-group tests, including forwarding and unsupported-MCore
+  coverage (log SHA256 `061fb09951f5…`).
 
   HSG job `3616801` then qualified the full recipe for 50 steps: two
   deterministic, non-profiled launches ran sequentially on the same
@@ -489,7 +492,7 @@ small set of reductions and dispatch choices. They are fully enumerated in
    rows retain strict EP32 MCore certificates for both model proxies, but the
    full Bridge recipe's clean 50-step same-allocation 96-GPU qualification is a
    retained cluster artifact, not yet a checked-in weekly schedule/dashboard.
-   Bridge commit `fc23554a` propagates
+   Bridge commit `5793e80a` propagates
    `reduce_scatter_hierarchical_group_size` into MCore process-group
    initialization. The remaining scale gate should repeat the same two
    deterministic, non-profiled jobs sequentially in one allocation, compare all
