@@ -83,6 +83,7 @@ def certify_trace_path(
     *,
     expected_ranks: int | None = None,
     expected_iterations: int | None = None,
+    required_event_prefixes: tuple[str, ...] = (),
     required_collective_prefixes: tuple[str, ...] = (),
     require_dp_fp32_accumulation: bool = False,
     require_dp_hierarchical_fp32_accumulation: bool = False,
@@ -215,6 +216,22 @@ def certify_trace_path(
     if pending_collectives:
         failures.append(f"{pending_collectives} collectives were pending at trace-window end")
 
+    event_prefix_counts = Counter()
+    for prefix in required_event_prefixes:
+        event_prefix_counts[prefix] = sum(
+            str(event.get("name", "")).startswith(prefix) for event in events
+        )
+        if event_prefix_counts[prefix] == 0:
+            failures.append(f"no events start with {prefix!r}")
+
+    te_backend_unavailable = [
+        event for event in events if event.get("name") == "te.attention.backend.unavailable"
+    ]
+    if te_backend_unavailable:
+        failures.append(
+            f"{len(te_backend_unavailable)} TE attention backend selections were unavailable"
+        )
+
     collectives = [event for event in events if event.get("kind") == "collective"]
     completed = [event for event in collectives if str(event.get("name", "")).endswith(".end")]
     completed_without_hashes = [
@@ -259,9 +276,15 @@ def certify_trace_path(
     multi_rank_dp_grad_begins = [
         event for event in dp_grad_begins if event.get("payload", {}).get("group_size", 0) > 1
     ]
+    # A two-rank reduction has one floating-point addition per output element, so physical
+    # topology cannot alter its accumulation order. Require the fixed hierarchy only where a
+    # reduction tree can actually contain more than one addition.
+    hierarchy_required_dp_grad_begins = [
+        event for event in dp_grad_begins if event.get("payload", {}).get("group_size", 0) > 2
+    ]
     multi_rank_dp_without_hierarchy = [
         event
-        for event in multi_rank_dp_grad_begins
+        for event in hierarchy_required_dp_grad_begins
         if event.get("payload", {}).get("hierarchical_fp32_accumulation") is not True
     ]
     if require_dp_hierarchical_fp32_accumulation:
@@ -295,6 +318,8 @@ def certify_trace_path(
         "collective_begins_without_end": collective_begins_without_end,
         "collective_ends_without_begin": collective_ends_without_begin,
         "pending_collectives": pending_collectives,
+        "event_prefix_counts": dict(event_prefix_counts),
+        "te_attention_backend_unavailable": len(te_backend_unavailable),
         "collective_prefix_counts": dict(prefix_counts),
         "dp_grad_reductions": len(dp_grad_begins),
         "dp_grad_reductions_without_fp32_accumulation": len(dp_without_fp32),
@@ -313,6 +338,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-ranks", type=int)
     parser.add_argument("--expected-iterations", type=int)
     parser.add_argument(
+        "--require-event-prefix",
+        action="append",
+        default=[],
+        help="Require at least one event whose semantic name starts with this prefix",
+    )
+    parser.add_argument(
         "--require-collective-prefix",
         action="append",
         default=[],
@@ -330,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         kwargs = {
             "expected_ranks": args.expected_ranks,
             "expected_iterations": args.expected_iterations,
+            "required_event_prefixes": tuple(args.require_event_prefix),
             "required_collective_prefixes": tuple(args.require_collective_prefix),
             "require_dp_fp32_accumulation": args.require_dp_fp32_accumulation,
             "require_dp_hierarchical_fp32_accumulation": (

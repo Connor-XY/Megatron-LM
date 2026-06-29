@@ -15,6 +15,8 @@ def _write_trace(
     pending=0,
     fp32_accumulation=True,
     hierarchical_fp32_accumulation=True,
+    group_size=2,
+    event_names=(),
 ):
     path = root / f"iter_{iteration:07d}" / f"rank_{rank:05d}{suffix}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +58,7 @@ def _write_trace(
             "payload": {
                 "fp32_accumulation": fp32_accumulation,
                 "hierarchical_fp32_accumulation": hierarchical_fp32_accumulation,
-                "group_size": 2,
+                "group_size": group_size,
             },
         },
         {
@@ -78,6 +80,20 @@ def _write_trace(
             "payload": {"pending_collectives": pending},
         },
     ]
+    for event_name in event_names:
+        events.insert(
+            -1,
+            {
+                "schema_version": 1,
+                "iteration": iteration,
+                "rank": rank,
+                "kind": "runtime",
+                "name": event_name,
+                "payload": {},
+            },
+        )
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
     path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     return path
 
@@ -107,6 +123,7 @@ def test_reports_recompute_pending_and_reduction_failures(tmp_path):
         pending=1,
         fp32_accumulation=False,
         hierarchical_fp32_accumulation=False,
+        group_size=4,
     )
 
     report = certify_trace_path(
@@ -118,6 +135,41 @@ def test_reports_recompute_pending_and_reduction_failures(tmp_path):
     assert report["pending_collectives"] == 1
     assert report["dp_grad_reductions_without_fp32_accumulation"] == 1
     assert report["multi_rank_dp_grad_reductions_without_hierarchical_fp32_accumulation"] == 1
+
+
+def test_accepts_two_rank_fp32_reduction_without_hierarchy(tmp_path):
+    _write_trace(tmp_path, hierarchical_fp32_accumulation=False, group_size=2)
+
+    report = certify_trace_path(
+        tmp_path, require_dp_fp32_accumulation=True, require_dp_hierarchical_fp32_accumulation=True
+    )
+
+    assert report["equal"]
+    assert report["multi_rank_dp_grad_reductions"] == 1
+    assert report["multi_rank_dp_grad_reductions_without_hierarchical_fp32_accumulation"] == 0
+
+
+def test_requires_general_event_prefix(tmp_path):
+    _write_trace(tmp_path, event_names=("te.attention.backend.selected",))
+
+    report = certify_trace_path(
+        tmp_path, required_event_prefixes=("te.attention.backend.selected",)
+    )
+
+    assert report["equal"]
+    assert report["event_prefix_counts"] == {"te.attention.backend.selected": 1}
+
+
+def test_rejects_missing_event_prefix_and_unavailable_te_backend(tmp_path):
+    _write_trace(tmp_path, event_names=("te.attention.backend.unavailable",))
+
+    report = certify_trace_path(
+        tmp_path, required_event_prefixes=("te.attention.backend.selected",)
+    )
+
+    assert not report["equal"]
+    assert report["event_prefix_counts"] == {"te.attention.backend.selected": 0}
+    assert report["te_attention_backend_unavailable"] == 1
 
 
 def test_cli_compares_two_certified_trace_trees(tmp_path, capsys):

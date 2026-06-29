@@ -202,6 +202,7 @@ if ((NODE_RANK == 0)); then
         "$TRACE_ROOT/run-a" "$TRACE_ROOT/run-b" \
         --expected-ranks 32 \
         --expected-iterations 2 \
+        --require-event-prefix te.attention.backend.selected \
         --require-collective-prefix moe.ep_ \
         --require-collective-prefix moe.router_expert_bias. \
         --require-collective-prefix data_parallel. \
