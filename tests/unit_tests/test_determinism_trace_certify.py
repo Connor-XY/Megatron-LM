@@ -33,13 +33,22 @@ def _write_trace(
             "sequence": 1,
             "iteration": iteration,
             "rank": rank,
+            "kind": "phase",
+            "name": "iteration.begin",
+            "payload": {},
+        },
+        {
+            "schema_version": 1,
+            "sequence": 2,
+            "iteration": iteration,
+            "rank": rank,
             "kind": "recompute",
             "name": "checkpoint.recompute",
             "payload": {"checkpoint_id": 0, "matches_forward": matches_forward},
         },
         {
             "schema_version": 1,
-            "sequence": 2,
+            "sequence": 3,
             "iteration": iteration,
             "rank": rank,
             "kind": "collective",
@@ -52,7 +61,7 @@ def _write_trace(
         },
         {
             "schema_version": 1,
-            "sequence": 3,
+            "sequence": 4,
             "iteration": iteration,
             "rank": rank,
             "kind": "collective",
@@ -61,7 +70,7 @@ def _write_trace(
         },
         {
             "schema_version": 1,
-            "sequence": 4,
+            "sequence": 5,
             "iteration": iteration,
             "rank": rank,
             "kind": "phase",
@@ -70,6 +79,7 @@ def _write_trace(
         },
     ]
     path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    return path
 
 
 def test_certifies_complete_bit_exact_trace(tmp_path):
@@ -119,7 +129,7 @@ def test_cli_compares_two_certified_trace_trees(tmp_path, capsys):
     assert main([str(left), str(right), "--expected-ranks", "1", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["equal"]
-    assert report["comparison"]["events_compared"] == 5
+    assert report["comparison"]["events_compared"] == 6
 
 
 def test_cli_does_not_call_one_trace_tree_a_determinism_certificate(tmp_path, capsys):
@@ -139,3 +149,91 @@ def test_rejects_duplicate_pair_that_hides_missing_rank_iteration_coverage(tmp_p
 
     assert not report["equal"]
     assert "missing rank/iteration pairs: [(1, 2)]" in report["failures"]
+
+
+def test_rejects_unsupported_schema_for_single_trace_tree(tmp_path, capsys):
+    path = _write_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    events[0]["schema_version"] = 99
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    assert main([str(tmp_path)]) == 2
+    assert "Unsupported schema version" in capsys.readouterr().err
+
+
+def test_rejects_trace_errors_and_unbalanced_collectives(tmp_path):
+    path = _write_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    events = [
+        event
+        for event in events
+        if not (event["kind"] == "collective" and event["name"].endswith(".end"))
+    ]
+    events.insert(
+        -1,
+        {
+            "schema_version": 1,
+            "sequence": 0,
+            "iteration": 1,
+            "rank": 0,
+            "kind": "phase",
+            "name": "iteration.error",
+            "payload": {"exception_type": "RuntimeError"},
+        },
+    )
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    report = certify_trace_path(tmp_path)
+
+    assert not report["equal"]
+    assert report["iteration_errors"] == 1
+    assert report["collective_begins_without_end"] == 1
+
+
+def test_rejects_mixed_file_identity_and_non_contiguous_sequence(tmp_path):
+    path = _write_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    events[-1]["rank"] = 1
+    events[-1]["sequence"] = 99
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    report = certify_trace_path(tmp_path)
+
+    assert not report["equal"]
+    assert report["file_identity_failures"] == 1
+    assert report["sequence_failures"] == 1
+
+
+def test_rejects_duplicate_runtime_and_missing_iteration_begin(tmp_path):
+    path = _write_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    events = [event for event in events if event["name"] != "iteration.begin"]
+    events.insert(1, dict(events[0]))
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    report = certify_trace_path(tmp_path)
+
+    assert not report["equal"]
+    assert report["runtime_count_failures"] == 1
+    assert report["iteration_begin_count_failures"] == 1
+
+
+def test_rejects_collective_end_before_begin(tmp_path):
+    path = _write_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    begin_index = next(i for i, event in enumerate(events) if event["name"].endswith(".begin"))
+    end_index = next(i for i, event in enumerate(events) if event["name"].endswith(".end"))
+    events[begin_index], events[end_index] = events[end_index], events[begin_index]
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    report = certify_trace_path(tmp_path)
+
+    assert not report["equal"]
+    assert report["collective_begins_without_end"] == 1
+    assert report["collective_ends_without_begin"] == 1

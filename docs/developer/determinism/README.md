@@ -157,6 +157,10 @@ requires deterministic runtime state, the requested rank/iteration/file counts,
 matching activation recomputes, completed collective output hashes, zero pending
 collectives, the requested semantic collective surfaces, and (optionally) the
 ordered fp32 and hierarchical multi-rank data-parallel reduction paths.
+It also rejects unsupported or incomplete event schemas, mixed rank/iteration
+identities within one file, sequence gaps, duplicate or missing runtime and
+iteration boundary markers, explicit `iteration.error` events, and collective
+begins/ends that are not balanced within the trace window.
 Single-rank reductions are excluded from the hierarchy requirement because they
 perform no inter-rank reduction. Exit code 0 is a certificate, 1 is a failed
 invariant or cross-run divergence, and 2 is invalid input. Use `--json` to retain

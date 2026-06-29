@@ -13,9 +13,20 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from tools.determinism.compare_traces import compare_trace_paths
+    from tools.determinism.compare_traces import SUPPORTED_SCHEMA_VERSION, compare_trace_paths
 except ModuleNotFoundError:  # Direct ``python tools/determinism/certify_traces.py`` invocation.
-    from compare_traces import compare_trace_paths
+    from compare_traces import SUPPORTED_SCHEMA_VERSION, compare_trace_paths
+
+
+_REQUIRED_EVENT_KEYS = (
+    "schema_version",
+    "sequence",
+    "iteration",
+    "rank",
+    "kind",
+    "name",
+    "payload",
+)
 
 
 def _trace_files(path: Path) -> list[Path]:
@@ -27,8 +38,10 @@ def _trace_files(path: Path) -> list[Path]:
     return files
 
 
-def _events(files: Iterable[Path]) -> Iterable[dict[str, Any]]:
+def _events(files: Iterable[Path]) -> dict[Path, list[dict[str, Any]]]:
+    events_by_file = {}
     for path in files:
+        file_events = []
         with path.open(encoding="utf-8") as trace_file:
             for line_number, line in enumerate(trace_file, start=1):
                 try:
@@ -39,7 +52,30 @@ def _events(files: Iterable[Path]) -> Iterable[dict[str, Any]]:
                     ) from error
                 if not isinstance(event, Mapping):
                     raise TypeError(f"Expected an event object in {path}:{line_number}")
-                yield dict(event)
+                missing = [key for key in _REQUIRED_EVENT_KEYS if key not in event]
+                if missing:
+                    raise ValueError(f"Missing keys in {path}:{line_number}: {', '.join(missing)}")
+                if event["schema_version"] != SUPPORTED_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"Unsupported schema version in {path}:{line_number}: "
+                        f"{event['schema_version']!r}"
+                    )
+                for key in ("sequence", "iteration", "rank"):
+                    if type(event[key]) is not int:
+                        raise TypeError(
+                            f"Expected integer {key} in {path}:{line_number}, "
+                            f"got {event[key]!r}"
+                        )
+                for key in ("kind", "name"):
+                    if not isinstance(event[key], str):
+                        raise TypeError(
+                            f"Expected string {key} in {path}:{line_number}, " f"got {event[key]!r}"
+                        )
+                if not isinstance(event["payload"], Mapping):
+                    raise TypeError(f"Expected payload object in {path}:{line_number}")
+                file_events.append(dict(event))
+        events_by_file[path] = file_events
+    return events_by_file
 
 
 def certify_trace_path(
@@ -54,8 +90,63 @@ def certify_trace_path(
     """Return a JSON-safe certification report for one trace directory."""
     trace_path = Path(trace_path)
     files = _trace_files(trace_path)
-    events = list(_events(files))
+    events_by_file = _events(files)
+    events = [event for file_events in events_by_file.values() for event in file_events]
     failures = []
+
+    file_identity_failures = 0
+    sequence_failures = 0
+    runtime_count_failures = 0
+    iteration_begin_count_failures = 0
+    iteration_end_count_failures = 0
+    collective_begins_without_end = 0
+    collective_ends_without_begin = 0
+    for path, file_events in events_by_file.items():
+        identities = {(event["rank"], event["iteration"]) for event in file_events}
+        if len(identities) != 1:
+            file_identity_failures += 1
+            failures.append(f"{path} contains rank/iteration identities {sorted(identities)}")
+        sequences = [event["sequence"] for event in file_events]
+        if sequences != list(range(len(file_events))):
+            sequence_failures += 1
+            failures.append(f"{path} has non-contiguous event sequence {sequences}")
+        runtime_count = sum(event["name"] == "runtime" for event in file_events)
+        if runtime_count != 1:
+            runtime_count_failures += 1
+            failures.append(f"{path} has {runtime_count} runtime events, expected 1")
+        iteration_begin_count = sum(event["name"] == "iteration.begin" for event in file_events)
+        if iteration_begin_count != 1:
+            iteration_begin_count_failures += 1
+            failures.append(
+                f"{path} has {iteration_begin_count} iteration.begin events, expected 1"
+            )
+        iteration_end_count = sum(event["name"] == "iteration.end" for event in file_events)
+        if iteration_end_count != 1:
+            iteration_end_count_failures += 1
+            failures.append(f"{path} has {iteration_end_count} iteration.end events, expected 1")
+
+        outstanding_collectives = Counter()
+        missing_begins = Counter()
+        for event in file_events:
+            if event["kind"] != "collective":
+                continue
+            if event["name"].endswith(".begin"):
+                outstanding_collectives[event["name"][: -len(".begin")]] += 1
+            elif event["name"].endswith(".end"):
+                collective_name = event["name"][: -len(".end")]
+                if outstanding_collectives[collective_name]:
+                    outstanding_collectives[collective_name] -= 1
+                    if not outstanding_collectives[collective_name]:
+                        del outstanding_collectives[collective_name]
+                else:
+                    missing_begins[collective_name] += 1
+        missing_ends = outstanding_collectives
+        collective_begins_without_end += sum(missing_ends.values())
+        collective_ends_without_begin += sum(missing_begins.values())
+        if missing_ends:
+            failures.append(f"{path} has collective begins without ends: {dict(missing_ends)}")
+        if missing_begins:
+            failures.append(f"{path} has collective ends without begins: {dict(missing_begins)}")
 
     rank_iterations = {(event.get("rank"), event.get("iteration")) for event in events}
     ranks = sorted({rank for rank, _ in rank_iterations if isinstance(rank, int)})
@@ -115,11 +206,12 @@ def certify_trace_path(
         )
 
     iteration_ends = [event for event in events if event.get("name") == "iteration.end"]
+    iteration_errors = [event for event in events if event.get("name") == "iteration.error"]
+    if iteration_errors:
+        failures.append(f"found {len(iteration_errors)} iteration.error events")
     pending_collectives = sum(
         int(event.get("payload", {}).get("pending_collectives", 0)) for event in iteration_ends
     )
-    if len(iteration_ends) != len(files):
-        failures.append(f"found {len(iteration_ends)} iteration.end events for {len(files)} files")
     if pending_collectives:
         failures.append(f"{pending_collectives} collectives were pending at trace-window end")
 
@@ -190,10 +282,18 @@ def certify_trace_path(
         "events": len(events),
         "ranks": ranks,
         "iterations": iterations,
+        "file_identity_failures": file_identity_failures,
+        "sequence_failures": sequence_failures,
+        "runtime_count_failures": runtime_count_failures,
+        "iteration_begin_count_failures": iteration_begin_count_failures,
+        "iteration_end_count_failures": iteration_end_count_failures,
+        "iteration_errors": len(iteration_errors),
         "recomputes": len(recomputes),
         "recompute_mismatches": len(recompute_mismatches),
         "collectives": len(collectives),
         "completed_collectives": len(completed),
+        "collective_begins_without_end": collective_begins_without_end,
+        "collective_ends_without_begin": collective_ends_without_begin,
         "pending_collectives": pending_collectives,
         "collective_prefix_counts": dict(prefix_counts),
         "dp_grad_reductions": len(dp_grad_begins),
