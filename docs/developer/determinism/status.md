@@ -168,6 +168,19 @@ small set of reductions and dispatch choices. They are fully enumerated in
 - **DP and small-stat reductions** (`distributed/param_and_grad_buffer.py`,
   `distributed/deterministic_collectives.py`): rank-indexed all-to-all or
   all-gather followed by a fixed local fp32 sum.
+- **Final TP/PP gradient synchronization**
+  (`distributed/finalize_model_grads.py`): native SUM/AVG reductions remain a
+  topology-sensitive gap. The opt-in trace fingerprints their exact inputs and
+  outputs, plus token-count synchronization, so a scaled run can establish
+  whether this boundary is the first divergence before an ordered replacement
+  is introduced.
+- **Megatron-FSDP gradient reduction**
+  (`distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py`) remains an
+  unsupported cross-allocation path: it launches native SUM/AVG/premultiplied
+  all-reduce and reduce-scatter from both synchronous and overlapped pipelines
+  and does not consume the ordered-fp32 flag. The checked-in FSDP8 proxy cells
+  only repeat within one initialized topology. This does not affect the Ultra
+  production launcher, which uses the standard distributed optimizer.
 - **TE attention** (`extensions/transformer_engine.py:1697`): asserts
   `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` when `deterministic_mode` is on, then TE
   filters Flash/Fused/Unfused backends by input-specific deterministic support.
@@ -210,6 +223,9 @@ small set of reductions and dispatch choices. They are fully enumerated in
   has SHA256 `f808fe963e1c…`; the pytest log has SHA256 `24d2beab4b1e…`.
   The GPU test step is `COMPLETED 0:0`; the top-level batch status is `FAILED`
   only because its post-check regex omitted pytest's `33 deselected` field.
+  The FSDP cells are same-process-group repeatability tests; Megatron-FSDP's
+  native floating reductions still require an ordered implementation and an
+  independent-allocation certificate.
 - **Operator-level gaps (added):**
   `test_torch_norm.py` directly certifies PyTorch LayerNorm and RMSNorm backward,
   bypassing TE/Apex so the fallback is genuinely exercised. `test_dsa_paths.py`
@@ -240,7 +256,12 @@ small set of reductions and dispatch choices. They are fully enumerated in
   outputs are recorded at the existing waits. Rank-process visibility captures
   autograd-worker launches; `iteration.end.pending_collectives` reports
   operations that outlive the selected window instead of writing to a closed
-  trace.
+  trace. End-of-backward finalization now records native TP SUM/AVG, PP
+  embedding/replicated-parameter reductions, and token-count synchronization at
+  their existing synchronous completion points. AWS-CMH job `719032` passed the
+  focused real-NCCL trace test on all four GB200 ranks with every Slurm step
+  `COMPLETED 0:0` (console SHA256 `32c8d9751876…`, evidence-manifest SHA256
+  `022414bbd4c2…`).
   `tools/determinism/compare_traces.py` aligns rank traces by semantic event
   identity instead of PP/VPP arrival order. `certify_traces.py` additionally
   enforces rank/iteration coverage, deterministic runtime state, recompute

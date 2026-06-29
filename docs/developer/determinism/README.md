@@ -99,8 +99,11 @@ forward/recompute identities, output-discarding checkpoint recomputation, and
 semantic MoE expert-parallel all-to-all boundaries. With
 `--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
 parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
-distributed-optimizer parameter-gather hashes. It also fingerprints the
-standard synchronous TP all-reduce, first/last-dimension all-gather, and
+distributed-optimizer parameter-gather hashes. End-of-backward finalization
+additionally fingerprints native TP SUM/AVG, PP embedding/replicated-parameter
+all-reduces, and token-count broadcast/reduction boundaries. It also
+fingerprints the standard synchronous TP all-reduce, first/last-dimension
+all-gather, and
 first/last-dimension reduce-scatter paths in original forward, activation
 recompute, and backward. Core TP linear tracing additionally covers the
 synchronous sequence-parallel forward gather and the backward async gather,
@@ -136,14 +139,18 @@ implementations, output-discarding checkpoint recomputation, optimizer
 inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, pipeline
 P2P sends/receives, DP all-reduce/reduce-scatter, and distributed-optimizer
 parameter all-gather, synchronous TP mapping all-reduce/all-gather/
-reduce-scatter, core TP linear synchronous/async collectives, plus opt-in local
+reduce-scatter, core TP linear synchronous/async collectives, final TP/PP
+gradient and token-count synchronization, plus opt-in local
 optimizer main parameters and moment state. TE FP8/FP4 checkpoint boundaries
 are covered, but internal quantizer state is not independently fingerprinted.
 TP userbuffer payloads and in-process kernel selection remain follow-up
 instrumentation surfaces. Actual kernel identities from a captured iteration
 can be recovered from an Nsight Systems SQLite export with
-`attribute_nsys_ranges.py --kernels`. Native floating-point TP SUM ordering
-remains a determinism-path gap even though its payload is now observable.
+`attribute_nsys_ranges.py --kernels`. Native floating-point TP/PP SUM and AVG
+ordering remains a determinism-path gap even though its payload is now
+observable. Megatron-FSDP gradient reductions are a separate uninstrumented
+native-collective gap; its existing FSDP8 cells are same-topology tests, not
+cross-allocation certificates.
 
 For a scaled model run, use the stricter certifier instead of relying on a trace
 comparison alone:

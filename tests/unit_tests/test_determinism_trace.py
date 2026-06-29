@@ -21,6 +21,10 @@ from megatron.core.determinism_trace import (
     record_tensor,
     trace_iteration,
 )
+from megatron.core.distributed.finalize_model_grads import (
+    _all_reduce_with_determinism_trace,
+    _broadcast_with_determinism_trace,
+)
 from megatron.core.extensions import transformer_engine as te_extension
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -285,6 +289,56 @@ def test_collective_trace_records_semantic_input_and_output(tmp_path):
     assert collective[0]["payload"]["inputs"][0]["sha256"]
     assert collective[1]["payload"]["outputs"][0]["sha256"]
     assert events[-1]["payload"]["pending_collectives"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_finalize_model_grad_collectives_record_existing_completion_points(tmp_path):
+    Utils.initialize_model_parallel()
+    try:
+        group = torch.distributed.group.WORLD
+        rank = torch.distributed.get_rank()
+        reduced = torch.tensor([rank + 1.0], device="cuda")
+        broadcast = torch.tensor([rank + 10.0], device="cuda")
+
+        with trace_iteration(tmp_path, 23, hash_tensors=True):
+            _all_reduce_with_determinism_trace(
+                reduced,
+                group=group,
+                trace_name="finalize_model_grads.tensor_parallel_sum.backward",
+                metadata={"gradient_kind": "non_tensor_parallel_parameter"},
+            )
+            _broadcast_with_determinism_trace(
+                broadcast,
+                src=0,
+                group=group,
+                trace_name="finalize_model_grads.num_tokens.pipeline_broadcast",
+                metadata={"value_kind": "token_count"},
+            )
+
+        world_size = torch.distributed.get_world_size()
+        torch.testing.assert_close(
+            reduced, torch.tensor([world_size * (world_size + 1) / 2], device="cuda")
+        )
+        torch.testing.assert_close(broadcast, torch.tensor([10.0], device="cuda"))
+        events = _read_events(_trace_path(tmp_path, 23))
+        collective = [event for event in events if event["kind"] == "collective"]
+        assert [event["name"] for event in collective] == [
+            "finalize_model_grads.tensor_parallel_sum.backward.begin",
+            "finalize_model_grads.tensor_parallel_sum.backward.end",
+            "finalize_model_grads.num_tokens.pipeline_broadcast.begin",
+            "finalize_model_grads.num_tokens.pipeline_broadcast.end",
+        ]
+        assert collective[0]["payload"]["operation"] == "all_reduce"
+        assert collective[0]["payload"]["reduce_op"] == "sum"
+        assert collective[2]["payload"]["operation"] == "broadcast"
+        assert collective[2]["payload"]["src"] == 0
+        assert all(
+            event["payload"].get("inputs", event["payload"].get("outputs"))[0]["sha256"]
+            for event in collective
+        )
+        assert events[-1]["payload"]["pending_collectives"] == 0
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_process_trace_records_worker_threads_and_pending_collectives(tmp_path):
