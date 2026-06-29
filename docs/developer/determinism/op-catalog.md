@@ -20,12 +20,13 @@ on a real recipe, and the determinism verdict from one of:
   must give bit-identical out+grad). Rows still needing this are marked **⚠ verify**.
 
 Before declaring the catalog complete, run
-`python tools/determinism/audit_sensitive_ops.py megatron`. The AST report is a
-review queue for collective reductions, indexed operations, ordering calls, and
-determinism controls; every training-path candidate needs either a row here or
-an explicit reason it is out of scope. The scanner intentionally does not infer
-a verdict and filters known non-tensor collisions from async/control-plane
-`put`, `gather`, and module `embedding` calls.
+`python tools/determinism/audit_sensitive_ops.py megatron --git-tracked-only`.
+The AST report is a review queue for collective reductions, indexed operations,
+ordering calls, and determinism controls; every training-path candidate needs
+either a row here or an explicit reason it is out of scope. The tracked-only
+mode prevents local scratch files from changing the branch catalog. The scanner
+intentionally does not infer a verdict and filters known non-tensor collisions
+from async/control-plane `put`, `gather`, and module `embedding` calls.
 
 Status legend (matches `training-path.md`): 🟢 deterministic · 🔵 has det branch ·
 🟡 conditional (verify) · 🔴 gap (no det path).

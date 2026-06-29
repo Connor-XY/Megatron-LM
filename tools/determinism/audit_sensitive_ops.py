@@ -15,6 +15,7 @@ import argparse
 import ast
 import fnmatch
 import json
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -174,7 +175,11 @@ class _SensitiveOperationVisitor(ast.NodeVisitor):
 
 
 def scan_sensitive_operations(
-    source_root: str | Path, *, categories: Iterable[str] = (), exclude_globs: Iterable[str] = ()
+    source_root: str | Path,
+    *,
+    categories: Iterable[str] = (),
+    exclude_globs: Iterable[str] = (),
+    git_tracked_only: bool = False,
 ) -> list[SensitiveOperation]:
     """Return determinism-sensitive calls under ``source_root`` in stable order."""
     source_root = Path(source_root)
@@ -184,7 +189,25 @@ def scan_sensitive_operations(
     excludes = tuple(exclude_globs)
     display_root = source_root.parent
     operations = []
-    for path in sorted(source_root.rglob("*.py")):
+    if git_tracked_only:
+        git_result = subprocess.run(
+            ["git", "-C", str(source_root), "ls-files", "-z", "--", "*.py"],
+            check=False,
+            capture_output=True,
+        )
+        if git_result.returncode != 0:
+            detail = git_result.stderr.decode(errors="replace").strip()
+            raise OSError(f"Cannot list Git-tracked files under {source_root}: {detail}")
+        source_paths = [
+            source_root / relative_path
+            for relative_path in git_result.stdout.decode().split("\0")
+            if relative_path
+        ]
+    else:
+        source_paths = source_root.rglob("*.py")
+    for path in sorted(source_paths):
+        if not path.is_file():
+            continue
         relative_source_path = path.relative_to(source_root).as_posix()
         if any(fnmatch.fnmatch(relative_source_path, pattern) for pattern in excludes):
             continue
@@ -228,6 +251,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Glob relative to source_root to exclude; repeat as needed",
     )
+    parser.add_argument(
+        "--git-tracked-only",
+        action="store_true",
+        help="Ignore untracked Python files so the report represents the current branch",
+    )
     parser.add_argument("--json", action="store_true", help="Emit a machine-readable report")
     parser.add_argument("--fail-empty", action="store_true", help="Return 1 when no calls match")
     return parser
@@ -237,7 +265,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         operations = scan_sensitive_operations(
-            args.source_root, categories=args.category, exclude_globs=args.exclude
+            args.source_root,
+            categories=args.category,
+            exclude_globs=args.exclude,
+            git_tracked_only=args.git_tracked_only,
         )
     except (FileNotFoundError, OSError, SyntaxError) as error:
         print(f"error: {error}", file=sys.stderr)

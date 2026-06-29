@@ -347,6 +347,16 @@ small set of reductions and dispatch choices. They are fully enumerated in
   collectives, 3 indexed reductions, 43 indexed writes/gathers, 59 ordering
   calls, and 12 controls (report SHA256 `d16379e25326…`, manifest SHA256
   `9c55455b1f70…`).
+  The final branch now supports `--git-tracked-only`, so local scratch files do
+  not contaminate this inventory. At MCore `a5b284629`, the tracked report has
+  284 candidates across 88 files: 82 floating reductions, 81 rank-indexed
+  collectives, 4 indexed reductions, 44 indexed writes/gathers, 60 ordering
+  calls, and 13 controls. The six additions since `d76d4b600` are exactly the
+  fixed-order final-gradient all-to-all/all-gather plus its control branch and
+  the fixed-order unpermute argsort/gather/fallback; both semantic operations
+  are classified in the catalog above. AWS-DFW job `540456` passed all five
+  focused scanner tests (`COMPLETED 0:0`; pytest SHA256 `2fdd72bfa913…`). The
+  retained tracked report has SHA256 `7c27d7021da5…`.
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by

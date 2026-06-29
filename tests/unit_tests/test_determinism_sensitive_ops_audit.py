@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import json
+import subprocess
 
 from tools.determinism.audit_sensitive_ops import main, scan_sensitive_operations
 
@@ -78,6 +79,24 @@ def schedule(module, queue, coroutine):
     )
 
     assert scan_sensitive_operations(source_root) == []
+
+
+def test_git_tracked_only_ignores_untracked_sources(tmp_path):
+    source_root = tmp_path / "megatron"
+    source_root.mkdir()
+    tracked = source_root / "tracked.py"
+    tracked.write_text("tensor.index_add_(0, index, source)\n", encoding="utf-8")
+    (source_root / "untracked.py").write_text(
+        "torch.distributed.all_reduce(tensor)\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", str(tracked)], check=True)
+
+    operations = scan_sensitive_operations(source_root, git_tracked_only=True)
+
+    assert [(operation.path, operation.call) for operation in operations] == [
+        ("megatron/tracked.py", "tensor.index_add_")
+    ]
 
 
 def test_missing_or_empty_source_root_has_distinct_exit_codes(tmp_path, capsys):
