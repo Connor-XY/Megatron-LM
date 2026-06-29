@@ -130,6 +130,7 @@ These features are currently **incompatible** with deterministic mode:
 | `tp_comm_overlap` (async TP) | `determinism.py` (forces off) | Async NCCL collective ordering varies |
 | Multiple distributed-optimizer instances | `determinism.py` assert | The cross-instance floating-point reduction is not ordered |
 | `ddp_average_in_collective` | `determinism.py` assert | AVG must follow the rank-ordered SUM, not occur inside NCCL |
+| Megatron-FSDP | `determinism.py` assert | Its native all-reduce/reduce-scatter path does not yet provide fixed-rank accumulation |
 | Packed sequence (`thd`) in gated-delta-net | `ssm/gated_delta_net.py:314` assert | No deterministic packed-seq SSM path |
 
 > **Open question (tracked in the roadmap docs):** it is not fully established
@@ -180,7 +181,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
   all-reduce and reduce-scatter from both synchronous and overlapped pipelines
   and does not consume the ordered-fp32 flag. The checked-in FSDP8 proxy cells
   only repeat within one initialized topology. This does not affect the Ultra
-  production launcher, which uses the standard distributed optimizer.
+  production launcher, which uses the standard distributed optimizer. The
+  fail-closed MCore and Bridge validation tests passed in AWS-CMH job `719072`
+  (`COMPLETED 0:0`; console SHA256 `1cb105e7ecf0…`, evidence-manifest SHA256
+  `47638ad5d151…`).
 - **TE attention** (`extensions/transformer_engine.py:1697`): asserts
   `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` when `deterministic_mode` is on, then TE
   filters Flash/Fused/Unfused backends by input-specific deterministic support.

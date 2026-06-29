@@ -55,6 +55,10 @@ def apply_determinism_to_args(args) -> None:
     assert (
         not args.cross_entropy_loss_fusion
     ), "Cross Entropy Fusion is currently not deterministic."
+    assert not args.use_megatron_fsdp, (
+        "Deterministic mode does not support --use-megatron-fsdp: its gradient "
+        "all-reduce/reduce-scatter path does not yet provide fixed-rank accumulation."
+    )
 
     # NB: ``--use-flash-attn`` is intentionally NOT rejected under
     # --deterministic-mode. FlashAttention is deterministic on supported

@@ -16,6 +16,7 @@ def _args(**overrides):
     values = {
         "cross_entropy_loss_fusion": False,
         "tp_comm_overlap": False,
+        "use_megatron_fsdp": False,
         "use_distributed_optimizer": True,
         "num_distributed_optimizer_instances": 1,
         "ddp_average_in_collective": False,
@@ -65,6 +66,13 @@ def test_non_distributed_optimizer_does_not_enable_reduce_scatter(monkeypatch):
     apply_determinism_to_args(args)
 
     assert args.ddp_reduce_scatter_with_fp32_accumulation is False
+
+
+def test_megatron_fsdp_fails_closed(monkeypatch):
+    monkeypatch.setattr(torch, "use_deterministic_algorithms", Mock())
+
+    with pytest.raises(AssertionError, match="does not support --use-megatron-fsdp"):
+        apply_determinism_to_args(_args(use_megatron_fsdp=True))
 
 
 def test_mamba_determinism_disables_cold_cache_autotuning(monkeypatch):
