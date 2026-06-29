@@ -223,9 +223,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
   exact named wgrad/updated-parameter hashes. An additional opt-in records local
   main parameters and direct tensor/scalar optimizer state before and after the
   step using stable optimizer/group/parameter ordinals, localizing Adam moment
-  divergence without adding communication. Megatron activation checkpointing
-  records paired forward/recompute fingerprints and reports their within-run
-  identity. The shared MoE all-to-all wrapper records semantically named
+  divergence without adding communication. Megatron and Transformer Engine
+  activation checkpointing plus `CheckpointWithoutOutput` record paired
+  forward/recompute fingerprints and report their within-run identity. The
+  shared MoE all-to-all wrapper records semantically named
   dispatch/combine inputs and outputs in original forward, activation
   recompute, and backward. Pipeline P2P tracing records sends and completed
   receives at the schedule's existing synchronous, batched, or overlapped wait
@@ -275,7 +276,11 @@ small set of reductions and dispatch choices. They are fully enumerated in
   linear focused test then passed on every rank in job `3617204` (log SHA256
   `a57bb228c848…`); job `3617239` passed the expanded 21-test trace file on all
   four ranks (log SHA256 `834bb84b0e2b…`), and job `3617240` passed all three
-  legacy layer cases on all eight ranks (log SHA256 `f148bed8acc0…`).
+  legacy layer cases on all eight ranks (log SHA256 `f148bed8acc0…`). HSG job
+  `3632592` passed the final 24-test trace file on all four ranks, including a
+  real CUDA/TE autograd checkpoint and output-discarding recompute; every Slurm
+  step completed `0:0` (log SHA256 `0cbe18944114…`, source-manifest SHA256
+  `55657144c167…`).
 - **Strict external-recipe log gate (added):**
   `tools/determinism/compare_training_logs.py` compares every logged iteration
   and every nonvolatile serialized metric, requires loss and grad norm by
@@ -544,9 +549,10 @@ small set of reductions and dispatch choices. They are fully enumerated in
    optimizer parameters and moment state. Nsight SQLite attribution now maps
    selected NVTX ranges to the exact causally launched CUDA kernel identities,
    deduplicating launches covered by nested ranges. TP userbuffer payloads, TE
-   FP8/FP4 recompute, and in-process kernel selection are still missing. Native
-   floating-point TP reductions and the non-distributed-optimizer DP all-reduce
-   also lack topology-independent paths.
+   internal FP8/FP4 quantizer state, and in-process kernel selection are still
+   missing; TE checkpoint inputs/outputs and forward/recompute identity are now
+   covered. Native floating-point TP reductions and the non-distributed-
+   optimizer DP all-reduce also lack topology-independent paths.
 
 ## 9. References
 

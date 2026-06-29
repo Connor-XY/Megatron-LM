@@ -19,6 +19,11 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.determinism_trace import (
+    begin_recompute_trace,
+    record_recompute_phase,
+    use_determinism_trace,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -3082,9 +3087,26 @@ def te_checkpoint(
 
     from transformer_engine.pytorch.distributed import checkpoint
 
+    trace_handle = begin_recompute_trace(forward_func, {"args": args, "kwargs": kwargs})
+    if trace_handle is not None:
+        phase = "forward"
+
+        def traced_forward_func(*forward_args, **forward_kwargs):
+            nonlocal phase
+            current_phase = phase
+            with use_determinism_trace(trace_handle.trace, collective_phase=current_phase):
+                outputs = forward_func(*forward_args, **forward_kwargs)
+            record_recompute_phase(trace_handle, current_phase, outputs)
+            phase = "recompute"
+            return outputs
+
+        checkpoint_forward_func = traced_forward_func
+    else:
+        checkpoint_forward_func = forward_func
+
     if is_te_min_version("1.5.0"):
         return checkpoint(
-            forward_func,
+            checkpoint_forward_func,
             *args,
             distribute_saved_activations=distribute_saved_activations,
             get_rng_state_tracker=get_rng_state_tracker,
@@ -3093,7 +3115,11 @@ def te_checkpoint(
         )
     else:
         return checkpoint(
-            forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args
+            checkpoint_forward_func,
+            distribute_saved_activations,
+            get_rng_state_tracker,
+            tp_group,
+            *args,
         )
 
 

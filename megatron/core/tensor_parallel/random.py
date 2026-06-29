@@ -692,6 +692,8 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
+        ctx.determinism_trace_handle = checkpoint_without_output_obj.determinism_trace_handle
+        record_recompute_phase(ctx.determinism_trace_handle, "forward", outputs)
         ctx.save_for_backward(*detach_variable(args))
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
@@ -706,7 +708,11 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         # This is to avoid double-reloading the inputs in CPU offloading scenario.
         inputs = ctx.inputs
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
+        determinism_trace = (
+            ctx.determinism_trace_handle.trace if ctx.determinism_trace_handle is not None else None
+        )
+        with use_determinism_trace(determinism_trace, collective_phase="backward"):
+            torch.autograd.backward(outputs, args)
         ctx.outputs = None
         ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
@@ -735,6 +741,7 @@ class CheckpointWithoutOutput(object):
         self.fwd_cuda_rng_state_tracker = None
         self.ctx = None
         self.outputs = None
+        self.determinism_trace_handle = None
 
     def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
         """Checkpoint function."""
@@ -747,6 +754,7 @@ class CheckpointWithoutOutput(object):
             return run_function(*args)
 
         self.run_function = run_function
+        self.determinism_trace_handle = begin_recompute_trace(run_function, args)
 
         self.rng_states = _get_all_rng_states()
 
@@ -795,11 +803,23 @@ class CheckpointWithoutOutput(object):
                 return t
 
             inputs = tuple(detach(t) for t in inputs)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            determinism_trace = (
+                self.determinism_trace_handle.trace
+                if self.determinism_trace_handle is not None
+                else None
+            )
+            with (
+                torch.enable_grad(),
+                fp8_ctx,
+                recompute_ctx,
+                use_determinism_trace(determinism_trace, collective_phase="recompute"),
+            ):
                 outputs = self.run_function(*inputs)
+        record_recompute_phase(self.determinism_trace_handle, "recompute", outputs)
 
         self.run_function = None
         self.rng_states = None
+        self.determinism_trace_handle = None
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

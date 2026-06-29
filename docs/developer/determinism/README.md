@@ -41,7 +41,9 @@ Use `--json` for automation and `--max-details N` to bound the report. Exit code
 This avoids treating PP/VPP hook arrival order as execution order, but it only
 localizes surfaces that the existing dump hooks capture. Use the structured
 trace below for recompute, optimizer, and collective boundaries; async TP
-userbuffer payloads and selected kernel identities remain follow-up surfaces.
+userbuffer payloads and in-process kernel selection remain follow-up surfaces.
+Captured kernel identities can be recovered offline with the Nsight attribution
+tool described below.
 Only compare trusted `.pth` files because PyTorch dump loading uses pickle
 serialization.
 
@@ -92,8 +94,9 @@ pretrain_gpt.py ... \
 ```
 
 The trace records determinism-relevant runtime configuration, forward/backward
-and optimizer boundaries, Megatron activation-checkpoint forward/recompute
-identities, and semantic MoE expert-parallel all-to-all boundaries. With
+and optimizer boundaries, Megatron and Transformer Engine activation-checkpoint
+forward/recompute identities, output-discarding checkpoint recomputation, and
+semantic MoE expert-parallel all-to-all boundaries. With
 `--determinism-trace-tensor-hashes`, it also records exact wgrad, updated
 parameter, checkpoint, all-to-all, pipeline P2P, DP gradient-reduction, and
 distributed-optimizer parameter-gather hashes. It also fingerprints the
@@ -128,17 +131,19 @@ python tools/determinism/compare_traces.py \
 
 Exit codes match `compare_dumps.py`: 0 is a match, 1 is a divergence, and 2 is
 invalid input. Use `--json` for automation. The current integration covers the
-Megatron tensor-parallel activation-checkpoint implementation, optimizer
+Megatron tensor-parallel and Transformer Engine activation-checkpoint
+implementations, output-discarding checkpoint recomputation, optimizer
 inputs/outputs, the standard MoE expert-parallel all-to-all dispatcher, pipeline
 P2P sends/receives, DP all-reduce/reduce-scatter, and distributed-optimizer
 parameter all-gather, synchronous TP mapping all-reduce/all-gather/
 reduce-scatter, core TP linear synchronous/async collectives, plus opt-in local
-optimizer main parameters and moment state. TP userbuffer payloads, TE FP8/FP4
-recompute, and in-process kernel selection remain follow-up instrumentation
-surfaces. Actual kernel identities from a captured iteration can be recovered
-from an Nsight Systems SQLite export with `attribute_nsys_ranges.py --kernels`.
-Native floating-point TP SUM ordering remains a determinism-path gap even though
-its payload is now observable.
+optimizer main parameters and moment state. TE FP8/FP4 checkpoint boundaries
+are covered, but internal quantizer state is not independently fingerprinted.
+TP userbuffer payloads and in-process kernel selection remain follow-up
+instrumentation surfaces. Actual kernel identities from a captured iteration
+can be recovered from an Nsight Systems SQLite export with
+`attribute_nsys_ranges.py --kernels`. Native floating-point TP SUM ordering
+remains a determinism-path gap even though its payload is now observable.
 
 For a scaled model run, use the stricter certifier instead of relying on a trace
 comparison alone:

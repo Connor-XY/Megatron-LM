@@ -13,6 +13,7 @@ from megatron.core.determinism_trace import (
     active_trace,
     begin_collective_trace,
     begin_recompute_trace,
+    collective_trace_phase,
     record_collective_result,
     record_event,
     record_optimizer_state,
@@ -20,8 +21,12 @@ from megatron.core.determinism_trace import (
     record_tensor,
     trace_iteration,
 )
+from megatron.core.extensions import transformer_engine as te_extension
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.parallel_state import get_pipeline_model_parallel_group
+from megatron.core.parallel_state import (
+    get_pipeline_model_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.tensor_parallel.layers import (
     linear_with_frozen_weight,
@@ -36,7 +41,12 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_last_dim_to_tensor_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.tensor_parallel.random import checkpoint
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    checkpoint,
+    get_cuda_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from tests.unit_tests.distributed.test_param_and_grad_buffer import get_model_and_buffers
 from tests.unit_tests.test_utilities import Utils
 
@@ -122,6 +132,90 @@ def test_recompute_trace_detects_changed_output(tmp_path):
     events = _read_events(_trace_path(tmp_path, 4))
     recompute = next(event for event in events if event["name"] == "checkpoint.recompute")
     assert recompute["payload"]["matches_forward"] is False
+
+
+def test_te_checkpoint_records_paired_recompute(tmp_path, monkeypatch):
+    phases = []
+
+    def checkpointed(value, scale):
+        phases.append(collective_trace_phase())
+        return value.square() * scale
+
+    def fake_te_checkpoint(function, *args, **kwargs):
+        for key in ("distribute_saved_activations", "get_rng_state_tracker", "tp_group"):
+            kwargs.pop(key)
+        function(*args, **kwargs)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(te_extension, "HAVE_TE", True)
+    monkeypatch.setattr(te_extension, "is_te_min_version", lambda _: True)
+    monkeypatch.setattr("transformer_engine.pytorch.distributed.checkpoint", fake_te_checkpoint)
+
+    tensor = torch.tensor([1.0, 2.0])
+    with trace_iteration(tmp_path, 20, hash_tensors=True):
+        output = te_extension.te_checkpoint(checkpointed, False, None, None, tensor, scale=2)
+
+    torch.testing.assert_close(output, tensor.square() * 2)
+    assert phases == ["forward", "recompute"]
+    events = _read_events(_trace_path(tmp_path, 20))
+    recompute = [event for event in events if event["kind"] == "recompute"]
+    assert [event["name"] for event in recompute] == ["checkpoint.forward", "checkpoint.recompute"]
+    assert recompute[1]["payload"]["matches_forward"] is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not te_extension.HAVE_TE,
+    reason="Transformer Engine checkpoint integration requires CUDA and TE",
+)
+def test_te_checkpoint_autograd_records_paired_recompute(tmp_path):
+    phases = []
+
+    def checkpointed(value):
+        phases.append(collective_trace_phase())
+        return value.square()
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        tensor = torch.tensor([1.0, 2.0], device="cuda", requires_grad=True)
+        with trace_iteration(tmp_path, 22, hash_tensors=True):
+            output = te_extension.te_checkpoint(
+                checkpointed, False, get_cuda_rng_tracker, get_tensor_model_parallel_group(), tensor
+            )
+            output.sum().backward()
+
+        assert phases == ["forward", "recompute"]
+        events = _read_events(_trace_path(tmp_path, 22))
+        recompute = [event for event in events if event["kind"] == "recompute"]
+        assert [event["name"] for event in recompute] == [
+            "checkpoint.forward",
+            "checkpoint.recompute",
+        ]
+        assert recompute[1]["payload"]["matches_forward"] is True
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_output_records_paired_recompute(tmp_path):
+    phases = []
+
+    def checkpointed(value):
+        phases.append(collective_trace_phase())
+        return value.square()
+
+    tensor = torch.tensor([1.0, 2.0], requires_grad=True)
+    with trace_iteration(tmp_path, 21, hash_tensors=True):
+        checkpoint_object = CheckpointWithoutOutput()
+        activation = checkpoint_object.checkpoint(checkpointed, tensor)
+        output = activation * tensor
+        checkpoint_object.discard_output_and_register_recompute(output)
+        output.sum().backward()
+
+    assert phases == ["forward", "recompute"]
+    events = _read_events(_trace_path(tmp_path, 21))
+    recompute = [event for event in events if event["kind"] == "recompute"]
+    assert [event["name"] for event in recompute] == ["checkpoint.forward", "checkpoint.recompute"]
+    assert recompute[1]["payload"]["matches_forward"] is True
 
 
 def test_nonfinite_payloads_remain_valid_json(tmp_path):
