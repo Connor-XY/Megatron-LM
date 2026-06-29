@@ -1,4 +1,14 @@
+---
+orphan: true
+---
+
 # Determinism Op Catalog
+
+> **Audience:** developers and maintainers reviewing implementation paths. This
+> is not a quick-start guide. Terms such as DP, TP, PP, and EP are defined in
+> the [glossary](./glossary.md). Detailed cluster and job provenance is retained
+> in the [maintainer evidence ledger](./internal-evidence.md), not in the user
+> guide.
 
 The per-operation catalog of determinism in Megatron-Core. For the narrative walk
 see [`training-path.md`](./training-path.md); for the control plane and targets see

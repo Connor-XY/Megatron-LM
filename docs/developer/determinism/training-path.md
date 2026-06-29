@@ -1,4 +1,13 @@
+---
+orphan: true
+---
+
 # Determinism Branch Map — A Walk Through One Training Step
+
+> **Audience:** developers tracing the implementation. For setup instructions,
+> use the [user guide](../../user-guide/deterministic-training.md); for cluster
+> provenance, use the [maintainer evidence ledger](./internal-evidence.md).
+> Abbreviations are defined in the [glossary](./glossary.md).
 
 This is a forward→backward→optimizer walk through a Megatron training step,
 calling out **every place where determinism enters or is decided**. Each entry

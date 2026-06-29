@@ -1,23 +1,32 @@
-# Determinism (developer docs)
+---
+orphan: true
+---
 
-Developer reference for bit-exact deterministic training in Megatron-Core: the
-current status, the per-op catalog, and the training-step branch map. This is the
-foundation artifact for the determinism roadmap (validation, performance, tooling).
+# Determinism developer reference
 
-> User-facing "how do I turn it on" guide: `docs/user-guide/deterministic-training.md`.
+> **Audience:** Megatron developers and reviewers. This reference explains the
+> implementation and debugging tools; it is not the setup guide for people
+> launching training.
+>
+> Start with the [Deterministic Training user guide](../../user-guide/deterministic-training.md)
+> for supported setup and constraints. Cluster-specific provenance is kept out
+> of this reading path and retained in the
+> [maintainer evidence ledger](./internal-evidence.md).
 
 ## Contents
 
-1. **[`status.md`](./status.md)** — start here. Definition of bitwise determinism,
-   why it's hard, the perf targets (~15% → <10% → 5%), the control plane
-   (`--deterministic-mode`, `determinism.py`, env vars), enforced limitations, the
-   determinism branch surface, validation status, and known gaps.
+1. **[`status.md`](./status.md)** — start here. Supported behavior, limitations,
+   evidence policy, and the upstream state without internal run provenance.
 2. **[`training-path.md`](./training-path.md)** — a forward→backward→optimizer walk
    that flags every point where determinism enters or is decided, with file:line
    refs and a 🟢/🔵/🟡/🔴 status for each.
 3. **[`op-catalog.md`](./op-catalog.md)** — the per-operation catalog table
    (det? / det path / non-det path / how selected / evidence / perf Δ / gap), plus
    the perf hotspot priority list and the verification backlog.
+4. **[`glossary.md`](./glossary.md)** — expansion of the parallelism and kernel
+   abbreviations used by the developer references.
+5. **[`internal-evidence.md`](./internal-evidence.md)** — maintainer-only cluster
+   records, job identifiers, artifact hashes, and historical measurements.
 
 ## Audit source candidates for the operation catalog
 

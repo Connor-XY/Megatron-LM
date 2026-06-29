@@ -1,91 +1,90 @@
 <!---
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
-   and proprietary rights in and to this software, related documentation
-   and any modifications thereto. Any use, reproduction, disclosure or
-   distribution of this software and related documentation without an express
-   license agreement from NVIDIA CORPORATION is strictly prohibited.
+   and proprietary rights in and to this software and related documentation.
 -->
 
 # Deterministic Training
 
-Deterministic training guarantees that two runs with identical inputs produce identical outputs at every step. Useful for debugging regressions and for reproducibility studies.
+> **Audience:** people launching Megatron training. This guide explains how to
+> enable reproducible training and what to expect. It intentionally excludes
+> internal test names, cluster labels, job identifiers, and engineering
+> provenance.
 
-Pass `--deterministic-mode` to any Megatron training entry point (e.g. `pretrain_gpt.py`):
+Deterministic mode makes two equivalent training runs produce the same model
+outputs, gradients, and recorded training metrics. It is useful when
+investigating a regression, reproducing a training issue, or validating a
+change to the training stack.
+
+## Enable deterministic mode
+
+Add `--deterministic-mode` to the normal training command:
 
 ```bash
 python pretrain_gpt.py \
   --deterministic-mode \
-  <other args ...>
+  <other training options>
 ```
 
-When enabled, Megatron applies the env vars and config overrides below via `megatron.training.determinism.apply_determinism_to_args` (called from `validate_args`).
+Use the same command, input data order, random seed, container or software
+versions, hardware class, and parallel layout for both runs. Deterministic mode
+cannot make two intentionally different configurations identical.
 
-## Environment variables
+## What Megatron changes
 
-The cuBLAS / Transformer Engine / NCCL defaults use `os.environ.setdefault`,
-so a user-supplied value wins. The Mamba controls are forced to their safe
-values because timing-selected cold-cache Triton configs are not reproducible.
-All five must take effect before their libraries or kernel modules initialize;
-`pretrain_hybrid.py` performs a lightweight argv bootstrap before importing
-torch or the hybrid model, then `apply_determinism_to_args` repeats the setup
-during validation as defense in depth.
+Megatron enables deterministic PyTorch behavior and selects conservative
+collective and kernel settings. It also avoids or rejects optimizations whose
+numerical order is not currently certified.
 
-| Variable | Value | Reason |
-|---|---|---|
-| `NCCL_ALGO` | `Ring` | Conservative algorithm choice; it avoids tree-order variability but does not by itself guarantee the same floating-point rank order across allocations |
-| `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | `0` | Forces Transformer Engine to use deterministic algorithms |
-| `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` | Disables cuBLAS heuristic workspace selection |
-| `MAMBA_DETERMINISTIC` | `1` | Enables deterministic Mamba reduction workspaces |
-| `TRITON_CACHE_AUTOTUNING` | `0` | Selects one fixed Triton config at import instead of timing all configs against a cold cache |
+| Area | What to expect |
+| --- | --- |
+| Gradient reduction | Reproducible accumulation order where floating-point addition would otherwise depend on runtime topology. |
+| Attention and kernel libraries | Only supported deterministic kernel choices are allowed. Megatron may choose a slower compatible implementation. |
+| Mixture-of-experts routing | Uses the certified dispatch path instead of unsupported fused dispatchers. |
+| Hybrid sequence models | Uses deterministic workspaces and fixed kernel-selection settings. |
 
-If you override `NCCL_ALGO`, the value must be a comma-separated subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for validating the fallback on their environment. Even `Ring` can map ranks to a different physical ring on a new allocation. Megatron therefore uses rank-ordered reductions for deterministic distributed-optimizer gradients and small floating-point statistics instead of treating `NCCL_ALGO` as a complete guarantee.
+You normally do not need to set environment variables manually. Megatron
+configures the required runtime values early in startup. If your launcher must
+set them itself, use the same values for both runs and set them before importing
+GPU kernel libraries.
 
-## Config overrides
+## Features that are currently incompatible
 
-Applied to the parsed `args` Namespace in `apply_determinism_to_args`:
+Deterministic mode stops rather than silently weakening its guarantees when a
+known unsupported feature is enabled. In particular, do not combine it with:
 
-| Flag | Behavior under `--deterministic-mode` |
-|---|---|
-| `--cross-entropy-loss-fusion` | Must be off (asserted; fused CE is non-deterministic) |
-| `--moe-token-dispatcher-type flex` | Replaced by the certified standard `alltoall` dispatcher; direct deterministic configs that retain DeepEP/HybridEP are rejected |
-| `--tp-comm-overlap` | Forced off (the overlap path uses non-deterministic NCCL collectives) |
-| `--ddp-reduce-scatter-with-fp32-accumulation` | Forced on with the distributed optimizer; rank-ordered all-to-all plus local fp32 accumulation removes allocation-topology-dependent reduction order |
-| `--ddp-reduce-scatter-hierarchical-group-size N` | Optional production optimization for the ordered fp32 path; reduce fixed contiguous logical groups of `N` ranks before exchanging fp32 partials across groups |
-| `--ddp-average-in-collective` | Must be off with the distributed optimizer; averaging is applied outside the ordered sum |
-| `--num-distributed-optimizer-instances` | Must be 1; the multi-instance reduction path is not yet certified |
-| `torch.use_deterministic_algorithms` | Set to `True` |
+- fused cross-entropy loss;
+- tensor-parallel communication overlap;
+- uncertified fused mixture-of-experts dispatch;
+- multiple distributed-optimizer instances;
+- collective averaging inside the distributed optimizer; or
+- Megatron-FSDP.
 
-The hierarchical group size is intentionally not inferred from node placement:
-changing it changes the floating-point reduction tree. Choose one fixed logical
-size for a recipe and keep it unchanged across runs. It must be greater than
-one, smaller than and divide the data+context-parallel size, and it requires the
-distributed optimizer plus fp32-accumulation reduce-scatter. For example, use
-`N=4` when every four contiguous logical DP ranks consistently form the desired
-local communication domain.
+The error message identifies the incompatible option. Remove that option or use
+a supported configuration before retrying.
 
-Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html)).
+## Verify a run
 
-Mamba training retains the fused memory-efficient path. Its deterministic
-reduction workspaces are enabled with `MAMBA_DETERMINISTIC=1`, while disabling
-cold-cache timing autotuning pins the Triton reduction tiling. This setup must
-happen before importing the Mamba kernels; use the standard
-`pretrain_hybrid.py --deterministic-mode` entry point or call
-`megatron.determinism_env.set_determinism_env_vars()` equally early in a custom
-launcher.
+For an initial check, run the same command twice and compare the complete
+per-iteration metrics, not only the final loss. For a production investigation,
+capture a short deterministic trace or selected tensor dumps from both runs and
+compare them with the supplied tools.
 
-## Verifying determinism
+A matching log is a useful signal, but it is not a full numerical certificate:
+different tensors can round to the same printed metric. The developer guide
+explains the stricter trace and dump workflows.
 
-The bit-exact correctness suite lives at `tests/unit_tests/determinism/correctness/`. It parametrizes over model presets (GPT-like, Llama-like, Hybrid/Mamba) × parallelism cells (TP, PP, VPP, EP, FSDP, and composites) and asserts that two runs of the same configuration produce bit-identical outputs and gradients. FP8 / FP4 recipes (`tensorwise`, `delayed`, `mxfp8`, `nvfp4`) are covered by `tests/unit_tests/determinism/correctness/test_fp8_determinism.py`; the Blackwell-only recipes are capability-skipped on Hopper.
+## Performance expectations
 
-The cost of `--deterministic-mode` is measured outside pytest by an nsys-driven per-NVTX-range breakdown: `tests/performance_tests/shell_test_utils/determinism/run_nsys_breakdown.sh` wraps any training entry point (e.g. `pretrain_gpt.py --profile`) under nsys for a det-vs-nondet comparison, and `tests/performance_tests/shell_test_utils/determinism/print_nsys_leaderboard.py` joins the two CSVs into a side-by-side table. The CI invocation lives at `tests/test_utils/recipes/h100/determinism-perf.yaml`.
+Deterministic mode can be slower because it replaces timing-sensitive or
+order-dependent operations with reproducible implementations. Measure a
+representative workload before enabling it broadly. The implementation avoids
+extra work where the result is provably unchanged, but the remaining cost
+depends on the model, sequence length, hardware, and enabled features.
 
-For multi-node certification, enable tensor hashes for a bounded trace window in
-two independent launches, then run `tools/determinism/certify_traces.py` over
-the two trace roots. The certifier validates runtime state, coverage, recompute
-identity, collective completion and hashes, ordered DP accumulation, and exact
-semantic trace equality. Pass
-`--require-dp-hierarchical-fp32-accumulation` when the recipe enables the
-hierarchy; it requires the hierarchical path for every multi-rank DP reduction.
-The certifier exits nonzero for either a missing invariant or a numerical
-divergence.
+## Need more detail?
+
+- [Developer determinism reference](../developer/determinism/README.md) —
+  architecture, operation catalog, profiling, and debugging tools.
+- [Determinism status](../developer/determinism/status.md) — supported
+  behavior, limitations, and the standard for validation claims.
