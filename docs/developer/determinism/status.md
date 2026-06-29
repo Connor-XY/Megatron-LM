@@ -88,9 +88,10 @@ not consistently closed.
 
 ### 4.1 Upstream state
 
-PR #5041 is closed and there is currently no determinism PR against
-`NVIDIA/main`. This branch still contains the stacked implementation and tests
-described below; none of them are an upstream guarantee.
+PR #5041 is **open** against `NVIDIA/main`. This branch is stacked on that PR's
+current head and adds the implementation, tests, diagnostics, and evidence
+described below; the additional commits have no separate upstream PR yet and
+are not an upstream guarantee.
 
 The config flag is `model_parallel_config.py` `deterministic_mode: bool = False`,
 threaded into `TransformerConfig`; library code reads that flag or
