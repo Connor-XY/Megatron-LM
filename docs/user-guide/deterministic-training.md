@@ -48,6 +48,7 @@ Applied to the parsed `args` Namespace in `apply_determinism_to_args`:
 | Flag | Behavior under `--deterministic-mode` |
 |---|---|
 | `--cross-entropy-loss-fusion` | Must be off (asserted; fused CE is non-deterministic) |
+| `--moe-token-dispatcher-type flex` | Replaced by the certified standard `alltoall` dispatcher; direct deterministic configs that retain DeepEP/HybridEP are rejected |
 | `--tp-comm-overlap` | Forced off (the overlap path uses non-deterministic NCCL collectives) |
 | `--ddp-reduce-scatter-with-fp32-accumulation` | Forced on with the distributed optimizer; rank-ordered all-to-all plus local fp32 accumulation removes allocation-topology-dependent reduction order |
 | `--ddp-reduce-scatter-hierarchical-group-size N` | Optional production optimization for the ordered fp32 path; reduce fixed contiguous logical groups of `N` ranks before exchanging fp32 partials across groups |

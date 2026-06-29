@@ -1456,6 +1456,12 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_token_dispatcher_type == "flex":
+            if self.deterministic_mode:
+                raise ValueError(
+                    "Deterministic mode does not support the flex MoE dispatcher: "
+                    "DeepEP and HybridEP do not yet have a certified fixed-order path. "
+                    "Use moe_token_dispatcher_type='alltoall'."
+                )
             if self.moe_pad_expert_input_to_capacity and (
                 self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
             ):

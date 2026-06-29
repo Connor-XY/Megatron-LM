@@ -108,8 +108,9 @@ threaded into `TransformerConfig`; library code reads that flag or
   load-bearing: a cold autotune cache can choose different reduction tilings.
   `pretrain_hybrid.py` runs this bootstrap before importing `HybridModel`.
 - **`megatron.training.determinism.apply_determinism_to_args(args)`** rejects CE
-  fusion, validates `NCCL_ALGO` (excluding `Tree`), forces
-  `tp_comm_overlap=False`, and finally enables torch deterministic algorithms.
+  fusion, replaces uncertified DeepEP/HybridEP dispatch with standard all-to-all,
+  validates `NCCL_ALGO` (excluding `Tree`), forces `tp_comm_overlap=False`, and
+  finally enables torch deterministic algorithms.
   For the distributed optimizer it also requires one optimizer instance,
   rejects collective AVG, and forces ordered fp32 reduce-scatter.
 - **Small floating-point statistics** (gradient norm, reported loss, and MoE
@@ -127,6 +128,7 @@ These features are currently **incompatible** with deterministic mode:
 | Feature | Where enforced | Reason |
 | --- | --- | --- |
 | `cross_entropy_loss_fusion` | `arguments.py:1502` / `determinism.py` assert | Fused CE kernel is non-deterministic |
+| Flex MoE dispatcher (DeepEP/HybridEP) | `determinism.py` switches to standard all-to-all; `TransformerConfig` rejects any surviving flex config | External fused dispatch/combine kernels do not yet have a fixed-order cross-allocation certificate |
 | `tp_comm_overlap` (async TP) | `determinism.py` (forces off) | Async NCCL collective ordering varies |
 | Multiple distributed-optimizer instances | `determinism.py` assert | The cross-instance floating-point reduction is not ordered |
 | `ddp_average_in_collective` | `determinism.py` assert | AVG must follow the rank-ordered SUM, not occur inside NCCL |
@@ -161,6 +163,14 @@ small set of reductions and dispatch choices. They are fully enumerated in
   atomics or reductions. Unsupported devices, dtypes, layouts, or missing
   Triton retain collision-free in-place `scatter_`; normal mode keeps the
   out-of-place `scatter` path.
+- **Flex MoE dispatch** (`transformer/moe/token_dispatcher.py`): DeepEP and
+  HybridEP fuse permutation, communication, and combine inside external kernels
+  whose token-arrival/reduction order is not controlled or traced by MCore.
+  Deterministic CLI and Bridge overrides therefore select the certified standard
+  all-to-all dispatcher, while direct configs that retain `flex` fail closed.
+  AWS-CMH job `721485` passed the MCore guard on every one of four ranks plus
+  both Bridge override/validator tests; job `721541` passed the target
+  DeepSeek-V3 recipe switch (`COMPLETED 0:0`; pytest SHA256 `30bafb911e8c…`).
 - **MoE top-k under activation checkpointing** (`moe_utils.py`): deterministic
   mode keeps `sorted=True` in both no-grad forward and grad-enabled recompute.
 - **Router expert-bias counts** (`transformer/moe/router.py`,

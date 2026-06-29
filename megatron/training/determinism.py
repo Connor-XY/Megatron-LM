@@ -41,9 +41,10 @@ def apply_determinism_to_args(args) -> None:
     2. Sets env vars via :func:`set_determinism_env_vars`. A user-supplied
        cuBLAS/TE/NCCL value survives its setdefault; Mamba deterministic mode
        and cold-cache Triton autotuning are forced to safe values.
-    3. Forces ``tp_comm_overlap=False`` (non-deterministic NCCL collectives).
-    4. Uses rank-ordered FP32 accumulation for distributed-optimizer gradient reduction.
-    5. Calls ``torch.use_deterministic_algorithms(True)``.
+    3. Replaces uncertified fused MoE dispatch with the standard all-to-all dispatcher.
+    4. Forces ``tp_comm_overlap=False`` (non-deterministic NCCL collectives).
+    5. Uses rank-ordered FP32 accumulation for distributed-optimizer gradient reduction.
+    6. Calls ``torch.use_deterministic_algorithms(True)``.
 
     The argument assertion runs FIRST so a malformed args Namespace fails
     fast without leaving the process in a half-deterministic state (env
@@ -59,6 +60,16 @@ def apply_determinism_to_args(args) -> None:
         "Deterministic mode does not support --use-megatron-fsdp: its gradient "
         "all-reduce/reduce-scatter path does not yet provide fixed-rank accumulation."
     )
+
+    if args.moe_token_dispatcher_type == "flex":
+        from megatron.training.utils import warn_rank_0
+
+        warn_rank_0(
+            "Switching the uncertified flex MoE dispatcher to alltoall for deterministic mode."
+        )
+        args.moe_token_dispatcher_type = "alltoall"
+        args.moe_flex_dispatcher_backend = None
+        args.moe_shared_expert_overlap = False
 
     # NB: ``--use-flash-attn`` is intentionally NOT rejected under
     # --deterministic-mode. FlashAttention is deterministic on supported
