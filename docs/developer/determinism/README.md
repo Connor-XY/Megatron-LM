@@ -28,6 +28,9 @@ orphan: true
 5. **[`validation-evidence.md`](./validation-evidence.md)** — findings,
    conclusions, limits, and the evidence standard. Raw provenance is retained
    only in an ignored local record.
+6. **[`dsv4-assessment.md`](./dsv4-assessment.md)** — DeepSeek-V4 determinism
+   scope, DSA op verdicts, coverage added, effectiveness/performance, and the
+   gaps (mHC, CSA, suite-on-dev) still open for a full DSV4 claim.
 
 ## Audit source candidates for the operation catalog
 

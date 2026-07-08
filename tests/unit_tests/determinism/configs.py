@@ -157,6 +157,32 @@ def deepseek_base() -> dict:
     )
 
 
+# DeepSeek-V4-style proxy base: the DSV3 base plus DeepSeek Sparse Attention
+# (DSA — a lightning indexer scores tokens and top-k selection sparsifies core
+# attention). DSV4 = DSV3 (MLA + fine-grained MoE) + DSA; the dev branch adds
+# CSA and hyper-connections (mHC), which do not exist on this branch and are
+# therefore out of this preset's scope. This covers the DSA surface that does
+# exist here: the pure-torch unfused sparse attention plus the indexer with its
+# KL loss — `dsa_indexer_loss_coeff > 0` keeps the indexer-loss path, including
+# its tensor-parallel all-reduce of attention scores, on the training path.
+# The indexer applies RoPE to a `qk_pos_emb_head_dim`-wide slice of each indexer
+# head and leaves the remainder un-rotated, so `dsa_indexer_head_dim` must exceed
+# the MLA `qk_pos_emb_head_dim` (64 here) — 128 matches the functional DSA config
+# (`gpt3_mcore_te_tp2_pp2_dsa`) and yields a [64, 64] rope/nope split. topk 8 <
+# seq_len 32 keeps the selection genuinely sparse. DSA validation rejects context
+# parallelism and requires `apply_rope_fusion=False`.
+def deepseek_v4_base() -> dict:
+    return dict(
+        deepseek_base(),
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=4,
+        dsa_indexer_head_dim=128,
+        dsa_indexer_topk=8,
+        dsa_indexer_loss_coeff=0.01,
+        apply_rope_fusion=False,
+    )
+
+
 # Nemotron-3-Ultra-style proxy base: hybrid Mamba + attention + MoE. The real
 # recipe interleaves Mamba (``M``), attention (``*``) and MoE (``E``) layers
 # (pattern ``MEMEMEM*...``) with sigmoid + expert-bias routing. This adds MoE +
@@ -337,6 +363,39 @@ DEEPSEEK_PARALLELISM_CONFIGS = [
     pytest.param({"FSDP": 8}, id="fsdp8"),
     pytest.param({"PP": 2}, id="pp2"),
     pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+]
+
+
+# DeepSeek-V4 proxy presets. DSA + MLA + MoE config lives in
+# ``deepseek_v4_base()``; the single canonical cell keeps the matrix cheap while
+# the DSA-specific op paths are additionally covered per-op by
+# ``test_dsa_paths.py``.
+DEEPSEEK_V4_CONFIGS = [pytest.param({}, id="dsv4-like")]
+
+
+# DeepSeek-V4 proxy parallelism matrix — expert-parallel focused.
+#
+# ``tp2-ep2`` is load-bearing: it is the first distributed bit-exact coverage of
+# the DSA indexer-loss tensor-parallel all-reduce (dsa.py attention-score
+# reduction); at TP=2 that reduction is one addition per element and therefore
+# topology-independent (TP>2 cross-allocation remains an open gap — see
+# docs/developer/determinism/dsv4-assessment.md).
+#
+# Excluded, with reasons (not determinism failures):
+#   * CP — rejected by DSA config validation.
+#   * FSDP — the deterministic CLI rejects Megatron-FSDP; same-topology FSDP
+#     repeats add no cross-allocation evidence.
+#   * PP / VPP — DSA's indexer-loss logging tracker on this branch is not
+#     PP-safe: with PP>1 the per-stage tracker sizes are not negotiated across
+#     pipeline stages, so one stage issues a collective the other does not and
+#     the run HANGS on NCCL P2P setup (non-DSA proxies pass PP in the same
+#     runner). The dev branch's DSA rewrite adds PP/MTP-safe lazy tracker growth
+#     and cross-PP size negotiation; re-enable these cells after that lands.
+DEEPSEEK_V4_PARALLELISM_CONFIGS = [
+    pytest.param({"EP": 2}, id="ep2"),
+    pytest.param({"EP": 4}, id="ep4"),
+    pytest.param({"TP": 2, "EP": 2}, id="tp2-ep2"),
+    pytest.param({"TP": 2, "EP": 4}, id="tp2-ep4"),
 ]
 
 

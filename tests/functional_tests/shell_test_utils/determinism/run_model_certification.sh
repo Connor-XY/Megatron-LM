@@ -5,8 +5,8 @@
 set -euo pipefail
 
 MODEL=${1:-}
-if [[ "$MODEL" != "dsv3" && "$MODEL" != "nemotron" ]]; then
-    echo "Usage: $0 {dsv3|nemotron}" >&2
+if [[ "$MODEL" != "dsv3" && "$MODEL" != "nemotron" && "$MODEL" != "dsv4" ]]; then
+    echo "Usage: $0 {dsv3|nemotron|dsv4}" >&2
     exit 2
 fi
 
@@ -117,7 +117,7 @@ COMMON_ARGS=(
     --no-load-rng
 )
 
-if [[ "$MODEL" == "dsv3" ]]; then
+if [[ "$MODEL" == "dsv3" || "$MODEL" == "dsv4" ]]; then
     TRAINING_SCRIPT=pretrain_gpt.py
     MODEL_ARGS=(
         --num-layers 1
@@ -142,6 +142,23 @@ if [[ "$MODEL" == "dsv3" ]]; then
         --moe-router-pre-softmax
         --moe-router-topk-scaling-factor 2.5
     )
+    if [[ "$MODEL" == "dsv4" ]]; then
+        # DSV4-style = the DSV3 proxy plus DeepSeek Sparse Attention. Requires
+        # the fast_hadamard_transform package in the image (the DSA indexer
+        # asserts it). topk 8 stays below the 16-token proxy sequence; a
+        # nonzero indexer-loss coefficient keeps the indexer KL loss — and its
+        # tensor-parallel score reduction — on the certified training path.
+        # indexer head dim must exceed qk-pos-emb-head-dim (64) for the RoPE
+        # split; 128 matches the functional DSA config.
+        MODEL_ARGS+=(
+            --experimental-attention-variant dsa
+            --dsa-indexer-n-heads 16
+            --dsa-indexer-head-dim 128
+            --dsa-indexer-topk 8
+            --dsa-indexer-loss-coeff 0.01
+            --no-rope-fusion
+        )
+    fi
 else
     TRAINING_SCRIPT=pretrain_hybrid.py
     MODEL_ARGS=(
