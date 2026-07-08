@@ -19,7 +19,7 @@ orphan: true
    evidence policy, and the upstream state without internal run provenance.
 2. **[`training-path.md`](./training-path.md)** — a forward→backward→optimizer walk
    that flags every point where determinism enters or is decided, with file:line
-   refs and a 🟢/🔵/🟡/🔴 status for each.
+   refs and a ✔/◆/▲/✖ status for each (shape-coded legend defined there).
 3. **[`op-catalog.md`](./op-catalog.md)** — the per-operation catalog table
    (det? / det path / non-det path / how selected / evidence / perf Δ / gap), plus
    the perf hotspot priority list and the verification backlog.

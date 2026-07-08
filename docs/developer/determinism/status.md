@@ -88,10 +88,13 @@ end-to-end measurement before it is accepted.
 
 ### 4.1 Upstream state
 
-PR #5041 is **open** against `NVIDIA/main`. This branch is stacked on that PR's
-current head and adds the implementation, tests, diagnostics, and evidence
-described below; the additional commits have no separate upstream PR yet and
-are not an upstream guarantee.
+PR #5041 **merged into `NVIDIA/main` on 2026-07-08**, so the determinism test
+scaffold (`BitExactRunner`, the det-vs-nondet nsys leaderboard, and the
+`determinism.py` argument helpers) is upstream. This branch was stacked on that
+PR's pre-merge head and adds the implementation, tests, diagnostics, and
+evidence described below; those additional commits have **no separate upstream
+PR yet** and are not an upstream guarantee. A rebase onto post-merge `main` is
+pending.
 
 The config flag is `model_parallel_config.py` `deterministic_mode: bool = False`,
 threaded into `TransformerConfig`; library code reads that flag or
@@ -128,7 +131,7 @@ These features are currently **incompatible** with deterministic mode:
 
 | Feature | Where enforced | Reason |
 | --- | --- | --- |
-| `cross_entropy_loss_fusion` | `arguments.py:1502` / `determinism.py` assert | Fused CE kernel is non-deterministic |
+| `cross_entropy_loss_fusion` | `megatron/training/determinism.py` assert (`apply_determinism_to_args`, reached from `arguments.py` `validate_args`) | Fused CE kernel is non-deterministic |
 | Flex MoE dispatcher (DeepEP/HybridEP) | `determinism.py` switches to standard all-to-all; `TransformerConfig` rejects any surviving flex config | External fused dispatch/combine kernels do not yet have a fixed-order cross-allocation certificate |
 | `tp_comm_overlap` (async TP) | `determinism.py` (forces off) | Async NCCL collective ordering varies |
 | Multiple distributed-optimizer instances | `determinism.py` assert | The cross-instance floating-point reduction is not ordered |
