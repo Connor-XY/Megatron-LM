@@ -55,7 +55,7 @@ then measurement terms, parallelism, and model/kernel abbreviations.
 
 | Term | Meaning |
 | --- | --- |
-| DSV3 / DSV4 | DeepSeek-V3- / DeepSeek-V4-style model configurations. DSV3 = MLA + fine-grained MoE (+ MTP). DSV4 additionally uses DSA sparse attention. |
+| DSV3 / DSV4 | DeepSeek-V3- and DeepSeek-V4-style model configurations. DSV3 combines MLA with fine-grained MoE (plus MTP). DSV4 additionally uses DSA sparse attention. |
 | Nemotron | Nemotron-3-Ultra-style hybrid model configuration used by the certification proxies (Mamba + attention + MoE). |
 | MoE | Mixture of Experts: a layer routes tokens to one or more expert networks. |
 | MLA | Multi-Latent Attention: low-rank latent q/kv projections (DeepSeek family). |
@@ -64,4 +64,4 @@ then measurement terms, parallelism, and model/kernel abbreviations.
 | SSM | State-space model layers (Mamba family). |
 | GDN | Gated delta net, an SSM variant (`ssm/gated_delta_net.py`). |
 | FLA | flash-linear-attention: the external fused-kernel library providing the non-deterministic fast paths for GDN. |
-| FAG | FlashAttention gradient (backward) kernel. "Deterministic FAG" = independent accumulation buffers plus a global deterministic sum (Longcat/DSV4 reports). |
+| FAG | FlashAttention gradient (backward) kernel. "Deterministic FAG" means independent accumulation buffers plus a global deterministic sum (Longcat/DSV4 reports). |

@@ -10,38 +10,40 @@ orphan: true
 > [validation-evidence.md](./validation-evidence.md). Raw run provenance is
 > deliberately kept only in an ignored local record.
 
-The per-operation catalog of determinism in Megatron-Core. For the narrative walk
-see [`training-path.md`](./training-path.md); for the control plane and targets see
-[`status.md`](./status.md).
+This is the per-operation catalog of determinism in Megatron-Core. For the
+narrative walk, see [`training-path.md`](./training-path.md); for the control plane
+and targets, see [`status.md`](./status.md).
 
 ## How this catalog is maintained (evidence, not guesses)
 
-Every row is classified by one of three evidence sources. **Do not estimate** perf
-numbers — fill the "Perf Δ" column from the PR #5041 nsys leaderboard
+Every row is classified by one of three evidence sources. **Do not estimate** the
+perf numbers. Fill the "Perf Δ" column from the PR #5041 nsys leaderboard
 (`tests/performance_tests/shell_test_utils/determinism/print_nsys_leaderboard.py`)
-on a real recipe, and the determinism verdict from one of:
+run on a real recipe, and draw the determinism verdict from one of the following:
 
-- **doc** — guaranteed by PyTorch / TE / NCCL / cuBLAS documentation (e.g.
-  `index_add`, `index_put(accumulate)` are documented deterministic under
-  `torch.use_deterministic_algorithms(True)`; `scatter_add` / `F.embedding`
-  backward / FA backward are documented non-deterministic).
+- **doc** — guaranteed by the PyTorch, TE, NCCL, or cuBLAS documentation (for
+  example, `index_add` and `index_put(accumulate)` are documented as deterministic
+  under `torch.use_deterministic_algorithms(True)`, while `scatter_add`,
+  `F.embedding` backward, and FA backward are documented as non-deterministic).
 - **code** — an explicit deterministic branch exists in the source.
-- **test** — confirmed by `BitExactRunner` (toggle `deterministic_mode`; same input
-  must give bit-identical out+grad). Rows still needing this are marked **⚠ verify**.
+- **test** — confirmed by `BitExactRunner`: with `deterministic_mode` toggled, the
+  same input must give bit-identical output and gradients. Rows still needing this
+  are marked **⚠ verify**.
 
 Before declaring the catalog complete, run
 `python tools/determinism/audit_sensitive_ops.py megatron --git-tracked-only`.
 The AST report is a review queue for collective reductions, indexed operations,
-ordering calls, and determinism controls; every training-path candidate needs
-either a row here or an explicit reason it is out of scope. The tracked-only
+ordering calls, and determinism controls. Every training-path candidate needs
+either a row here or an explicit reason that it is out of scope. The tracked-only
 mode prevents local scratch files from changing the branch catalog. The scanner
-intentionally does not infer a verdict and filters known non-tensor collisions
-from async/control-plane `put`, `gather`, and module `embedding` calls.
+intentionally does not infer a verdict, and it filters the known non-tensor
+collisions that come from asynchronous or control-plane `put`, `gather`, and
+module `embedding` calls.
 
 Status legend (matches `training-path.md`; statuses are **shape-coded**, not
 color-coded): ✔ deterministic · ◆ deterministic branch · ▲ conditional (verify)
 · ✖ gap (no deterministic path; `✖→forbidden` = deterministic mode rejects the
-feature / fails closed).
+feature and fails closed).
 
 <!-- sensitive-op-audit count=285 files=88 fingerprint=d0e3c25f90d86c6dcd3d0f3c948f0839d3b4a37a1c130e3c6121c2a0b2567a41 -->
 
@@ -50,10 +52,10 @@ feature / fails closed).
 The static audit currently finds **285 sensitive calls in 88 tracked source
 files**. The detailed tables below remain the authority for operation-level
 verdicts and performance evidence. This index gives every audited file an
-explicit disposition, including paths outside the DeepSeek-V3 / Nemotron-3-Ultra
-training target. `--verify-catalog` checks the count, the line-number-independent
-operation fingerprint, and the presence of every path, so a new or changed call
-cannot silently fall out of the review queue.
+explicit disposition, including paths outside the DeepSeek-V3 and Nemotron-3-Ultra
+training target. `--verify-catalog` checks the count, the operation fingerprint
+that is independent of line numbers, and the presence of every path, so that a new
+or changed call cannot silently fall out of the review queue.
 
 Run the gate with:
 
@@ -265,9 +267,9 @@ uv run python tools/determinism/audit_sensitive_ops.py megatron \
 
 ## Hotspots (performance priorities)
 
-The measurements behind these conclusions are retained locally with their run
-provenance. This page records only the result that affects an engineering
-decision; it is not a profiling log.
+The measurements behind these conclusions are retained locally, together with
+their run provenance. This page records only the results that affect an
+engineering decision, and it is not a profiling log.
 
 ### Findings
 
@@ -284,11 +286,12 @@ decision; it is not a profiling log.
 
 ### Profiling interpretation
 
-The profiler workflow compares deterministic and ordinary configurations on the
-same recipe, then attributes only ranges whose boundaries make the comparison
-meaningful. NVTX range totals may overlap, so they are not step latency. Use
-paired, alternating-order runs for a candidate change and retain both legs: a
-single placement can hide allocator, cache, or overlap effects.
+The profiler workflow compares a deterministic configuration against an ordinary
+one on the same recipe, and then attributes only the ranges whose boundaries make
+the comparison meaningful. NVTX range totals may overlap, so they do not add up to
+step latency. For a candidate change, use paired runs in alternating order and keep
+both legs, because a single placement can hide allocator, cache, or overlap
+effects.
 
 ### Validation coverage and open gaps
 
@@ -301,7 +304,7 @@ The checked-in suites and independent paired launches establish these findings:
   boundaries, selected attention backend, and the deterministic implementation
   selected for a reduction.
 - Small-group reduction shortcuts are covered by focused semantic tests and
-  model-level comparisons; larger groups retain ordered FP32 accumulation.
+  model-level comparisons. Larger groups retain ordered FP32 accumulation.
 - The deterministic unpermute and routing fast paths are checked against their
   conservative deterministic fallbacks, including CUDA-graph cases.
 
@@ -313,7 +316,7 @@ The following are intentionally not claimed as a general deterministic contract:
 - Fused cross entropy, tensor-parallel communication overlap, multiple
   distributed-optimizer instances, collective averaging, Megatron-FSDP, and
   packed-sequence SSM do not have the required cross-allocation contract.
-- A production-scale Bridge qualification is a maintainer gate; it is not a
+- A production-scale Bridge qualification is a maintainer gate. It is not a
   user-facing support promise.
 
 For the findings, conclusions, and evidence standard, see

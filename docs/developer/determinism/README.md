@@ -5,21 +5,22 @@ orphan: true
 # Determinism developer reference
 
 > **Audience:** Megatron developers and reviewers. This reference explains the
-> implementation and debugging tools; it is not the setup guide for people
+> implementation and debugging tools. It is not the setup guide for people
 > launching training.
 >
 > Start with the [Deterministic Training user guide](../../user-guide/deterministic-training.md)
 > for supported setup and constraints. The tracked documentation contains
-> conclusion-level evidence only; raw run provenance is deliberately local and
+> conclusion-level evidence only. Raw run provenance is deliberately local and
 > excluded from version control.
 
 ## Contents
 
 1. **[`status.md`](./status.md)** — start here. Supported behavior, limitations,
    evidence policy, and the upstream state without internal run provenance.
-2. **[`training-path.md`](./training-path.md)** — a forward→backward→optimizer walk
-   that flags every point where determinism enters or is decided, with file:line
-   refs and a ✔/◆/▲/✖ status for each (shape-coded legend defined there).
+2. **[`training-path.md`](./training-path.md)** — a walk through the forward pass,
+   backward pass, and optimizer that flags every point where determinism enters
+   or is decided, with file:line refs and a ✔/◆/▲/✖ status for each (shape-coded
+   legend defined there).
 3. **[`op-catalog.md`](./op-catalog.md)** — the per-operation catalog table
    (det? / det path / non-det path / how selected / evidence / perf Δ / gap), plus
    the perf hotspot priority list and the verification backlog.
@@ -51,20 +52,20 @@ resolves common `torch.distributed` import aliases and separates floating
 collective reductions, rank-indexed permutation collectives, indexed
 reductions, indexed writes/gathers, ordering operations, and explicit
 determinism-control calls. Common control-plane collisions such as queue
-`put`, `asyncio.gather`, and arbitrary module `embedding` calls are filtered;
-tensor `put_`, tensor/`torch.gather`, and PyTorch embedding calls remain in the
-review queue. `--git-tracked-only` excludes local scratch files so the report
-represents the branch under review. Repeat `--category` to select multiple
-classes and `--exclude` to omit a source-root-relative glob.
+`put`, `asyncio.gather`, and arbitrary module `embedding` calls are filtered,
+while tensor `put_`, tensor/`torch.gather`, and PyTorch embedding calls remain
+in the review queue. `--git-tracked-only` excludes local scratch files so the
+report represents the branch under review. Repeat `--category` to select
+multiple classes and `--exclude` to omit a source-root-relative glob.
 
-This is a candidate inventory, not a determinism verdict: whether a call is on
+This is a candidate inventory, not a determinism verdict. Whether a call is on
 the training path, has unique indices, reduces integer-valued data, or is
-protected by a deterministic branch still requires code/runtime analysis. Use
+protected by a deterministic branch still requires code or runtime analysis. Use
 the audit to find missing catalog rows, then record the classification and
 evidence in [`op-catalog.md`](./op-catalog.md). The catalog-verification mode
 requires an explicit disposition for every audited source file and matches a
-line-number-independent fingerprint of every path, symbol, category, and call;
-new or changed sensitive operations therefore require a deliberate catalog
+line-number-independent fingerprint of every path, symbol, category, and call.
+New or changed sensitive operations therefore require a deliberate catalog
 refresh.
 
 ## Locate the first difference in existing training dumps
@@ -88,7 +89,7 @@ Use `--json` for automation and `--max-details N` to bound the report. Exit code
 
 This avoids treating PP/VPP hook arrival order as execution order, but it only
 localizes surfaces that the existing dump hooks capture. Use the structured
-trace below for recompute, optimizer, and collective boundaries; async TP
+trace below for recompute, optimizer, and collective boundaries. Async TP
 userbuffer payloads and in-process kernel selection remain follow-up surfaces.
 Captured kernel identities can be recovered offline with the Nsight attribution
 tool described below.
@@ -115,14 +116,14 @@ field convention belong to the iteration record. After the first metric, an
 adjacent rank prefix appended directly by Slurm terminates the record, so that
 rank's own pipe-delimited timing or memory fields are also ignored.
 Identical duplicate rank-zero records are accepted for aggregated distributed
-logs; conflicting duplicates, missing iterations, missing required metrics, or
+logs. Conflicting duplicates, missing iterations, missing required metrics, or
 any other metric difference fail the gate. Additional required or volatile
 fields can be selected with repeatable `--require-metric` and
 `--ignore-metric` options. Exit code 0 is an exact serialized match, 1 is a
 complete but divergent comparison, and 2 is invalid or ambiguous input.
 
 This is stronger than sampling one loss value, but it is not a bitwise tensor
-certificate: equal printed metrics can hide an earlier tensor difference below
+certificate. Equal printed metrics can hide an earlier tensor difference below
 the logging precision. Use it to gate an external training loop, then use
 `certify_traces.py` or `compare_dumps.py` when the loop exposes the corresponding
 MCore instrumentation.
@@ -130,7 +131,7 @@ MCore instrumentation.
 ## Trace recompute and optimizer boundaries during training
 
 The structured runtime tracer complements tensor dumps with semantic JSONL
-events. Select one or a few iterations; every rank writes independently, so the
+events. Select one or a few iterations. Every rank writes independently, so the
 tool adds no collectives or cross-rank ordering constraints:
 
 ```bash
@@ -167,12 +168,12 @@ first/last-dimension reduce-scatter paths in original forward, activation
 recompute, and backward. Core TP linear tracing additionally covers the
 synchronous sequence-parallel forward gather and the backward async gather,
 dgrad all-reduce, and dgrad reduce-scatter. Async outputs are recorded only when
-the existing work-handle wait completes; the tracer does not add a collective
+the existing work-handle wait completes. The tracer does not add a collective
 or distributed wait. Exact hashing copies device tensors to the CPU and
-synchronizes execution; use it only for targeted debug iterations because those
+synchronizes execution. Use it only for targeted debug iterations, because those
 synchronizations can perturb communication overlap. Without that flag, phase,
 checkpoint, and collective tensor metadata remain available without the byte
-copies; optimizer boundary tensors are omitted. The additional
+copies, and optimizer boundary tensors are omitted. The additional
 `--determinism-trace-optimizer-state` flag records local main parameters and
 direct tensor/scalar optimizer state entries before and after the step, keyed by
 stable optimizer, parameter-group, and parameter ordinals. It requires exact
@@ -180,7 +181,7 @@ tensor hashes and is deliberately separate because hashing Adam moments roughly
 triples the optimizer-state bytes copied to the CPU.
 
 An `iteration.end` event reports `pending_collectives`. A nonzero value means a
-collective launched inside the selected window but completed after it; the late
+collective launched inside the selected window but completed after it. The late
 completion is intentionally not written into the closed iteration trace.
 
 Run the same launch into a second directory, then align events by semantic
@@ -207,7 +208,7 @@ reduce-scatter, core TP linear synchronous/async collectives, final TP/PP
 gradient and token-count synchronization, plus opt-in local
 optimizer main parameters and moment state. TE FP8/FP4 checkpoint boundaries
 are covered, but internal quantizer state is not independently fingerprinted.
-TE attention selection is covered at runtime; TP userbuffer payloads and other
+TE attention selection is covered at runtime. TP userbuffer payloads and other
 auto-dispatching libraries remain follow-up instrumentation surfaces. Actual
 kernel identities from a captured iteration
 can be recovered from an Nsight Systems SQLite export with
@@ -215,7 +216,7 @@ can be recovered from an Nsight Systems SQLite export with
 topology-independent deterministic implementation, while floating reductions
 inside TP mappings, TP linears, and vocab-parallel cross-entropy remain open.
 Megatron-FSDP gradient reductions are a separate uninstrumented
-native-collective gap; its existing FSDP8 cells are same-topology tests, not
+native-collective gap. Its existing FSDP8 cells are same-topology tests, not
 cross-allocation certificates.
 
 For a scaled model run, use the stricter certifier instead of relying on a trace
@@ -245,8 +246,8 @@ It also rejects unsupported or incomplete event schemas, mixed rank/iteration
 identities within one file, sequence gaps, duplicate or missing runtime and
 iteration boundary markers, explicit `iteration.error` events, and collective
 begins/ends that are not balanced within the trace window.
-Groups of at most two are excluded from the hierarchy requirement: one rank has
-no reduction and two ranks have exactly one floating-point addition per output,
+Groups of at most two are excluded from the hierarchy requirement. One rank has
+no reduction, and two ranks have exactly one floating-point addition per output,
 so there is no reduction-tree order for physical topology to change. They still
 must use fp32 accumulation when that invariant is requested. Exit code 0 is a
 certificate, 1 is a failed invariant or cross-run divergence, and 2 is invalid
@@ -256,7 +257,7 @@ input. Use `--json` to retain the complete evidence report.
 
 The multi-node runner launches and certifies two independent deterministic runs
 of either the DSV3-style or Nemotron-3-Ultra-style MCore proxy. Invoke it once
-per node in an 8-node, 4-GPU-per-node allocation; it derives node rank and node
+per node in an 8-node, 4-GPU-per-node allocation. It derives node rank and node
 count from Slurm by default and writes the retained JSON report under
 `$OUTPUT_PATH/determinism-certification/`:
 
@@ -291,8 +292,8 @@ python -m torch.distributed.run \
 ```
 
 `nsys` must be on `PATH`, and the output path must be visible to the profiled
-rank. The wrapper intentionally uses `--capture-range-end=stop`: Megatron's
-CUDA-profiler range stops collection but the wrapped rank keeps running to the
+rank. The wrapper intentionally uses `--capture-range-end=stop`. Megatron's
+CUDA-profiler range stops collection, but the wrapped rank keeps running to the
 same distributed completion point as its peers. Using `stop-shutdown` here can
 terminate the profiled rank early and strand the rest of the worker group.
 
@@ -322,7 +323,7 @@ python tools/determinism/attribute_nsys_ranges.py \
 
 `--parent-depth 1` is the nearest enclosing range. Sequence and operator IDs
 are removed before grouping, so repeated invocations share one row. Every
-matched range contributes to exactly one group; unlike nested parent durations,
+matched range contributes to exactly one group. Unlike nested parent durations,
 the grouped matched durations can be compared and summed.
 
 To identify the CUDA kernels actually launched by a matching NVTX range, join
@@ -338,7 +339,7 @@ python tools/determinism/attribute_nsys_ranges.py \
 
 This reports exact demangled kernel identities, launch counts, stream IDs, and
 the matching canonical NVTX ranges. A launch covered by nested matching ranges
-is counted once. Reported kernel durations are summed GPU activity time; kernels
+is counted once. Reported kernel durations are summed GPU activity time. Kernels
 on different streams can overlap, so the total is attribution evidence rather
 than wall-clock step time. Use `--json` to retain the machine-readable report.
 
@@ -359,7 +360,8 @@ torchrun \
 
 Run both `--order native-first` and `--order ordered-first` to expose ordering
 or cache effects, and repeat on the allocation topology used by the target
-recipe: single-domain and cross-domain results can differ substantially. Rank 0
+recipe, because single-domain and cross-domain results can differ substantially.
+Rank 0
 prints JSON with min/median/max latency, every sample, the ordered/native median
 ratio, numerical-difference bounds, rank-to-host placement, and exact output
 SHA-256 hashes by rank. The benchmark synchronizes each sample and reports the
@@ -370,13 +372,13 @@ communication/computation overlap in a training step.
 available to production DDP through
 `--ddp-reduce-scatter-hierarchical-group-size`. It first sums fixed contiguous
 logical-rank groups, then exchanges fp32 partials and sums them in fixed group
-order; it does not choose a tree from measured timing. The group size must
+order. It does not choose a tree from measured timing. The group size must
 divide the world size and should map the target recipe's logical DP ranks onto
 fast local communication domains. Keep that logical size fixed across runs.
 
 ## Maintenance
 
-Keep the catalog **evidence-based**: classify each op via PyTorch/TE/NCCL docs, an
-explicit code branch, or a `BitExactRunner` result — and fill perf deltas from the
+Keep the catalog **evidence-based**. Classify each op via PyTorch/TE/NCCL docs, an
+explicit code branch, or a `BitExactRunner` result, and fill perf deltas from the
 nsys det-vs-nondet leaderboard, never by estimate. See "How this catalog is
 maintained" in [`op-catalog.md`](./op-catalog.md).

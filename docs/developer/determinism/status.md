@@ -43,18 +43,18 @@ explicitly *allowed* to vary between runs:
 
 The primary enemy is **floating-point non-associativity**: `(a+b)+c ≠ a+(b+c)` in
 bf16/fp16/fp32. Any kernel whose result depends on the *order* of a parallel
-reduction (atomic adds, multi-block reductions, async collectives whose
-completion order varies, allocator-driven kernel autotuning) can produce
-different round-off between runs. Determinism therefore means pinning reduction
-order everywhere it matters.
+reduction can produce different round-off between runs. The usual culprits are
+atomic adds, multi-block reductions, async collectives whose completion order
+varies, and allocator-driven kernel autotuning. Determinism therefore means
+pinning reduction order everywhere it matters.
 
 ## 3. Targets and motivation
 
 Customers are moving determinism from a debug/CI nicety to a **production / hero-run
-requirement** (deterministic replay of loss spikes, checkpoint-resume that follows
-the original trajectory, and a proof point that the GPU stack produces correct
-math — mitigating SDC/SDE concerns). The blocker to enabling it by default is the
-performance penalty.
+requirement**. They want to replay loss spikes deterministically, resume from a
+checkpoint along the original trajectory, and have a proof point that the GPU
+stack produces correct math, which mitigates SDC/SDE concerns. The blocker to
+enabling it by default is the performance penalty.
 
 | Milestone | Determinism overhead (step time) |
 | --- | --- |
@@ -70,7 +70,7 @@ Profiling attributes most of the gap to a handful of operations — see
 Paired profiles establish three useful conclusions:
 
 - The fixed logical hierarchy removes the isolated data-parallel reduction
-  penalty: in the measured proxy it is close to native, while a flat ordered
+  penalty. In the measured proxy it runs close to native, whereas a flat ordered
   path is materially slower.
 - Collision-free routing and fixed-order unpermute remove avoidable
   deterministic overhead. The routing work improves isolated latency strongly
@@ -80,8 +80,8 @@ Paired profiles establish three useful conclusions:
   Attention backward, vocab-parallel loss/gather backward, and grouped-GEMM
   paths can dominate after the routing and reduction improvements land.
 
-The current performance result is therefore a direction, not a global claim:
-each optimization needs an exactness comparison and an alternating-order
+The current performance result is therefore a direction, not a global claim.
+Each optimization needs an exactness comparison and an alternating-order
 end-to-end measurement before it is accepted.
 
 ## 4. Control plane — how determinism is turned on
@@ -150,15 +150,17 @@ The complete per-operation classification is in
 [`op-catalog.md`](./op-catalog.md). The load-bearing branches are:
 
 - **MoE unpermute** (`moe_utils.py`,
-  `moe/ops/deterministic_index_select.py`): supported dropless, unpadded
-  all-to-all shapes use a fixed-order Triton segment sum with collision-free
-  gather backward. Unsupported shapes retain deterministic `index_add_`; normal
-  mode uses `scatter_add_`. The guarded path is CUDA-graph safe and preserves
+  `moe/ops/deterministic_index_select.py`): for supported dropless, unpadded
+  all-to-all shapes, deterministic mode uses a fixed-order Triton segment sum
+  with a collision-free gather backward. Unsupported shapes retain a
+  deterministic `index_add_`, while normal mode uses `scatter_add_`. The guarded
+  path is CUDA-graph safe and preserves
   the fallback’s contribution order.
 - **MoE routing map and probabilities** (`moe_utils.py`,
   `moe/ops/deterministic_routing.py`): deterministic mode uses collision-free
-  row-wise writes and selected-entry gather backward. Unsupported inputs retain
-  an in-place `scatter_` fallback; normal mode keeps out-of-place `scatter`.
+  row-wise writes and a selected-entry gather backward. Unsupported inputs
+  retain an in-place `scatter_` fallback, while normal mode keeps the
+  out-of-place `scatter`.
 - **Flex MoE dispatch** (`transformer/moe/token_dispatcher.py`): external
   fused dispatchers combine permutation, communication, and reduction order
   outside MCore’s control. Deterministic configuration therefore selects the
@@ -168,8 +170,8 @@ The complete per-operation classification is in
   keeps `sorted=True` across activation recompute, and expert-bias counts use
   exact integer accumulation and comparison.
 - **Embedding and vocabulary-parallel loss** (`tensor_parallel/layers.py`,
-  `tensor_parallel/cross_entropy.py`): direct indexing avoids embedding
-  backward atomics; the local cross-entropy backward uses collision-free
+  `tensor_parallel/cross_entropy.py`): direct indexing avoids the atomics in
+  embedding backward, and the local cross-entropy backward uses collision-free
   selected-class updates. The remaining tensor-parallel floating collectives
   retain their documented limitation.
 - **Mamba / SSM** (`ssm/ops/determinism.py`,
@@ -179,11 +181,12 @@ The complete per-operation classification is in
 - **Data-parallel and small-statistic reductions**
   (`distributed/param_and_grad_buffer.py`,
   `distributed/deterministic_collectives.py`): deterministic mode uses
-  identity and native two-rank shortcuts where the arithmetic is uniquely
-  ordered, otherwise a fixed logical-rank FP32 reduction.
+  identity and native two-rank shortcuts where the arithmetic is already
+  uniquely ordered, and otherwise falls back to a fixed logical-rank FP32
+  reduction.
 - **Final tensor/pipeline-parallel gradient synchronization**
   (`distributed/finalize_model_grads.py`): supported one- and two-rank groups
-  select their semantic shortcuts; larger groups use bounded chunks, a fixed
+  take their semantic shortcuts, while larger groups use bounded chunks, a fixed
   local sum, and rank-indexed communication. The trace records the
   implementation selected for each reduction.
 - **Megatron-FSDP reduction** remains unsupported at the required

@@ -6,9 +6,9 @@ orphan: true
 
 > **Audience:** developers and reviewers. This restores the detailed,
 > first-edition validation narrative while omitting environment-specific run
-> provenance. It records findings, conclusions, and explanations; the raw
-> scheduler, artifact, and source-identity ledger is retained only in the
-> ignored local record.
+> provenance. It records findings, conclusions, and explanations. The raw
+> ledger of scheduler details, artifacts, and source identity is retained
+> only in the ignored local record.
 
 ## Scope and method
 
@@ -49,25 +49,26 @@ deterministic.
 ## Operator and routing findings
 
 - PyTorch LayerNorm/RMSNorm fallbacks and DSA sparse-mask paths have focused
-  forward, backward, and recompute coverage. The DSA writes are deterministic
-  where their indices are unique.
-- Deterministic top-k keeps `sorted=True` in both original forward and
-  checkpoint recompute. This avoids probability drift, but its radix-sort work
-  remains a performance hotspot.
+  coverage of their forward, backward, and recompute passes. The DSA writes
+  are deterministic where their indices are unique.
+- Deterministic top-k keeps `sorted=True` in both the original forward pass
+  and the checkpoint recompute. This avoids probability drift, but its
+  radix-sort work remains a performance hotspot.
 - Standard MoE all-to-all is a rank-indexed permutation and produces matching
-  dispatch/combine payloads when inputs match. External fused dispatchers are
-  rejected because their token-arrival and combine order cannot yet be
-  certified.
-- The routing map/probability implementation uses collision-free writes and a
-  selected-entry gather backward. Tests cover ordinary PyTorch fallback,
-  Triton acceleration, unsupported inputs, and CUDA-graph replay.
+  dispatch and combine payloads when the inputs match. External fused
+  dispatchers are rejected because the order in which their tokens arrive and
+  combine cannot yet be certified.
+- The implementation that produces the routing map and probabilities uses
+  collision-free writes, and its backward pass gathers the selected entries.
+  Tests cover the ordinary PyTorch fallback, Triton acceleration, unsupported
+  inputs, and CUDA-graph replay.
 - The deterministic unpermute fast path preserves the conservative
   `index_add_` contribution order while lowering allocation and latency on its
-  guarded shapes. Unsupported routes, padding, capacity/drop configurations,
-  dtypes, and layouts retain the fallback.
-- Router expert-bias counts use integer accumulation and integer-space
-  comparisons, preventing near-tie decisions from changing after the
-  floating-point exact-integer range is exceeded.
+  guarded shapes. The fallback still handles unsupported routes, padding,
+  capacity/drop configurations, dtypes, and layouts.
+- Router expert-bias counts use integer accumulation and compare values in
+  integer space, so near-tie decisions do not change even after the counts
+  exceed the range where floating point represents integers exactly.
 
 ## Trace and divergence-diagnosis findings
 
@@ -108,9 +109,10 @@ or mixed trace trees rather than producing a partial success result.
 
 ## Mamba and attention findings
 
-- Deterministic Mamba execution pins the relevant environment before kernel
-  imports and fixes its workspace/configuration choice. This prevents
-  cold-cache autotune drift without requiring the fused path to be disabled.
+- Deterministic Mamba execution pins the relevant environment before the
+  kernels are imported and fixes its workspace and configuration choice. This
+  prevents the autotuner from drifting on a cold cache, and it does so without
+  having to disable the fused path.
 - Transformer Engine selection is validated from the backend that an actual
   forward uses. DeepSeek-style MLA and Nemotron-style attention can choose
   different valid backends under the same policy.
@@ -147,10 +149,10 @@ The evidence supports these engineering decisions:
 | Pin Mamba/Triton configuration early | It prevents configuration-dependent drift without a demonstrated proxy slowdown. |
 | Do not force one attention backend | Eligibility and performance depend on the actual input and installed kernel library. |
 
-The remaining full-step gap is shaped by attention backward, vocab-parallel
-loss/gather backward, grouped GEMM, and topology/overlap effects. End-to-end
-ABBA measurements improve some workloads but vary across allocations, so the
-aggressive performance target is not yet a general claim.
+The remaining full-step gap comes from attention backward, the vocab-parallel
+loss and gather backward, grouped GEMM, and topology and overlap effects.
+End-to-end ABBA measurements improve some workloads but vary across
+allocations, so the aggressive performance target is not yet a general claim.
 
 ## Conditions and remaining limitations
 

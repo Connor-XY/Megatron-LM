@@ -9,13 +9,14 @@ orphan: true
 > conclusion-level validation, see [validation evidence](./validation-evidence.md).
 > Abbreviations are defined in the [glossary](./glossary.md).
 
-This is a forward→backward→optimizer walk through a Megatron training step,
-calling out **every place where determinism enters or is decided**. Each entry
+This document walks through a single Megatron training step — from the forward
+pass, through the backward pass, to the optimizer — calling out **every place
+where determinism enters or is decided**. Each entry
 links to the file:line and to the row in [`op-catalog.md`](./op-catalog.md). Read
 [`status.md`](./status.md) first for the control plane and definitions.
 
-Legend for the "Determinism" column. Statuses are distinguished by **glyph
-shape** (not color) and each has a name used in prose:
+This legend explains the "Determinism" column. Statuses are distinguished by their
+**glyph shape** (not color), and each has a name used in the prose:
 
 - ✔ **deterministic** — deterministic as implemented (by formula, or pinned
   reduction order)
@@ -73,7 +74,7 @@ an observer sees.
 | Top-k expert selection | `moe_utils.py` (`torch.topk`) | ◆ | Deterministic mode forces `sorted=True` even in the no-grad activation-checkpoint forward; normal mode keeps the faster no-grad `sorted=False` path. This avoids forward/recompute probability drift for sigmoid top-k normalization. The sorted path is the source of the `cub::DeviceRadixSort` det-vs-nondet delta (**hotspot**). |
 | Expert-bias selected-score gather | `moe_utils.py` (`torch.gather`) | ◆ | PyTorch switches gather backward from scatter-add to its deterministic indexed-write path. A collision-free Triton candidate was exact and faster in isolation/profile but regressed two balanced production ABBAs by 3.2–3.3%, so it is not in the source tree. |
 | Flextron soft-mask routing | `elastification/flextron_elasticity_hooks.py` | ▲ | Flextron replaces the main router with weighted sigmoid accumulation, always-sorted top-k, selected-score gather, and unique-index scatter. Its `deterministic_mode` parameter is deprecated and unused; global deterministic algorithms still select PyTorch's deterministic gather backward. The path is cataloged but not yet model-certified. |
-| Group-limited (node-limited) top-k | `moe_utils.py:617-634` (`group_mask.scatter_`) | ▲ | `scatter_` writes 1s at unique group indices → deterministic in forward; no explicit det branch (**verify**). |
+| Group-limited (node-limited) top-k | `moe_utils.py:617-634` (`group_mask.scatter_`) | ▲ | `scatter_` writes 1s at unique group indices, so the forward is deterministic, with no explicit deterministic branch (**verify**). |
 | Routing map / probs construction | `moe_utils.py`, `moe/ops/deterministic_routing.py` | ◆ | det: a fused row-wise Triton kernel initializes probabilities and the boolean map, writes unique top-k entries, and gathers selected gradients in backward. It has no atomics or reductions; unsupported inputs retain in-place `scatter_`. Non-det uses out-of-place `scatter`. The fused path is exact to the scatter and former `index_put_(accumulate=False)` implementations and passes CUDA-graph replay. Also `compute_routing_scores_for_aux_loss` and capacity masks use collision-free `scatter` with **no** det branch. |
 | Capacity-factor drop | `moe_utils.py:940-951` | ▲ | `scatter` of capacity mask; unique indices. |
 | Token permute (dispatch sort) | `moe_utils.py:299-431` (`argsort(stable=True)` + `index_select`, or fused TE permute) | ✔ | Stable sort + gather is deterministic. |
