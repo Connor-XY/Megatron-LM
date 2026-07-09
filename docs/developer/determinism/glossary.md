@@ -13,7 +13,7 @@ then measurement terms, parallelism, and model/kernel abbreviations.
 | Term | Meaning |
 | --- | --- |
 | Deterministic mode | Execution with `--deterministic-mode`: `apply_determinism_to_args` validates/overrides unsupported features, sets the determinism env vars, and enables torch deterministic algorithms. Library code selects deterministic branches via `config.deterministic_mode` or `torch.are_deterministic_algorithms_enabled()`. |
-| Default mode | Execution without `--deterministic-mode`. Older text in these documents also calls this "normal" or "ordinary" mode — the three are synonyms. |
+| Default mode | Execution without `--deterministic-mode`. Also called "normal" or "ordinary" mode. |
 | Torch deterministic algorithms | The global `torch.use_deterministic_algorithms(True)` state. It makes listed PyTorch ops select deterministic implementations and raises on ops with none; it is one ingredient of deterministic mode, not the whole contract. |
 | Bit-exact / bitwise identical | Two runs produce byte-identical values for the compared tensors or serialized metrics. The strongest claim used here; "identical loss curve" alone is weaker because logging precision can hide low-bit drift. |
 | Reproducible | Same result under the *same* conditions (allocation, caches, environment). Weaker than deterministic-across-allocations: a run can be reproducible within one allocation yet diverge on a different physical topology. |

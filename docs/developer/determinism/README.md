@@ -9,26 +9,24 @@ orphan: true
 > launching training.
 >
 > Start with the [Deterministic Training user guide](../../user-guide/deterministic-training.md)
-> for supported setup and constraints. The tracked documentation contains
-> conclusion-level evidence only. Raw run provenance is deliberately local and
-> excluded from version control.
+> for supported setup and constraints. These documents record conclusions, not
+> raw run logs.
 
 ## Contents
 
 1. **[`status.md`](./status.md)** — start here. Supported behavior, limitations,
-   evidence policy, and the upstream state without internal run provenance.
+   evidence policy, and the upstream state.
 2. **[`training-path.md`](./training-path.md)** — a walk through the forward pass,
    backward pass, and optimizer that flags every point where determinism enters
-   or is decided, with file:line refs and a ✔/◆/▲/✖ status for each (shape-coded
-   legend defined there).
+   or is decided, with file:line refs and a ✔/◆/▲/✖ status for each (legend
+   defined there).
 3. **[`op-catalog.md`](./op-catalog.md)** — the per-operation catalog table
    (det? / det path / non-det path / how selected / evidence / perf Δ / gap), plus
    the perf hotspot priority list and the verification backlog.
 4. **[`glossary.md`](./glossary.md)** — expansion of the parallelism and kernel
    abbreviations used by the developer references.
 5. **[`validation-evidence.md`](./validation-evidence.md)** — findings,
-   conclusions, limits, and the evidence standard. Raw provenance is retained
-   only in an ignored local record.
+   conclusions, limits, and the evidence standard.
 6. **[`dsv4-assessment.md`](./dsv4-assessment.md)** — DeepSeek-V4 determinism
    scope, DSA op verdicts, coverage added, effectiveness/performance, and the
    gaps (mHC, CSA, suite-on-dev) still open for a full DSV4 claim.

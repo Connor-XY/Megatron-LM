@@ -205,8 +205,8 @@ The complete per-operation classification is in
 ## 7. Validation status
 
 The detailed validation findings, conclusions, and explanations are collected in
-[validation-evidence.md](./validation-evidence.md). They preserve the
-first-edition technical scope while omitting environment-specific provenance.
+[validation-evidence.md](./validation-evidence.md). They omit environment-specific
+provenance.
 
 ## 8. Known gaps (feeding the roadmap)
 

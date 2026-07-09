@@ -4,11 +4,9 @@ orphan: true
 
 # Determinism validation evidence
 
-> **Audience:** developers and reviewers. This restores the detailed,
-> first-edition validation narrative while omitting environment-specific run
-> provenance. It records findings, conclusions, and explanations. The raw
-> ledger of scheduler details, artifacts, and source identity is retained
-> only in the ignored local record.
+> **Audience:** developers and reviewers. It records findings, conclusions, and
+> explanations, and omits environment-specific run provenance such as scheduler
+> details, artifacts, and source identity.
 
 ## Scope and method
 

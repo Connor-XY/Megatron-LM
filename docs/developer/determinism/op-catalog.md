@@ -7,8 +7,7 @@ orphan: true
 > **Audience:** developers and maintainers reviewing implementation paths. This
 > is not a quick-start guide. Terms such as DP, TP, PP, and EP are defined in
 > the [glossary](./glossary.md). Conclusion-level results are summarized in
-> [validation-evidence.md](./validation-evidence.md). Raw run provenance is
-> deliberately kept only in an ignored local record.
+> [validation-evidence.md](./validation-evidence.md).
 
 This is the per-operation catalog of determinism in Megatron-Core. For the
 narrative walk, see [`training-path.md`](./training-path.md); for the control plane
@@ -40,10 +39,9 @@ intentionally does not infer a verdict, and it filters the known non-tensor
 collisions that come from asynchronous or control-plane `put`, `gather`, and
 module `embedding` calls.
 
-Status legend (matches `training-path.md`; statuses are **shape-coded**, not
-color-coded): ✔ deterministic · ◆ deterministic branch · ▲ conditional (verify)
-· ✖ gap (no deterministic path; `✖→forbidden` = deterministic mode rejects the
-feature and fails closed).
+Status legend (matches `training-path.md`): ✔ deterministic · ◆ deterministic
+branch · ▲ conditional (verify) · ✖ gap (no deterministic path; `✖→forbidden` =
+deterministic mode rejects the feature and fails closed).
 
 <!-- sensitive-op-audit count=285 files=88 fingerprint=d0e3c25f90d86c6dcd3d0f3c948f0839d3b4a37a1c130e3c6121c2a0b2567a41 -->
 
@@ -320,6 +318,4 @@ The following are intentionally not claimed as a general deterministic contract:
   user-facing support promise.
 
 For the findings, conclusions, and evidence standard, see
-[validation-evidence.md](./validation-evidence.md). Keep detailed cluster,
-scheduler, artifact, and source provenance only in the ignored local
-`validation-evidence.local.md` record.
+[validation-evidence.md](./validation-evidence.md).

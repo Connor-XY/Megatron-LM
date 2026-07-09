@@ -15,8 +15,7 @@ where determinism enters or is decided**. Each entry
 links to the file:line and to the row in [`op-catalog.md`](./op-catalog.md). Read
 [`status.md`](./status.md) first for the control plane and definitions.
 
-This legend explains the "Determinism" column. Statuses are distinguished by their
-**glyph shape** (not color), and each has a name used in the prose:
+The "Determinism" column uses these statuses, each with a name used in the prose:
 
 - ✔ **deterministic** — deterministic as implemented (by formula, or pinned
   reduction order)
