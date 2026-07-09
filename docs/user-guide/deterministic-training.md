@@ -33,12 +33,12 @@ cannot make two intentionally different configurations identical.
 ## What Megatron changes
 
 Megatron enables deterministic PyTorch behavior and selects conservative
-settings for its collectives and kernels. It also avoids or rejects
-optimizations whose numerical order is not currently certified.
+collective and kernel settings. It also avoids or rejects optimizations whose
+numerical order is not currently certified.
 
 | Area | What to expect |
 | --- | --- |
-| Gradient reduction | Uses a reproducible accumulation order where floating-point addition would otherwise depend on runtime topology. |
+| Gradient reduction | Reproducible accumulation order where floating-point addition would otherwise depend on runtime topology. |
 | Attention and kernel libraries | Only supported deterministic kernel choices are allowed. Megatron may choose a slower compatible implementation. |
 | Mixture-of-experts routing | Uses the certified dispatch path instead of unsupported fused dispatchers. |
 | Hybrid sequence models | Uses deterministic workspaces and fixed kernel-selection settings. |
