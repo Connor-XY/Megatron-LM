@@ -113,12 +113,25 @@ effectiveness; paired det-vs-nondet nsys leaderboard for performance. Runs on
   bug (fixed by the dev DSA rewrite), not a determinism divergence. The proxy
   therefore excludes PP cells and sets `supports_pp=False`; re-enable after the
   dev tracker fix lands (§6).
-- **Performance (DSA determinism overhead):** _PENDING — det-vs-nondet step-time
-  ratio on the DSV4-precursor config (MLA + MoE + DSA, TP2×EP4), to be compared
-  with the DSV3 (no-DSA) baseline of 1.25×. Expectation: DSA's unfused torch
-  attention is compute-heavy in both modes, so its determinism delta should be
-  small relative to the MoE contribution; the number establishes whether that
-  holds._
+- **Performance (DSA determinism overhead): DSA does not worsen the relative
+  cost.** Paired det-vs-nondet nsys leaderboards (8×H100, TP2×EP4, profiled
+  steps 5–7):
+
+  | Config | det step | nondet step | ratio |
+  | --- | --- | --- | --- |
+  | MLA + MoE (DSV3-like baseline) | 219.6 ms | 186.1 ms | **1.18×** |
+  | MLA + MoE + **DSA** (DSV4-precursor) | 314.5 ms | 266.1 ms | **1.18×** |
+
+  DSA adds ~95 ms/step of absolute compute **in both modes** (unfused torch
+  sparse attention + the indexer), so the det/nondet ratio is unchanged: the
+  determinism overhead is dominated by the MoE path, and DSA's own determinism
+  delta is contained. The DSA-specific overhead surfaces as a larger
+  `self_attention` forward (+127 ms det-vs-nondet range) and `aten::bmm`
+  (+80 ms range) from the sparse-attention/index-score GEMMs; per the
+  dispatch-vs-wall-clock caveat these CPU ranges overlap GPU work, and the
+  step-time ratio is the load-bearing number. Both configs are **within the
+  1.25× gate** (the MoE baseline improved from an earlier 1.25× as the fused
+  deterministic routing/unpermute/reduce-scatter kernels landed).
 
 ## 5. Onboarding blocker — `fast_hadamard_transform`
 
