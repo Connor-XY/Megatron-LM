@@ -52,7 +52,9 @@ else
     wait_for_file "$TRACE_ROOT/setup.ready"
 fi
 
-export PYTHONPATH=$ROOT_DIR
+# Prepend (not clobber): launchers may inject extra library paths, e.g. a
+# fast_hadamard_transform build for the dsv4 certificate.
+export PYTHONPATH=$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 export NCCL_ALGO=${NCCL_ALGO:-Ring}
@@ -214,12 +216,21 @@ run_one run-a "$MASTER_PORT"
 run_one run-b "$((MASTER_PORT + 1))"
 
 if ((NODE_RANK == 0)); then
+    # DeepSeek Sparse Attention uses an unfused torch attention path, not a
+    # Transformer Engine DotProductAttention backend, so it emits no
+    # ``te.attention.backend.selected`` event. Requiring that surface for dsv4
+    # would fail the certificate on a missing event even when the two runs are
+    # bit-identical, so it is only required for the TE-attention models.
+    CERTIFY_EVENT_REQ=()
+    if [[ "$MODEL" != "dsv4" ]]; then
+        CERTIFY_EVENT_REQ+=(--require-event-prefix te.attention.backend.selected)
+    fi
     set +e
     "$PYTHON_BIN" "$ROOT_DIR/tools/determinism/certify_traces.py" \
         "$TRACE_ROOT/run-a" "$TRACE_ROOT/run-b" \
         --expected-ranks 32 \
         --expected-iterations 2 \
-        --require-event-prefix te.attention.backend.selected \
+        "${CERTIFY_EVENT_REQ[@]}" \
         --require-collective-prefix moe.ep_ \
         --require-collective-prefix moe.router_expert_bias. \
         --require-collective-prefix data_parallel. \

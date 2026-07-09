@@ -90,6 +90,21 @@ effectiveness; paired det-vs-nondet nsys leaderboard for performance. Runs on
   single-addition argument). This is the first model-level, distributed DSA
   determinism evidence; op-level coverage (`test_dsa_paths.py`, TP=1) already
   existed.
+- **Scale certification — DSV4 is bit-identical at 32 GPUs (EP32).** The
+  `dsv4` mode of `run_model_certification.sh` ran two independent 8-node ×
+  4-GPU launches (TP1, EP32, one MoE + DSA layer, activation recompute,
+  hierarchical fp32 DP reduction) and compared their structured traces with
+  `certify_traces.py`: **0 divergences over 7,360 compared events**, recompute
+  and collective surfaces balanced, no pending collectives. The DSV3 EP32
+  certificate (no DSA) passes identically. This is the same machinery and scale
+  as the existing weekly nemotron/DSV3 certificates.
+  - *Cert-invariant note:* the DSV3 cert requires a
+    `te.attention.backend.selected` trace event; DSA uses an **unfused torch
+    attention** path and emits no TE-attention-backend event, so that one
+    requirement is dropped for `dsv4` (it would otherwise fail a
+    provably-bit-identical run on a missing event, not a divergence). All other
+    invariants — MoE EP / router-bias / DP collective surfaces and the ordered
+    fp32 DP reduction — are still required and pass.
 - **DSA + pipeline parallelism does not run here (functional, not determinism).**
   The `pp2` / `pp2-vpp2` cells **hang** on NCCL P2P setup: DSA's
   `DSAIndexerLossLoggingHelper` on this branch does not negotiate per-stage
