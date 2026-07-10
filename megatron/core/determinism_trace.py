@@ -39,6 +39,7 @@ class EventKind(str, Enum):
     COLLECTIVE = "collective"
     OPTIMIZER = "optimizer"
     TENSOR = "tensor"
+    OP = "op"
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,86 @@ def fingerprint_tensor(tensor: torch.Tensor, *, include_hash: bool) -> TensorFin
         requires_grad=tensor.requires_grad,
         sha256=digest,
     )
+
+
+# ---------------------------------------------------------------------------
+# Device-side tensor signature.
+#
+# A 128-bit digest of a tensor's raw bytes computed on the tensor's own device,
+# ported from Megatron-Bridge's determinism debug tool (``signature.py`` on the
+# ``zhiyul/determinism-debug-tool`` branch). The bytes are reinterpreted as
+# ``int64`` lanes and reduced with two integer reductions that mix value and
+# position. Integer addition is exact and wraps mod 2**64, so the digest is
+# identical regardless of reduction order, chunk size, GPU, process, or
+# physical topology — and only two 64-bit scalars ever cross the PCIe bus,
+# which is why this is cheap enough to fingerprint every ATen op output while
+# the SHA256 path above (a full device-to-host copy per tensor) is not. It is
+# bit-exact over all bytes: it distinguishes ``-0.0`` from ``+0.0`` and
+# differing NaN payloads.
+# ---------------------------------------------------------------------------
+
+_SIG_C1 = 6364136223846793005  # 0x5851F42D4C957F2D (LCG multiplier)
+_SIG_C2 = 1442695040888963407  # 0x14057B7EF767814F (LCG increment)
+_SIG_MASK64 = 0xFFFFFFFFFFFFFFFF
+# At most 16M int64 lanes (~128 MB) per reduction chunk. Chunk sums accumulate
+# exactly, so the digest is independent of the chunk size.
+_SIG_CHUNK_LANES = 1 << 24
+# Sentinel for empty tensors. A real all-zero tensor digests to a nonzero value
+# through the position term, so this cannot collide with actual data.
+_SIG_EMPTY_DIGEST = "0" * 32
+
+
+def _device_digest(x: torch.Tensor) -> str:
+    """128-bit hex digest of ``x``'s raw bytes, reduced on ``x``'s own device.
+
+    ``x`` must be contiguous, real, and non-empty.
+    """
+    # reshape(-1) first so 0-dim scalars (e.g. a loss) work — ``view`` cannot
+    # reinterpret a 0-dim tensor.
+    u8 = x.reshape(-1).view(torch.uint8)
+    pad = (-u8.numel()) % 8
+    if pad:
+        u8 = torch.cat([u8, u8.new_zeros(pad)])
+    lanes = u8.view(torch.int64)
+
+    h1 = 0
+    h2 = 0
+    n = lanes.numel()
+    for start in range(0, n, _SIG_CHUNK_LANES):
+        seg = lanes[start : start + _SIG_CHUNK_LANES]
+        idx = torch.arange(start, start + seg.numel(), device=seg.device, dtype=torch.int64)
+        # Mix each lane with its absolute position, then take a linear and a
+        # nonlinear (squared) reduction so multi-lane cancellations in the
+        # linear sum are still caught. ``idx + 1`` is never zero, so lane 0 of
+        # an all-zero tensor still receives a nonzero position term.
+        mixed = seg * _SIG_C1 + (idx + 1) * _SIG_C2
+        both = torch.stack((mixed.sum(), (mixed * mixed).sum()))
+        s1, s2 = both.tolist()  # one D2H transfer of two scalars per chunk
+        h1 = (h1 + s1) & _SIG_MASK64
+        h2 = (h2 + s2) & _SIG_MASK64
+    return f"{h1:016x}{h2:016x}"
+
+
+def tensor_signature(tensor: Any) -> dict[str, Any] | None:
+    """Cross-process-stable fingerprint of a tensor as a JSON-ready dict.
+
+    Returns ``None`` for non-tensors. The digest covers every raw byte of the
+    tensor (complex tensors are viewed as interleaved real/imaginary floats).
+    """
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    shape = list(tensor.shape)
+    dtype = str(tensor.dtype)
+    numel = tensor.numel()
+    if numel == 0:
+        return {"shape": shape, "dtype": dtype, "numel": 0, "digest": _SIG_EMPTY_DIGEST}
+    x = tensor.detach()
+    if x.is_complex():
+        x = torch.view_as_real(x)
+    if x.layout != torch.strided:
+        x = x.to_dense()
+    x = x.contiguous()
+    return {"shape": shape, "dtype": dtype, "numel": numel, "digest": _device_digest(x)}
 
 
 def _tensor_tree(value: Any, *, include_hash: bool, path: str = "") -> list[dict[str, Any]]:

@@ -134,6 +134,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core.determinism_op_trace import op_trace_mode
 from megatron.core.determinism_trace import (
     EventKind,
     active_trace,
@@ -2209,7 +2210,7 @@ def train_step(
         trace_dir,
         trace_iteration_number,
         hash_tensors=getattr(args, "determinism_trace_tensor_hashes", False),
-    ):
+    ), op_trace_mode(should_trace and getattr(args, "determinism_trace_ops", False)):
         return _train_step(
             forward_step_func,
             data_iterator,

@@ -1319,10 +1319,17 @@ def validate_args(args, defaults={}):
                 "--determinism-trace-optimizer-state requires "
                 "--determinism-trace-tensor-hashes"
             )
+        if args.determinism_trace_ops:
+            # The op-trace dispatch mode runs Python per ATen op and cannot run
+            # inside CUDA-graph capture.
+            assert not getattr(args, "enable_cuda_graph", False) and getattr(
+                args, "cuda_graph_impl", "none"
+            ) in (None, "none"), "--determinism-trace-ops is incompatible with CUDA graphs"
     else:
         assert args.determinism_trace_interval is None
         assert not args.determinism_trace_tensor_hashes
         assert not args.determinism_trace_optimizer_state
+        assert not args.determinism_trace_ops
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.

@@ -182,6 +182,18 @@ An `iteration.end` event reports `pending_collectives`. A nonzero value means a
 collective launched inside the selected window but completed after it. The late
 completion is intentionally not written into the closed iteration trace.
 
+Add `--determinism-trace-ops` to additionally fingerprint **every ATen op
+output** into the same trace with a cheap device-side signature (a 128-bit
+order-independent integer digest, so only two scalars cross the PCIe bus per
+tensor — far cheaper than exact byte hashes). This names the exact compute op
+where two runs first diverge, in between the semantic boundaries above. Records
+carry per-op-name occurrence identities, so the comparator aligns them across
+runs regardless of scheduling. Two limitations: it cannot run under CUDA-graph
+capture, and extension kernels that bypass the torch dispatcher (Transformer
+Engine GEMMs and fused attention, Triton kernels) are not captured directly — a
+divergence born inside one surfaces at the first ATen op that consumes its
+output, which the diff then names.
+
 Run the same launch into a second directory, then align events by semantic
 identity rather than arrival order:
 

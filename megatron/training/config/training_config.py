@@ -63,6 +63,11 @@ class TrainingConfig:
     determinism_trace_optimizer_state: bool = False
     """Include exact local optimizer parameter and state hashes before and after each traced step."""
 
+    determinism_trace_ops: bool = False
+    """Fingerprint every ATen op output (cheap device-side signature) into the determinism trace
+    during traced iterations, naming the exact compute op where two runs first diverge. Debug aid
+    for bounded windows; incompatible with CUDA graphs."""
+
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
