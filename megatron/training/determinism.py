@@ -133,3 +133,13 @@ def apply_determinism_to_args(args) -> None:
 
     # 6. Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)
+    # Experimental profiling toggle: use_deterministic_algorithms(True) also zero-fills
+    # uninitialized memory, which is a large share of the deterministic overhead. Skipping
+    # the fill has stayed bit-exact in validation. Env-gated so the default is unchanged;
+    # set DET_NO_FILL=1 to measure the fill-off path.
+    if os.environ.get("DET_NO_FILL", "").startswith("1"):
+        import torch.utils.deterministic as torch_det_utils
+
+        if hasattr(torch_det_utils, "fill_uninitialized_memory"):
+            # This is a settable bool flag, not a function.
+            torch_det_utils.fill_uninitialized_memory = False
