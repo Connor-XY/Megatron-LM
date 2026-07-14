@@ -57,6 +57,17 @@ class TrainingConfig:
     determinism_trace_interval: int | None = None
     """Number of training iterations between structured determinism traces."""
 
+    determinism_trace_start_iteration: int | None = None
+    """Only trace iterations at or after this 1-based iteration number. Combined with
+    determinism_trace_end_iteration this restricts tracing to a step window (for example,
+    the step where a divergence first arises and the step before it), while
+    determinism_trace_interval still selects which steps within the window are traced.
+    None means no lower bound."""
+
+    determinism_trace_end_iteration: int | None = None
+    """Only trace iterations at or before this 1-based iteration number. None means no
+    upper bound. See determinism_trace_start_iteration."""
+
     determinism_trace_tensor_hashes: bool = False
     """Include exact tensor byte hashes in determinism traces. This synchronizes device tensors."""
 

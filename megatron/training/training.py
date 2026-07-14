@@ -2200,10 +2200,16 @@ def train_step(
     trace_iteration_number = iteration + 1
     configured_trace_dir = getattr(args, "determinism_trace_dir", None)
     configured_trace_interval = getattr(args, "determinism_trace_interval", None)
+    trace_start = getattr(args, "determinism_trace_start_iteration", None)
+    trace_end = getattr(args, "determinism_trace_end_iteration", None)
+    in_trace_window = (trace_start is None or trace_iteration_number >= trace_start) and (
+        trace_end is None or trace_iteration_number <= trace_end
+    )
     should_trace = (
         configured_trace_dir is not None
         and configured_trace_interval is not None
         and trace_iteration_number % configured_trace_interval == 0
+        and in_trace_window
     )
     trace_dir = configured_trace_dir if should_trace else None
     with trace_iteration(

@@ -1314,6 +1314,17 @@ def validate_args(args, defaults={}):
     if args.determinism_trace_dir is not None:
         assert args.determinism_trace_interval is not None
         assert args.determinism_trace_interval > 0
+        trace_start = args.determinism_trace_start_iteration
+        trace_end = args.determinism_trace_end_iteration
+        if trace_start is not None:
+            assert trace_start > 0, "--determinism-trace-start-iteration is 1-based and must be > 0"
+        if trace_end is not None:
+            assert trace_end > 0, "--determinism-trace-end-iteration is 1-based and must be > 0"
+        if trace_start is not None and trace_end is not None:
+            assert trace_start <= trace_end, (
+                "--determinism-trace-start-iteration must not exceed "
+                "--determinism-trace-end-iteration"
+            )
         if args.determinism_trace_optimizer_state:
             assert args.determinism_trace_tensor_hashes, (
                 "--determinism-trace-optimizer-state requires "
@@ -1327,6 +1338,8 @@ def validate_args(args, defaults={}):
             ) in (None, "none"), "--determinism-trace-ops is incompatible with CUDA graphs"
     else:
         assert args.determinism_trace_interval is None
+        assert args.determinism_trace_start_iteration is None
+        assert args.determinism_trace_end_iteration is None
         assert not args.determinism_trace_tensor_hashes
         assert not args.determinism_trace_optimizer_state
         assert not args.determinism_trace_ops
