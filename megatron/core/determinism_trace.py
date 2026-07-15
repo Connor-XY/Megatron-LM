@@ -192,10 +192,26 @@ def _device_digest(x: torch.Tensor) -> str:
     """
     # reshape(-1) first so 0-dim scalars (e.g. a loss) work — ``view`` cannot
     # reinterpret a 0-dim tensor.
-    u8 = x.reshape(-1).view(torch.uint8)
+    flat = x.reshape(-1)
+    try:
+        u8 = flat.contiguous().view(torch.uint8)
+    except RuntimeError:
+        # Some large-model tensor layouts reject the int64->uint8 byte
+        # reinterpret even after ``.contiguous()`` (e.g. a 1-D result whose
+        # last-dim stride is not 1). A CPU roundtrip yields a canonical
+        # stride-1, offset-0 buffer; the bytes — and thus the digest — are
+        # identical, only the reinterpret site moves.
+        u8 = flat.detach().to("cpu").contiguous().view(torch.uint8).to(flat.device)
     pad = (-u8.numel()) % 8
     if pad:
         u8 = torch.cat([u8, u8.new_zeros(pad)])
+    elif u8.storage_offset() % 8 != 0:
+        # ``view(int64)`` requires an 8-byte-aligned storage offset. A
+        # contiguous-but-offset slice (e.g. a routing-index view whose byte
+        # count is already a multiple of 8) otherwise raises
+        # "storage_offset() must be divisible by 8 to view Byte as Long".
+        # Copy to a fresh offset-0 buffer so the reinterpret is always valid.
+        u8 = u8.clone()
     lanes = u8.view(torch.int64)
 
     h1 = 0
