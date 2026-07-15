@@ -49,6 +49,7 @@ Design notes, matching the Megatron-Bridge determinism debug tool this ports
 
 from __future__ import annotations
 
+import os
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -72,6 +73,14 @@ _SUSPENDED = threading.local()
 # Substring skip rules (see module docstring).
 _SKIP_SUBSTRINGS = ("empty", "c10d")
 
+# Optional per-output size cap. Fingerprinting a tensor allocates a device
+# temporary the size of the output, so on a very large model the per-op cost
+# during the live-activation forward can OOM a rank. Set DET_TRACE_OP_MAXNUMEL
+# to skip outputs above that element count (0 = no cap). A skipped output still
+# records its shape/dtype (no digest), so a divergence surfaces at the first
+# under-cap tensor downstream.
+_MAX_NUMEL = int(os.environ.get("DET_TRACE_OP_MAXNUMEL", "0") or "0")
+
 
 def _op_identity(trace: Any, name: str) -> int:
     """Deterministic per-(trace, op-name) occurrence index."""
@@ -92,6 +101,12 @@ def _signature_outputs(out: Any) -> list[dict[str, Any]]:
 
     def add(value: Any) -> None:
         if isinstance(value, torch.Tensor) and value.numel() > 0:
+            if _MAX_NUMEL and value.numel() > _MAX_NUMEL:
+                signatures.append(
+                    {"shape": list(value.shape), "dtype": str(value.dtype),
+                     "numel": value.numel(), "digest": "skipped_oversize"}
+                )
+                return
             signature = tensor_signature(value)
             if signature is not None:
                 signatures.append(signature)
