@@ -27,6 +27,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.determinism import pin_external_mamba_autotuners, use_deterministic_mode
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -208,6 +209,11 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        if self.use_mem_eff_path and use_deterministic_mode():
+            # The mem-eff path runs fused kernels from the external mamba_ssm
+            # package whose timing-based triton autotune breaks run-to-run
+            # bit-exactness. Pin those autotuners to a fixed config.
+            pin_external_mamba_autotuners()
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
