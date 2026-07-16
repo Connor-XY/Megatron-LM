@@ -196,12 +196,14 @@ def _device_digest(x: torch.Tensor) -> str:
     try:
         u8 = flat.contiguous().view(torch.uint8)
     except RuntimeError:
-        # Some large-model tensor layouts reject the int64->uint8 byte
-        # reinterpret even after ``.contiguous()`` (e.g. a 1-D result whose
-        # last-dim stride is not 1). A CPU roundtrip yields a canonical
-        # stride-1, offset-0 buffer; the bytes — and thus the digest — are
-        # identical, only the reinterpret site moves.
-        u8 = flat.detach().to("cpu").contiguous().view(torch.uint8).to(flat.device)
+        # ``.contiguous()`` is a no-op on size-1 (and other trivially
+        # "contiguous") tensors whose ``stride(-1)`` is not 1 — a 1-element
+        # int64 index that inherited an 8192-stride from its parent, say — so
+        # the int64->uint8 reinterpret still fails after it. ``clone`` with an
+        # explicit contiguous format forces a fresh stride-1, offset-0 buffer
+        # on-device (the same canonicalization ``_tensor_bytes`` relies on),
+        # after which the byte view always succeeds.
+        u8 = flat.clone(memory_format=torch.contiguous_format).view(torch.uint8)
     pad = (-u8.numel()) % 8
     if pad:
         u8 = torch.cat([u8, u8.new_zeros(pad)])
