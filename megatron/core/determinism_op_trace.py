@@ -103,8 +103,12 @@ def _signature_outputs(out: Any) -> list[dict[str, Any]]:
         if isinstance(value, torch.Tensor) and value.numel() > 0:
             if _MAX_NUMEL and value.numel() > _MAX_NUMEL:
                 signatures.append(
-                    {"shape": list(value.shape), "dtype": str(value.dtype),
-                     "numel": value.numel(), "digest": "skipped_oversize"}
+                    {
+                        "shape": list(value.shape),
+                        "dtype": str(value.dtype),
+                        "numel": value.numel(),
+                        "digest": "skipped_oversize",
+                    }
                 )
                 return
             signature = tensor_signature(value)
