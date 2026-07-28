@@ -3,10 +3,40 @@
 Nemotron-3 a55b, GTP64 + HybridEP EP64 + cuteDSL + mxfp8, 32 nodes / 128 GB300 GPUs on CMH2.
 All numbers are 1F1B relative to GTP alone on the same allocation.
 
-## Two Settings Worth Changing Today
+## From a 10% Regression to Break-Even
 
-Together these take 1F1B from a 2% throughput tax to break-even, so it can be enabled for its
-memory and scheduling properties without paying for it.
+Enabling 1F1B on this recipe used to cost 10-18% throughput. It now costs nothing. Four separate
+things closed that gap, and only the last two are configuration.
+
+**Correct gradients under delay-wgrad.** The overlap needs `--delay-wgrad-compute`, which was
+banned with EGTP + cuteDSL because it produced wrong gradients: grad norm 3.4 against a reference
+9.7. The deferred weight gradient for the dense and shared GTP linears was computed into a full
+unsharded scratch buffer and then dropped, because TE's `backward_dw` assumed fused accumulation
+had already placed it in `main_grad`. Reduce-scattering that buffer into the sharded `main_grad`
+before it is discarded makes every parameter class bit-identical to the eager reference. Routed
+experts were never affected; the cuteDSL grouped MLP already did this explicitly.
+
+**Migration to current MCore and TransformerEngine.** Moving from the prototype checkout to
+MCore `gtp_release` 269949e and TE 2.19.0.dev0 removed most of the remaining deficit. TE's fused
+MXFP8 grouped MLP now passes caller buffers to the cuDNN frontend kernel as `d_tensor`, which
+eliminates device-to-device copies but requires cuDNN frontend 1.26.0. The version TE declares,
+1.25.0, does not carry that signature. On current sources the deficit measured about 2%.
+
+**Honest measurement.** Arms had been run A-then-B with one sample each, which aliases allocation
+drift onto the arm effect. One such run reported 1F1B 6.488% *faster*. Running A-B-B-A instead,
+with a 2% per-arm CV gate, put the real figure at -2.033%.
+
+**Two settings, worth about 2 points together.** Detailed below.
+
+| stage | 1F1B against GTP alone |
+|---|---|
+| prototype, wrong gradients | -10% to -18% |
+| current sources, fixed gradients, fixed-order measurement | about -2% |
+| A-B-B-A measurement, correct baseline | -2.033% |
+| non-cuteDSL wgrad kernel | -0.910% |
+| `CUDA_DEVICE_MAX_CONNECTIONS` left at default | -0.065% |
+
+## The Two Settings
 
 - **`NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP=1`** — worth about 1.7 points.
 
@@ -14,15 +44,15 @@ memory and scheduling properties without paying for it.
   `b.pre_dispatch.backward_dw` (`model_chunk_schedule_plan.py:236`). Those slots exist to cover
   the dispatch and combine all-to-all. Running without `--delay-wgrad-compute` leaves them empty.
   Running with it fills them, but the cuteDSL wgrad kernel then contends with GTP's all-gather:
-  all-gather kernel time rises 7.5% (891.9 ms against 829.9 ms), which alone accounts for the
-  whole 2% deficit. Switching to the non-cuteDSL wgrad kernel keeps the slots covered and removes
-  the contention. All-gather time returns to 823.7 ms against a GTP-alone mean of 838.7 ms.
+  all-gather kernel time rises 7.5%, from 829.9 ms to 891.9 ms, which alone accounts for the whole
+  2% deficit. The non-cuteDSL wgrad kernel keeps the slots covered without the contention.
+  All-gather time returns to 823.7 ms against a GTP-alone mean of 838.7 ms.
 
 - **Leave `CUDA_DEVICE_MAX_CONNECTIONS` at the driver default** — worth 0.33 points.
 
   The profiling launcher exports `CUDA_DEVICE_MAX_CONNECTIONS=32` for every non-`no1f1b` variant,
   so the 1F1B arms ran at 32 channels while the GTP-alone arms ran at the driver default. A third
-  of the apparent 1F1B penalty was this asymmetry, not 1F1B.
+  of the apparent 1F1B penalty was that asymmetry, not 1F1B.
 
 Recommended configuration:
 
@@ -34,15 +64,12 @@ CUDA_DEVICE_MAX_CONNECTIONS      leave unset
 NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128
 ```
 
-## The Exact Recipe Runs One Micro-Batch Per Step
+Result: two accepted runs at -0.291% and +0.162%, mean -0.065%. 1F1B is throughput-neutral, so it
+can be enabled for its memory and scheduling properties without paying for it.
 
-`--global-batch-size 128` with `--micro-batch-size 1` and DP 128 gives M = 1. 1F1B interleaves
-micro-batch N's forward with micro-batch N-1's backward, which needs M >= 2. At M = 1 that
-mechanism cannot engage at all, so every M = 1 measurement describes only the intra-micro-batch
-overlap that `--overlap-moe-expert-parallel-comm` performs inside a layer.
+## Configuration Sweep
 
-At M = 1 the best configuration reaches parity: two accepted runs at -0.291% and +0.162%, mean
--0.065%. Every configuration dimension is bracketed with the defaults optimal.
+Both HybridEP dimensions are bracketed on each side and both defaults are optimal.
 
 | HybridEP SMs | result | | combine chunk | result |
 |---|---|---|---|---|
@@ -50,23 +77,20 @@ At M = 1 the best configuration reaches parity: two accepted runs at -0.291% and
 | 32 (default) | -0.065% | | 128 (default) | -0.065% |
 | 64 | -2.304% | | 512 | -1.157% |
 
-## M = 2 Is Feasible and the First Comparison Favours 1F1B
+## Larger Global Batch: Unresolved
 
-`GBS=256` gives M = 2. The paged stash must grow, because 1F1B holds two micro-batches of expert
-activations; CUDA factor 1.03 overflows and 2.0 exhausts GPU memory. At 1.03 for the baseline and
-1.2 for 1F1B, one rep of each arm completed:
+1F1B interleaves micro-batch N's forward with micro-batch N-1's backward, so it needs at least two
+micro-batches per step. The exact recipe's `--global-batch-size 128` with `--micro-batch-size 1`
+and DP 128 gives one. `GBS=256` gives two.
 
-| arm | TFLOP/s/GPU | CV |
-|---|---|---|
-| GTP alone | 1220.60 | 0.55% |
-| GTP + 1F1B | 1227.33 | 0.44% |
+Absolute throughput rises for both arms at `GBS=256`, to 1220-1233 TFLOP/s/GPU against about 1165,
+so a larger-batch comparison must use a larger-batch baseline.
 
-That is +0.551% for 1F1B. Treat it as preliminary. The third rep overflowed the stash, so the
-four-arm design did not complete and allocation drift is not controlled. A full ABBA at stash 1.3
-is running.
-
-Absolute throughput at M = 2 is higher for both arms, 1220-1227 against about 1165 at M = 1, so
-an M = 2 comparison must use an M = 2 baseline.
+Neither attempt produced a usable comparison. The paged stash must grow, because 1F1B holds two
+micro-batches of expert activations. CUDA factor 1.03 overflows, 2.0 exhausts GPU memory, and both
+1.2 and 1.3 overflowed on the third arm, so the four-arm design did not complete. The two partial
+single-rep comparisons disagree in sign: +0.551% at stash 1.2, -0.470% at stash 1.3. Nothing
+should be concluded from either.
 
 ## Refuted
 
@@ -97,5 +121,5 @@ sub-1% differences, so candidates need replication.
 
 ## Open
 
-A complete four-arm ABBA at M = 2, replicated. That is the first test of 1F1B's actual mechanism,
-and the preliminary sign is positive.
+A complete four-arm ABBA at `GBS=256`, replicated, at a paged-stash size that fits. That is the
+first test of 1F1B's cross-micro-batch mechanism, and it is currently unmeasured.
