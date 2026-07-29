@@ -77,20 +77,27 @@ Both HybridEP dimensions are bracketed on each side and both defaults are optima
 | 32 (default) | -0.065% | | 128 (default) | -0.065% |
 | 64 | -2.304% | | 512 | -1.157% |
 
-## Larger Global Batch: Unresolved
+## Larger Global Batch: No Effect
 
 1F1B interleaves micro-batch N's forward with micro-batch N-1's backward, so it needs at least two
 micro-batches per step. The exact recipe's `--global-batch-size 128` with `--micro-batch-size 1`
-and DP 128 gives one. `GBS=256` gives two.
+and DP 128 gives one. `GBS=256` gives two, and is the only configuration where the mechanism can
+engage.
 
-Absolute throughput rises for both arms at `GBS=256`, to 1220-1233 TFLOP/s/GPU against about 1165,
-so a larger-batch comparison must use a larger-batch baseline.
+Absolute throughput rises for both arms at `GBS=256`, to about 1205-1231 TFLOP/s/GPU against about
+1165, so a larger-batch comparison uses a larger-batch baseline.
 
-Neither attempt produced a usable comparison. The paged stash must grow, because 1F1B holds two
-micro-batches of expert activations. CUDA factor 1.03 overflows, 2.0 exhausts GPU memory, and both
-1.2 and 1.3 overflowed on the third arm, so the four-arm design did not complete. The two partial
-single-rep comparisons disagree in sign: +0.551% at stash 1.2, -0.470% at stash 1.3. Nothing
-should be concluded from either.
+Two arms run per allocation, with the order reversed in a companion job, because the four-arm
+design overflowed the paged stash on its third arm. Five accepted runs:
+
+| order | results |
+|---|---|
+| A then B | +1.692%, -0.472%, -0.928% |
+| B then A | +0.422%, +0.806% |
+
+Mean +0.304%, SD 1.04, SE 0.46, p about 0.55. No significant effect. The estimate fell from
++0.547% at three runs to +0.304% at five as data accumulated, and the A-then-B ordering averages
++0.097%. The opening +1.692% was an outlier.
 
 ## Refuted
 
@@ -111,15 +118,20 @@ Arms run A-B-B-A on one allocation so the mean time position of each arm is iden
 drift cancels. Throughput is averaged over iterations 14-20, after the profiler window and its
 contaminated exit iteration. Any arm whose CV exceeds 2% rejects the run.
 
-Four favourable results failed verification: +6.488% (fixed A-then-B ordering), +1.655% and
-+0.957% (degraded baselines), and +0.428% (reversed to -1.039% on replication). The +0.957% case
-re-ran clean at -1.157%, a 2.1-point swing. Every over-estimate favoured 1F1B, because allocation
-degradation lands on ABBA position 4, which is a baseline arm.
+Six favourable results failed verification: +6.488% (fixed A-then-B ordering), +1.655% and
++0.957% (degraded baselines), +0.428% (reversed to -1.039% on replication), and the larger-batch
++1.692% (reversed to -0.472% and -0.928% on the same ordering). The +0.957% case re-ran clean at
+-1.157%, a 2.1-point swing. Every over-estimate favoured 1F1B, because allocation degradation
+lands on ABBA position 4, which is a baseline arm.
 
 Between-run SD is about 1%, larger than per-arm CV within a run. Single allocations cannot resolve
 sub-1% differences, so candidates need replication.
 
-## Open
+## Where This Leaves 1F1B
 
-A complete four-arm ABBA at `GBS=256`, replicated, at a paged-stash size that fits. That is the
-first test of 1F1B's cross-micro-batch mechanism, and it is currently unmeasured.
+1F1B is throughput-neutral, not faster. At `GBS=128` its cross-micro-batch mechanism cannot
+engage, so parity is the structural ceiling. At `GBS=256` the mechanism engages and any effect is
+smaller than 0.5%, indistinguishable from zero across five runs.
+
+The practical outcome is that 1F1B no longer costs anything, so it can be enabled for its memory
+and scheduling properties on their own merits.
