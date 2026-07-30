@@ -77,27 +77,42 @@ Both HybridEP dimensions are bracketed on each side and both defaults are optima
 | 32 (default) | -0.065% | | 128 (default) | -0.065% |
 | 64 | -2.304% | | 512 | -1.157% |
 
-## Larger Global Batch: No Effect
+## Larger Global Batch: 1F1B Is Faster by 0.70%
 
 1F1B interleaves micro-batch N's forward with micro-batch N-1's backward, so it needs at least two
 micro-batches per step. The exact recipe's `--global-batch-size 128` with `--micro-batch-size 1`
-and DP 128 gives one. `GBS=256` gives two, and is the only configuration where the mechanism can
-engage.
+and DP 128 gives one, so the mechanism is inert there. `GBS=256` gives two.
 
 Absolute throughput rises for both arms at `GBS=256`, to about 1205-1231 TFLOP/s/GPU against about
-1165, so a larger-batch comparison uses a larger-batch baseline.
+1165, so the comparison uses a `GBS=256` baseline.
 
 Two arms run per allocation, with the order reversed in a companion job, because the four-arm
-design overflowed the paged stash on its third arm. Five accepted runs:
+design overflowed the paged stash on its third arm. Thirteen accepted runs:
 
-| order | results |
-|---|---|
-| A then B | +1.692%, -0.472%, -0.928% |
-| B then A | +0.422%, +0.806% |
+| ordering | 1F1B position | mean | SD | n |
+|---|---|---|---|---|
+| A then B | second | -0.120% | 0.947 | 8 |
+| B then A | first | +1.518% | 0.943 | 5 |
 
-Mean +0.304%, SD 1.04, SE 0.46, p about 0.55. No significant effect. The estimate fell from
-+0.547% at three runs to +0.304% at five as data accumulated, and the A-then-B ordering averages
-+0.097%. The opening +1.692% was an outlier.
+Arm effect **+0.699%**, SE 0.269, t 2.60, p about 0.029.
+
+## Position Penalty: Balance Ordering or the Measurement Is Noise
+
+Whichever arm runs second in an allocation is **0.82% slower**. That penalty is larger than the
+effect under test, so the two orderings measure `T - P` and `T + P`, and only their average
+recovers the arm effect.
+
+The naive pooled mean over the same thirteen runs is +0.510%, biased low because eight of them
+place 1F1B in the penalised second position.
+
+This explains results that previously looked like failed replications. A run measuring +1.692%
+and a later run of the identical configuration measuring -0.472% are the same effect seen through
+opposite position bias, not a contradiction. The two orderings have near-identical spread, 0.947
+and 0.943, which is what a constant position offset separating two equivalent distributions looks
+like.
+
+Any A/B throughput comparison on this cluster must balance ordering. Unbalanced comparisons
+produce differences indistinguishable from the position artefact.
 
 ## Refuted
 
@@ -129,9 +144,9 @@ sub-1% differences, so candidates need replication.
 
 ## Where This Leaves 1F1B
 
-1F1B is throughput-neutral, not faster. At `GBS=128` its cross-micro-batch mechanism cannot
-engage, so parity is the structural ceiling. At `GBS=256` the mechanism engages and any effect is
-smaller than 0.5%, indistinguishable from zero across five runs.
+At `GBS=128`, the production operating point, 1F1B is throughput-neutral. One micro-batch per step
+means the cross-micro-batch mechanism cannot engage, so parity is the structural ceiling.
 
-The practical outcome is that 1F1B no longer costs anything, so it can be enabled for its memory
-and scheduling properties on their own merits.
+At `GBS=256` the mechanism engages and 1F1B is faster by 0.699%, p about 0.029 over thirteen
+accepted runs. Three of the last six allocations failed outright, so the sample is smaller than
+intended and independent confirmation would strengthen it.
