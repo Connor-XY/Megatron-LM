@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.determinism_trace import begin_collective_trace, record_collective_result
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -35,6 +36,45 @@ def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
         return "main_grad"
     return "grad"
+
+
+def _all_reduce_with_determinism_trace(
+    tensor: torch.Tensor,
+    *,
+    group: torch.distributed.ProcessGroup,
+    trace_name: str,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+    metadata: Optional[Dict[str, object]] = None,
+) -> None:
+    """Run the existing synchronous all-reduce with opt-in payload tracing."""
+    trace_metadata: Dict[str, object] = {
+        "async_op": False,
+        "reduce_op": "avg" if op == torch.distributed.ReduceOp.AVG else "sum",
+    }
+    trace_metadata.update(metadata or {})
+    trace_handle = begin_collective_trace(
+        trace_name, "all_reduce", tensor, group=group, metadata=trace_metadata
+    )
+    torch.distributed.all_reduce(tensor, op=op, group=group)
+    record_collective_result(trace_handle, tensor)
+
+
+def _broadcast_with_determinism_trace(
+    tensor: torch.Tensor,
+    *,
+    src: int,
+    group: torch.distributed.ProcessGroup,
+    trace_name: str,
+    metadata: Optional[Dict[str, object]] = None,
+) -> None:
+    """Run an existing synchronous broadcast with opt-in payload tracing."""
+    trace_metadata: Dict[str, object] = {"async_op": False, "src": src}
+    trace_metadata.update(metadata or {})
+    trace_handle = begin_collective_trace(
+        trace_name, "broadcast", tensor, group=group, metadata=trace_metadata
+    )
+    torch.distributed.broadcast(tensor, src=src, group=group)
+    record_collective_result(trace_handle, tensor)
 
 
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
@@ -119,7 +159,12 @@ def _allreduce_conditional_embedding_grads(
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, group=pp_group)
+            _all_reduce_with_determinism_trace(
+                coalesced,
+                group=pp_group,
+                trace_name="finalize_model_grads.conditional_embedding.backward",
+                metadata={"gradient_kind": "conditional_embedding", "tensor_count": len(grads)},
+            )
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
 
@@ -198,6 +243,7 @@ def _allreduce_word_embedding_grads(
         pp_group,
         partial(_get_shared_word_embedding_weight, config=config),
         config=config,
+        trace_name="finalize_model_grads.word_embedding.backward",
     )
 
 
@@ -208,6 +254,7 @@ def _allreduce_embedding_grad(
     weight_getter: Callable[[torch.nn.Module], Optional[torch.nn.Parameter]],
     skip_if_none: bool = True,
     config: TransformerConfig = None,
+    trace_name: str = "finalize_model_grads.embedding.backward",
 ):
     """Unified helper to all-reduce embedding parameters across pipeline stages.
 
@@ -255,7 +302,12 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+        _all_reduce_with_determinism_trace(
+            grad,
+            group=embd_group,
+            trace_name=trace_name,
+            metadata={"gradient_kind": "embedding", "tensor_count": 1},
+        )
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
@@ -271,7 +323,12 @@ def _allreduce_position_embedding_grads(
     """
 
     _allreduce_embedding_grad(
-        model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
+        model,
+        pos_emb_group,
+        pp_group,
+        _get_position_embedding_weight,
+        skip_if_none=False,
+        trace_name="finalize_model_grads.position_embedding.backward",
     )
 
 
@@ -301,8 +358,11 @@ def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerCon
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(
-                coalesced, group=parallel_state.get_pipeline_model_parallel_group()
+            _all_reduce_with_determinism_trace(
+                coalesced,
+                group=parallel_state.get_pipeline_model_parallel_group(),
+                trace_name="finalize_model_grads.flextron_router.backward",
+                metadata={"gradient_kind": "flextron_router", "tensor_count": len(grads)},
             )
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
@@ -464,14 +524,24 @@ def _allreduce_non_tensor_model_parallel_grads(
                         grads_sum.append(grad.data)
 
     # Loop grads and perform correct all-reduce
-    for params, grads, all_reduce_op in zip(
+    for params, grads, all_reduce_op, reduction_name in zip(
         [params_sum, params_avg],
         [grads_sum, grads_avg],
         [torch.distributed.ReduceOp.SUM, torch.distributed.ReduceOp.AVG],
+        ["sum", "average"],
     ):
         if grads:
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
+            _all_reduce_with_determinism_trace(
+                coalesced,
+                op=all_reduce_op,
+                group=tp_group,
+                trace_name=f"finalize_model_grads.tensor_parallel_{reduction_name}.backward",
+                metadata={
+                    "gradient_kind": "non_tensor_parallel_parameter",
+                    "tensor_count": len(grads),
+                },
+            )
             for param, buf, synced in zip(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
@@ -683,10 +753,21 @@ def finalize_model_grads(
         # to the other ranks in the pipeline parallel group.
         assert not isinstance(pp_group, list)
         last_rank = get_pp_last_rank(pp_group)
-        torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group)
+        _broadcast_with_determinism_trace(
+            num_tokens,
+            src=last_rank,
+            group=pp_group,
+            trace_name="finalize_model_grads.num_tokens.pipeline_broadcast",
+            metadata={"value_kind": "token_count"},
+        )
 
         # all-reduce across DP ranks.
-        torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+        _all_reduce_with_determinism_trace(
+            num_tokens,
+            group=dp_cp_group,
+            trace_name="finalize_model_grads.num_tokens.data_parallel_sum",
+            metadata={"value_kind": "token_count"},
+        )
 
         # Clamp to avoid div-by-zero without a host-side branch on a device tensor,
         # which would otherwise cause a sync that is illegal during CUDA graph capture.

@@ -2,6 +2,12 @@
 
 import torch
 
+from megatron.core.determinism_trace import (
+    active_trace,
+    begin_collective_trace,
+    collective_trace_phase,
+    record_collective_result,
+)
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
 
@@ -19,12 +25,44 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _reduce(input_, group):
+def _begin_tensor_parallel_collective_trace(
+    trace_name, operation, input_, group, *, trace_phase=None, metadata=None, determinism_trace=None
+):
+    """Begin an opt-in TP collective trace without changing collective execution."""
+    if trace_name is None:
+        return None
+    phase = collective_trace_phase() if trace_phase is None else trace_phase
+    return begin_collective_trace(
+        f"{trace_name}.{phase}",
+        operation,
+        input_,
+        group=group,
+        metadata=metadata,
+        trace=determinism_trace,
+    )
+
+
+def _trace_split_sizes(split_sizes):
+    """Return split sizes in a JSON-serializable form."""
+    return split_sizes.tolist() if hasattr(split_sizes, "tolist") else split_sizes
+
+
+def _reduce(input_, group, *, trace_name=None, trace_phase=None, determinism_trace=None):
     """All-reduce the input tensor across model parallel group."""
     assert group is not None, "group should not be None"
 
+    trace_handle = _begin_tensor_parallel_collective_trace(
+        trace_name,
+        "all_reduce",
+        input_,
+        group,
+        trace_phase=trace_phase,
+        metadata={"async_op": False, "bypassed": group.size() == 1},
+        determinism_trace=determinism_trace,
+    )
     # Bypass the function if we are using only 1 GPU.
     if group.size() == 1:
+        record_collective_result(trace_handle, input_)
         return input_
 
     # All-reduce.
@@ -34,6 +72,7 @@ def _reduce(input_, group):
     input_ = input_.contiguous()
     torch.distributed.all_reduce(input_, group=group)
 
+    record_collective_result(trace_handle, input_)
     return input_
 
 
@@ -81,12 +120,24 @@ def _split_along_first_dim(input_, group):
     return output
 
 
-def _gather_along_last_dim(input_, group):
+def _gather_along_last_dim(
+    input_, group, *, trace_name=None, trace_phase=None, determinism_trace=None
+):
     """Gather tensors and concatinate along the last dimension."""
 
     world_size = group.size()
+    trace_handle = _begin_tensor_parallel_collective_trace(
+        trace_name,
+        "all_gather_into_tensor",
+        input_,
+        group,
+        trace_phase=trace_phase,
+        metadata={"async_op": False, "axis": "last", "bypassed": world_size == 1},
+        determinism_trace=determinism_trace,
+    )
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
+        record_collective_result(trace_handle, input_)
         return input_
 
     dim_size = list(input_.size())
@@ -97,10 +148,13 @@ def _gather_along_last_dim(input_, group):
     tensor_list = output.chunk(world_size, dim=0)
     output = torch.cat(tensor_list, dim=-1).contiguous()
 
+    record_collective_result(trace_handle, output)
     return output
 
 
-def _reduce_scatter_along_last_dim(input_, group):
+def _reduce_scatter_along_last_dim(
+    input_, group, *, trace_name=None, trace_phase=None, determinism_trace=None
+):
     """Reduce-scatter tensors on the last dimension."""
 
     world_size = group.size()
@@ -111,11 +165,30 @@ def _reduce_scatter_along_last_dim(input_, group):
         input_, split_size_or_sections=input_.shape[-1] // world_size, dim=1
     )
     concat_tensor = torch.cat(split_tensors, dim=0)
+    trace_handle = _begin_tensor_parallel_collective_trace(
+        trace_name,
+        "reduce_scatter_tensor",
+        concat_tensor,
+        group,
+        trace_phase=trace_phase,
+        metadata={"async_op": False, "axis": "last", "bypassed": world_size == 1},
+        determinism_trace=determinism_trace,
+    )
     output = _reduce_scatter_along_first_dim(concat_tensor, group=group).reshape(target_shape)
+    record_collective_result(trace_handle, output)
     return output
 
 
-def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_buffer=False):
+def _gather_along_first_dim(
+    input_,
+    group,
+    output_split_sizes=None,
+    use_global_buffer=False,
+    *,
+    trace_name=None,
+    trace_phase=None,
+    determinism_trace=None,
+):
     """Gather tensors and concatenate along the first dimension.
 
     Args:
@@ -131,8 +204,26 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
 
     assert group is not None, "group should not be None"
     world_size = group.size()
+    trace_metadata = {
+        "async_op": False,
+        "axis": "first",
+        "bypassed": world_size == 1,
+        "output_split_sizes": _trace_split_sizes(output_split_sizes),
+        "use_global_buffer": use_global_buffer,
+    }
+    operation = "all_gather_into_tensor" if output_split_sizes is None else "all_gather"
+    trace_handle = _begin_tensor_parallel_collective_trace(
+        trace_name,
+        operation,
+        input_,
+        group,
+        trace_phase=trace_phase,
+        metadata=trace_metadata,
+        determinism_trace=determinism_trace,
+    )
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
+        record_collective_result(trace_handle, input_)
         return input_
 
     dim_size = list(input_.size())
@@ -153,10 +244,20 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
         output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
         torch.distributed.all_gather(output_tensor_list, input_, group=group)
 
+    record_collective_result(trace_handle, output)
     return output
 
 
-def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_global_buffer=False):
+def _reduce_scatter_along_first_dim(
+    input_,
+    group,
+    input_split_sizes=None,
+    use_global_buffer=False,
+    *,
+    trace_name=None,
+    trace_phase=None,
+    determinism_trace=None,
+):
     """Reduce-scatter the input tensor across model parallel group.
 
     Args:
@@ -167,8 +268,26 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
     """
     assert group is not None, "group should not be None"
     world_size = group.size()
+    trace_metadata = {
+        "async_op": False,
+        "axis": "first",
+        "bypassed": world_size == 1,
+        "input_split_sizes": _trace_split_sizes(input_split_sizes),
+        "use_global_buffer": use_global_buffer,
+    }
+    operation = "reduce_scatter_tensor" if input_split_sizes is None else "reduce_scatter"
+    trace_handle = _begin_tensor_parallel_collective_trace(
+        trace_name,
+        operation,
+        input_,
+        group,
+        trace_phase=trace_phase,
+        metadata=trace_metadata,
+        determinism_trace=determinism_trace,
+    )
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
+        record_collective_result(trace_handle, input_)
         return input_
 
     if input_split_sizes is None:
@@ -195,6 +314,7 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
         else:
             output = torch.empty_like(input_tensor_list[rank])
         torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
+    record_collective_result(trace_handle, output)
     return output
 
 
@@ -210,12 +330,22 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
+        ctx.determinism_trace = active_trace()
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _reduce(grad_output, ctx.group), None
+        return (
+            _reduce(
+                grad_output,
+                ctx.group,
+                trace_name="tensor_parallel.all_reduce",
+                trace_phase="backward",
+                determinism_trace=getattr(ctx, "determinism_trace", None),
+            ),
+            None,
+        )
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -229,7 +359,9 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_, group):
         """Forward function."""
-        return _reduce(input_, group)
+        return _reduce(
+            input_, group, trace_name="tensor_parallel.all_reduce", determinism_trace=active_trace()
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -249,12 +381,22 @@ class _ScatterToModelParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
+        ctx.determinism_trace = active_trace()
         return _split_along_last_dim(input_, group)
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _gather_along_last_dim(grad_output, ctx.group), None
+        return (
+            _gather_along_last_dim(
+                grad_output,
+                ctx.group,
+                trace_name="tensor_parallel.all_gather_last_dim",
+                trace_phase="backward",
+                determinism_trace=getattr(ctx, "determinism_trace", None),
+            ),
+            None,
+        )
 
 
 class _GatherFromModelParallelRegion(torch.autograd.Function):
@@ -269,7 +411,12 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
-        return _gather_along_last_dim(input_, group)
+        return _gather_along_last_dim(
+            input_,
+            group,
+            trace_name="tensor_parallel.all_gather_last_dim",
+            determinism_trace=active_trace(),
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -289,12 +436,22 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
+        ctx.determinism_trace = active_trace()
         return _split_along_first_dim(input_, group)
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _gather_along_first_dim(grad_output, ctx.group), None
+        return (
+            _gather_along_first_dim(
+                grad_output,
+                ctx.group,
+                trace_name="tensor_parallel.all_gather_first_dim",
+                trace_phase="backward",
+                determinism_trace=getattr(ctx, "determinism_trace", None),
+            ),
+            None,
+        )
 
 
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
@@ -326,7 +483,15 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.use_global_buffer = use_global_buffer
-        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer)
+        ctx.determinism_trace = active_trace()
+        return _gather_along_first_dim(
+            input_,
+            group,
+            output_split_sizes,
+            use_global_buffer,
+            trace_name="tensor_parallel.all_gather_first_dim",
+            determinism_trace=ctx.determinism_trace,
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -340,7 +505,13 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         if tensor_parallel_output_grad:
             return (
                 _reduce_scatter_along_first_dim(
-                    grad_output, ctx.group, ctx.output_split_sizes, ctx.use_global_buffer
+                    grad_output,
+                    ctx.group,
+                    ctx.output_split_sizes,
+                    ctx.use_global_buffer,
+                    trace_name="tensor_parallel.reduce_scatter_first_dim",
+                    trace_phase="backward",
+                    determinism_trace=getattr(ctx, "determinism_trace", None),
                 ),
                 None,
                 None,
@@ -366,7 +537,15 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         ctx.group = group
         ctx.input_split_sizes = input_split_sizes
         ctx.use_global_buffer = use_global_buffer
-        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
+        ctx.determinism_trace = active_trace()
+        return _reduce_scatter_along_first_dim(
+            input_,
+            group,
+            input_split_sizes,
+            use_global_buffer,
+            trace_name="tensor_parallel.reduce_scatter_first_dim",
+            determinism_trace=ctx.determinism_trace,
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -374,7 +553,15 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         input_split_sizes = ctx.input_split_sizes
         use_global_buffer = ctx.use_global_buffer
         return (
-            _gather_along_first_dim(grad_output, ctx.group, input_split_sizes, use_global_buffer),
+            _gather_along_first_dim(
+                grad_output,
+                ctx.group,
+                input_split_sizes,
+                use_global_buffer,
+                trace_name="tensor_parallel.all_gather_first_dim",
+                trace_phase="backward",
+                determinism_trace=getattr(ctx, "determinism_trace", None),
+            ),
             None,
             None,
             None,
@@ -393,12 +580,27 @@ class _AllGatherFromTensorParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
-        return _gather_along_last_dim(input_, group)
+        ctx.determinism_trace = active_trace()
+        return _gather_along_last_dim(
+            input_,
+            group,
+            trace_name="tensor_parallel.all_gather_last_dim",
+            determinism_trace=ctx.determinism_trace,
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _reduce_scatter_along_last_dim(grad_output, ctx.group), None
+        return (
+            _reduce_scatter_along_last_dim(
+                grad_output,
+                ctx.group,
+                trace_name="tensor_parallel.reduce_scatter_last_dim",
+                trace_phase="backward",
+                determinism_trace=getattr(ctx, "determinism_trace", None),
+            ),
+            None,
+        )
 
 
 class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
@@ -413,29 +615,88 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
-        return _reduce_scatter_along_last_dim(input_, group)
+        ctx.determinism_trace = active_trace()
+        return _reduce_scatter_along_last_dim(
+            input_,
+            group,
+            trace_name="tensor_parallel.reduce_scatter_last_dim",
+            determinism_trace=ctx.determinism_trace,
+        )
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _gather_along_last_dim(grad_output, ctx.group), None
+        return (
+            _gather_along_last_dim(
+                grad_output,
+                ctx.group,
+                trace_name="tensor_parallel.all_gather_last_dim",
+                trace_phase="backward",
+                determinism_trace=getattr(ctx, "determinism_trace", None),
+            ),
+            None,
+        )
 
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes, use_nccl_stream=False):
+    def forward(
+        ctx,
+        group,
+        input,
+        output_split_sizes,
+        input_split_sizes,
+        use_nccl_stream,
+        trace_name,
+        trace_phase,
+        determinism_trace,
+    ):
         """Forward function."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
         ctx.use_nccl_stream = use_nccl_stream
+        ctx.trace_name = trace_name
 
         world_size = group.size()
+        trace_metadata = {
+            "async_op": use_nccl_stream,
+            "input_split_sizes": (
+                input_split_sizes.tolist()
+                if hasattr(input_split_sizes, "tolist")
+                else input_split_sizes
+            ),
+            "output_split_sizes": (
+                output_split_sizes.tolist()
+                if hasattr(output_split_sizes, "tolist")
+                else output_split_sizes
+            ),
+            "bypassed": world_size == 1,
+        }
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
+            trace_handle = begin_collective_trace(
+                f"{trace_name}.{trace_phase}",
+                "all_to_all_single",
+                input,
+                group=group,
+                metadata=trace_metadata,
+                trace=determinism_trace,
+            )
+            ctx.determinism_trace = trace_handle.trace if trace_handle is not None else None
+            record_collective_result(trace_handle, input)
             return input
 
         input = input.contiguous()
+        trace_handle = begin_collective_trace(
+            f"{trace_name}.{trace_phase}",
+            "all_to_all_single",
+            input,
+            group=group,
+            metadata=trace_metadata,
+            trace=determinism_trace,
+        )
+        ctx.determinism_trace = trace_handle.trace if trace_handle is not None else None
         if output_split_sizes is None:
             # Equal split (all2all)
             output = torch.empty_like(input)
@@ -464,6 +725,7 @@ class _AllToAll(torch.autograd.Function):
                 input_split_sizes=input_split_sizes,
                 group=group,
             )
+        record_collective_result(trace_handle, output)
         return output
 
     @staticmethod
@@ -477,7 +739,13 @@ class _AllToAll(torch.autograd.Function):
                 ctx.input_split_sizes,
                 ctx.output_split_sizes,
                 ctx.use_nccl_stream,
+                ctx.trace_name,
+                "backward",
+                ctx.determinism_trace,
             ),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -556,11 +824,25 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
 
 
 def all_to_all(
-    group, input_, output_split_sizes_=None, input_split_sizes=None, use_nccl_stream=False
+    group,
+    input_,
+    output_split_sizes_=None,
+    input_split_sizes=None,
+    use_nccl_stream=False,
+    trace_name="tensor_parallel.all_to_all",
 ):
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
+    return _AllToAll.apply(
+        group,
+        input_,
+        output_split_sizes_,
+        input_split_sizes,
+        use_nccl_stream,
+        trace_name,
+        collective_trace_phase(),
+        active_trace(),
+    )
 
 
 def all_to_all_sp2hp(input_, group=None):

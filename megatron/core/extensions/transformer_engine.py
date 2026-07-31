@@ -20,6 +20,15 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.determinism_trace import (
+    EventKind,
+    active_trace,
+    begin_recompute_trace,
+    collective_trace_phase,
+    record_event,
+    record_recompute_phase,
+    use_determinism_trace,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -1767,6 +1776,137 @@ class TERowParallelLinear(TELinear):
             super().backward_dw()
 
 
+_TE_ATTENTION_BACKEND_STATE_KEYS = (
+    "use_flash_attention",
+    "flash_attention_backend",
+    "use_fused_attention",
+    "fused_attention_backend",
+    "use_unfused_attention",
+    "backend_selection_requires_update",
+)
+
+
+def _stable_te_backend_value(value: Any) -> Any:
+    """Convert TE's backend-state values to stable JSON-safe scalars."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _record_te_attention_backend_selection(
+    *,
+    config: TransformerConfig,
+    layer_number: int,
+    attention_type: str,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Optional[Tensor],
+    attn_mask_type: AttnMaskType,
+    qkv_format: str,
+    num_splits: Optional[int],
+) -> None:
+    """Record the backend selected by TE after a real attention forward."""
+    trace = active_trace()
+    if trace is None or not trace.is_open:
+        return
+
+    configured_backend = getattr(config.attention_backend, "name", str(config.attention_backend))
+    common_payload = {
+        "configured_backend": configured_backend,
+        "layer_number": layer_number,
+        "phase": collective_trace_phase(),
+        "attention_type": attention_type,
+        "attn_mask_type": getattr(attn_mask_type, "name", str(attn_mask_type)),
+        "qkv_format": qkv_format,
+        "num_splits": num_splits,
+        "query": {"shape": list(query.shape), "dtype": str(query.dtype)},
+        "key": {"shape": list(key.shape), "dtype": str(key.dtype)},
+        "value": {"shape": list(value.shape), "dtype": str(value.dtype)},
+        "attention_mask": (
+            None
+            if attention_mask is None
+            else {"shape": list(attention_mask.shape), "dtype": str(attention_mask.dtype)}
+        ),
+    }
+    try:
+        backend_class = te.pytorch.DotProductAttention
+        module_name = backend_class.__module__
+        backend_module = inspect.getmodule(backend_class)
+        if backend_module is None:
+            record_event(
+                EventKind.RUNTIME,
+                "te.attention.backend.unavailable",
+                {**common_payload, "module": module_name, "reason": "module_unavailable"},
+            )
+            return
+        state = getattr(backend_module, "_attention_backends", None)
+        if not isinstance(state, dict):
+            record_event(
+                EventKind.RUNTIME,
+                "te.attention.backend.unavailable",
+                {
+                    **common_payload,
+                    "module": module_name,
+                    "reason": "state_unavailable",
+                    "state_type": type(state).__name__,
+                },
+            )
+            return
+        normalized_state = {
+            key: _stable_te_backend_value(state.get(key))
+            for key in _TE_ATTENTION_BACKEND_STATE_KEYS
+        }
+        enabled_backends = [
+            name
+            for name, state_key in (
+                ("flash", "use_flash_attention"),
+                ("fused", "use_fused_attention"),
+                ("unfused", "use_unfused_attention"),
+            )
+            if bool(state.get(state_key))
+        ]
+        if len(enabled_backends) != 1:
+            record_event(
+                EventKind.RUNTIME,
+                "te.attention.backend.unavailable",
+                {
+                    **common_payload,
+                    "module": module_name,
+                    "reason": "invalid_selection",
+                    "enabled_backends": enabled_backends,
+                    "backend_state": normalized_state,
+                },
+            )
+            return
+
+        selected_backend = enabled_backends[0]
+        sub_backend_key = {
+            "flash": "flash_attention_backend",
+            "fused": "fused_attention_backend",
+            "unfused": None,
+        }[selected_backend]
+        record_event(
+            EventKind.RUNTIME,
+            "te.attention.backend.selected",
+            {
+                **common_payload,
+                "module": module_name,
+                "selected_backend": selected_backend,
+                "selected_sub_backend": (
+                    normalized_state.get(sub_backend_key) if sub_backend_key is not None else None
+                ),
+                "backend_state": normalized_state,
+            },
+        )
+    except Exception as error:  # TE's private diagnostic state is version dependent.
+        record_event(
+            EventKind.RUNTIME,
+            "te.attention.backend.unavailable",
+            {**common_payload, "reason": "introspection_error", "error_type": type(error).__name__},
+        )
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -1799,6 +1939,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         self.config = config
+        self._determinism_trace_layer_number = layer_number
+        self._determinism_trace_attention_type = attention_type
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
         # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
@@ -2078,6 +2220,18 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 _fa_kwargs["num_splits"] = num_splits
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
+        _record_te_attention_backend_selection(
+            config=self.config,
+            layer_number=self._determinism_trace_layer_number,
+            attention_type=self._determinism_trace_attention_type,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            attn_mask_type=attn_mask_type,
+            qkv_format=qkv_format,
+            num_splits=num_splits,
+        )
         return core_attn_out
 
     def sharded_state_dict(
@@ -3300,9 +3454,26 @@ def te_checkpoint(
 
     from transformer_engine.pytorch.distributed import checkpoint
 
+    trace_handle = begin_recompute_trace(forward_func, {"args": args, "kwargs": kwargs})
+    if trace_handle is not None:
+        phase = "forward"
+
+        def traced_forward_func(*forward_args, **forward_kwargs):
+            nonlocal phase
+            current_phase = phase
+            with use_determinism_trace(trace_handle.trace, collective_phase=current_phase):
+                outputs = forward_func(*forward_args, **forward_kwargs)
+            record_recompute_phase(trace_handle, current_phase, outputs)
+            phase = "recompute"
+            return outputs
+
+        checkpoint_forward_func = traced_forward_func
+    else:
+        checkpoint_forward_func = forward_func
+
     if is_te_min_version("1.5.0"):
         return checkpoint(
-            forward_func,
+            checkpoint_forward_func,
             *args,
             distribute_saved_activations=distribute_saved_activations,
             get_rng_state_tracker=get_rng_state_tracker,
@@ -3311,7 +3482,11 @@ def te_checkpoint(
         )
     else:
         return checkpoint(
-            forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args
+            checkpoint_forward_func,
+            distribute_saved_activations,
+            get_rng_state_tracker,
+            tp_group,
+            *args,
         )
 
 

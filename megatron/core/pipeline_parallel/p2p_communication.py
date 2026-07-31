@@ -6,6 +6,13 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from megatron.core.determinism_trace import (
+    active_trace,
+    begin_collective_trace,
+    record_collective_result,
+    trace_collective_work,
+    trace_collective_work_group,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
@@ -394,6 +401,61 @@ class P2PCommunicator:
         if tensor_recv_next_func is not None:
             tensor_recv_next = tensor_recv_next_func()
 
+        trace_records = None
+        if active_trace() is not None:
+            transport = "ring_exchange" if config.use_ring_exchange_p2p else "p2p"
+            trace_specs = (
+                (
+                    "send_prev",
+                    "pipeline.backward.send_prev",
+                    "isend",
+                    tensor_send_prev,
+                    tensor_send_prev,
+                    prev_rank,
+                ),
+                (
+                    "recv_prev",
+                    "pipeline.forward.recv_prev",
+                    "irecv",
+                    tensor_recv_prev,
+                    None,
+                    prev_rank,
+                ),
+                (
+                    "send_next",
+                    "pipeline.forward.send_next",
+                    "isend",
+                    tensor_send_next,
+                    tensor_send_next,
+                    next_rank,
+                ),
+                (
+                    "recv_next",
+                    "pipeline.backward.recv_next",
+                    "irecv",
+                    tensor_recv_next,
+                    None,
+                    next_rank,
+                ),
+            )
+            trace_records = []
+            for key, name, operation, tensor, inputs, peer_rank in trace_specs:
+                if tensor is None:
+                    continue
+                handle = begin_collective_trace(
+                    name,
+                    "ring_exchange" if config.use_ring_exchange_p2p else operation,
+                    inputs,
+                    group=pp_group,
+                    metadata={
+                        "peer_rank": peer_rank,
+                        "transport": transport,
+                        "batched": config.batch_p2p_comm,
+                        "wait_on_reqs": wait_on_reqs,
+                    },
+                )
+                trace_records.append((key, tensor, handle))
+
         p2p_reqs = p2p_func(
             tensor_send_prev=tensor_send_prev,
             tensor_recv_prev=tensor_recv_prev,
@@ -403,6 +465,30 @@ class P2PCommunicator:
             prev_pipeline_rank=prev_rank,
             next_pipeline_rank=next_rank,
         )
+        if trace_records is not None:
+            if config.use_ring_exchange_p2p:
+                for _, tensor, handle in trace_records:
+                    record_collective_result(handle, tensor)
+            elif isinstance(p2p_reqs, list):
+                if len(p2p_reqs) == 1:
+                    p2p_reqs = [
+                        trace_collective_work_group(
+                            p2p_reqs[0], [(handle, tensor) for _, tensor, handle in trace_records]
+                        )
+                    ]
+                else:
+                    assert len(p2p_reqs) == len(trace_records)
+                    p2p_reqs = [
+                        trace_collective_work(req, handle, tensor)
+                        for req, (_, tensor, handle) in zip(p2p_reqs, trace_records)
+                    ]
+            else:
+                p2p_reqs = {
+                    key: trace_collective_work(req, handle, tensor)
+                    for key, req in p2p_reqs.items()
+                    for trace_key, tensor, handle in trace_records
+                    if trace_key == key
+                }
         if isinstance(p2p_reqs, list):
             reqs.extend(p2p_reqs)
         else:

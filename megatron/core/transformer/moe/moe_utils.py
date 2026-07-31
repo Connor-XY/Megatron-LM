@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.determinism_trace import begin_collective_trace, record_collective_result
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -1158,8 +1159,21 @@ def get_updated_expert_bias(
                 with_context_parallel=True
             )
 
+        trace_handle = begin_collective_trace(
+            "moe.router_expert_bias.token_count",
+            "all_reduce",
+            tokens_per_expert,
+            group=tp_dp_cp_group,
+            metadata={
+                "async_op": False,
+                "reduce_op": "sum",
+                "value_kind": "token_count",
+                "exact_integer_accumulation": not tokens_per_expert.is_floating_point(),
+            },
+        )
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
+        record_collective_result(trace_handle, tokens_per_expert)
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
