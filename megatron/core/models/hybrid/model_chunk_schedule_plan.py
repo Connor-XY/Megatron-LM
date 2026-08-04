@@ -19,6 +19,7 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
+from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
 
 
 class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
@@ -124,7 +125,14 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     def __init__(self, model, *args, **kwargs):
         """Initialize the hybrid chunk plan after validating cuda graph support."""
-        assert model.config.cuda_graph_impl == "none", (
+        # Restrict the cuda-graph ban to bracketed group patterns, which is what the
+        # message already tells users to avoid. Ungrouped patterns keep one schedule
+        # node per layer and do capture: an ungrouped Mamba+MoE pattern trains
+        # correctly under cuda_graph_impl='full_iteration' together with
+        # --overlap-moe-expert-parallel-comm. Asserting unconditionally made the
+        # message's own "or use an ungrouped pattern" remedy unreachable.
+        has_grouped_layers = any(is_layer_group(item) for item in model.decoder.layer_type_list)
+        assert not has_grouped_layers or model.config.cuda_graph_impl == "none", (
             "EP A2A overlap with grouped HybridStack patterns (e.g. '[*E]') does not "
             "support cuda graphs yet. Set cuda_graph_impl='none' or use an ungrouped pattern."
         )
