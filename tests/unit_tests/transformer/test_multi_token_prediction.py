@@ -366,7 +366,10 @@ class TestMultiTokenPredictionLayer:
             assert emb_weight.grad is not None
 
     @pytest.mark.parametrize("detach_heads", [False, True])
-    def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
+    @pytest.mark.parametrize("fuse_linear_cross_entropy", [False, True])
+    def test_process_mtp_loss_detaches_output_weight(
+        self, detach_heads, fuse_linear_cross_entropy
+    ):
         """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
         so the MTP loss does not update the (shared) output projection weight."""
         torch.manual_seed(_SEED)
@@ -378,6 +381,10 @@ class TestMultiTokenPredictionLayer:
             num_attention_heads=8,
             use_cpu_initialization=True,
             mtp_detach_heads=detach_heads,
+        )
+        config.cross_entropy_loss_fusion = fuse_linear_cross_entropy
+        config.cross_entropy_fusion_impl = (
+            "linear" if fuse_linear_cross_entropy else "native"
         )
 
         seq_len = 4
@@ -395,9 +402,19 @@ class TestMultiTokenPredictionLayer:
         loss_mask = torch.ones(batch_size, seq_len)
         output_weight = torch.nn.Parameter(torch.randn(vocab_size, config.hidden_size))
 
-        def output_layer(hidden, weight=None, runtime_gather_output=None):
+        def output_layer(
+            hidden,
+            weight=None,
+            runtime_gather_output=None,
+            output_cross_entropy_loss=False,
+            labels=None,
+        ):
+            del runtime_gather_output, labels
             # hidden: [s, b, h] -> logits: [s, b, vocab]
-            return torch.matmul(hidden, weight.t()), None
+            logits = torch.matmul(hidden, weight.t())
+            if output_cross_entropy_loss:
+                return logits.sum(dim=-1).transpose(0, 1)
+            return logits, None
 
         def compute_language_model_loss(labels, logits):
             # per-token loss of shape [b, s] that depends on logits (hence output_weight).

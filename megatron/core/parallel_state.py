@@ -29,6 +29,7 @@ except ImportError:
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
+_GTP_WEIGHT_REMAT_RS_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
@@ -55,6 +56,7 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 
 # Expert generalized tensor parallelism group that current rank belongs to.
 _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
+_EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = None
 _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
@@ -932,10 +934,14 @@ def initialize_model_parallel(
     # GTP_remat overlaps with the CP-DP domain because GTP_remat only shards weights
     # while CP only shards activations — they are independent and can share ranks.
     global _GTP_WEIGHT_REMAT_GROUP
+    global _GTP_WEIGHT_REMAT_RS_GROUP
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
         _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
+    assert (
+        _GTP_WEIGHT_REMAT_RS_GROUP is None
+    ), "generalized tensor parallel reduce-scatter group is already initialized"
     for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
         group = create_group(
             gtp_ranks,
@@ -946,6 +952,17 @@ def initialize_model_parallel(
         if rank in gtp_ranks:
             _GTP_WEIGHT_REMAT_GROUP = group
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
+        if gtp_remat_size > 1:
+            rs_group = create_group(
+                gtp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("gtp_remat_rs", nccl_comm_cfgs),
+                group_desc="GTP_WEIGHT_REMAT_RS_GROUP",
+            )
+            if rank in gtp_ranks:
+                _GTP_WEIGHT_REMAT_RS_GROUP = rs_group
+        elif rank in gtp_ranks:
+            _GTP_WEIGHT_REMAT_RS_GROUP = group
 
     # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
     if gtp_remat_size > 1:
@@ -1334,10 +1351,14 @@ def initialize_model_parallel(
     # Build the expert generalized tensor parallel group
     # Expert GTP_remat overlaps with the expert DP domain (experts don't use CP).
     global _EXPERT_GTP_WEIGHT_REMAT_GROUP
+    global _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP
     global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
         _EXPERT_GTP_WEIGHT_REMAT_GROUP is None
     ), 'Expert generalized tensor parallel group is already initialized'
+    assert (
+        _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP is None
+    ), 'Expert generalized tensor parallel reduce-scatter group is already initialized'
     # EGTP shard groups are get_ranks('gtp_remat') on the expert generator (singletons when
     # expert_gtp_remat_size == 1). See RankGenerator.get_gtp_ranks.
     for egtp_ranks in expert_decoder_rank_generator.get_gtp_ranks(expert_gtp_remat_size):
@@ -1350,6 +1371,17 @@ def initialize_model_parallel(
         if rank in egtp_ranks:
             _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
             _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
+        if expert_gtp_remat_size > 1:
+            rs_group = create_group(
+                egtp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("expt_gtp_remat_rs", nccl_comm_cfgs),
+                group_desc="EXPERT_GTP_WEIGHT_REMAT_RS_GROUP",
+            )
+            if rank in egtp_ranks:
+                _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = rs_group
+        elif rank in egtp_ranks:
+            _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = group
 
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
@@ -1621,7 +1653,10 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     cp_size = get_context_parallel_world_size()
     tp_size = get_tensor_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
-    dp_size = get_data_parallel_world_size()
+    # RankGenerator models GTP rematerialization as its own axis below. Using the default
+    # GTP-inclusive DP size here would count that axis twice and can generate ranks outside
+    # the default process group's world size.
+    dp_size = get_data_parallel_world_size(with_gtp_remat=False)
     gtp_remat_size = get_gtp_weight_remat_world_size() or 1
 
     # Create regular DP all-gather group
@@ -1651,7 +1686,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     expt_dp_ag_group = None
     if for_expert_parallelism and ep_size > 1:
         expert_tp_size = get_expert_tensor_parallel_world_size()
-        expert_dp_size = get_expert_data_parallel_world_size()
+        expert_dp_size = get_expert_data_parallel_world_size(with_gtp_remat=False)
         egtp_remat_size = get_expert_gtp_weight_remat_world_size() or 1
 
         expert_rank_gen = RankGenerator(
@@ -1717,6 +1752,15 @@ def get_gtp_weight_remat_group(check_initialized=True):
             _GTP_WEIGHT_REMAT_GROUP is not None
         ), "generalized tensor parallel group is not initialized"
     return _GTP_WEIGHT_REMAT_GROUP
+
+
+def get_gtp_weight_remat_rs_group(check_initialized=True):
+    """Get the dedicated delayed-wgrad reduce-scatter group for dense GTP weights."""
+    if check_initialized:
+        assert (
+            _GTP_WEIGHT_REMAT_RS_GROUP is not None
+        ), "generalized tensor parallel reduce-scatter group is not initialized"
+    return _GTP_WEIGHT_REMAT_RS_GROUP
 
 
 def get_gtp_weight_remat_world_size():
@@ -2207,6 +2251,15 @@ def get_expert_gtp_weight_remat_group(check_initialized=True):
     return _EXPERT_GTP_WEIGHT_REMAT_GROUP
 
 
+def get_expert_gtp_weight_remat_rs_group(check_initialized=True):
+    """Get the dedicated delayed-wgrad reduce-scatter group for expert GTP weights."""
+    if check_initialized:
+        assert (
+            _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP is not None
+        ), "expert generalized tensor parallel reduce-scatter group is not initialized"
+    return _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP
+
+
 def get_expert_gtp_weight_remat_world_size():
     """Return world size for the expert-parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -2525,6 +2578,9 @@ def destroy_model_parallel():
     global _GTP_WEIGHT_REMAT_GROUP
     _GTP_WEIGHT_REMAT_GROUP = None
 
+    global _GTP_WEIGHT_REMAT_RS_GROUP
+    _GTP_WEIGHT_REMAT_RS_GROUP = None
+
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 
@@ -2614,6 +2670,9 @@ def destroy_model_parallel():
     # Destroy parallel state related to expert parallelism.
     global _EXPERT_GTP_WEIGHT_REMAT_GROUP
     _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
+
+    global _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP
+    _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = None
 
     global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None

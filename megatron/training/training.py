@@ -50,13 +50,11 @@ from megatron.core.distributed import (
     finalize_model_grads,
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel,
-    FullyShardedDataParallelV1,
-    FullyShardedDataParallelV2,
+    FullyShardedDataParallel as megatron_FSDP,
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1656,22 +1654,8 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            # The distributed optimizer shards each bucket over the intra-instance group, which
-            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
-            # same group, otherwise the layout reports more shards than the reduce-scatter uses
-            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
-            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
-            # when there are several instances.
-            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
-            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
-            data_parallel_world_size = get_pg_size(
-                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
-            )
-            expert_data_parallel_world_size = get_pg_size(
-                intra_expt_dp_group
-                if intra_expt_dp_group is not None
-                else getattr(layout_pgs, "expt_dp", None)
-            )
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
+            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1705,29 +1689,36 @@ def wrap_model_chunks_with_ddp(
     return wrapped
 
 
-def _freeze_all_model_chunks(model_list):
-    """Freeze all parameters in a list of model chunks (for logits-saving runs)."""
-    for model_module in model_list:
-        model_module.requires_grad_(False)
-        # Additionally freeze expert biases of routers
-        for module in model_module.modules():
-            if hasattr(module, "frozen_expert_bias"):
-                module.frozen_expert_bias = True
-    return model_list
+def _ensure_param_all_gather_groups(args, pg_collection):
+    """Create duplicate parameter-gather groups required by the selected DDP path."""
+    if not isinstance(pg_collection, ProcessGroupCollection):
+        return
 
+    separate_nccl_ub_param_gather = (
+        args.nccl_ub
+        and args.ddp_reduce_scatter_with_fp32_accumulation
+        and args.cuda_graph_impl == "full_iteration"
+    )
+    if (args.create_all_gather_group or separate_nccl_ub_param_gather) and getattr(
+        pg_collection, 'dp_cp_ag', None
+    ) is None:
+        timeout = (
+            timedelta(minutes=args.distributed_timeout_minutes)
+            if args.distributed_timeout_minutes
+            else None
+        )
+        dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+            for_expert_parallelism=(args.expert_model_parallel_size > 1),
+            timeout=timeout,
+        )
+        pg_collection.dp_cp_ag = dp_cp_ag
+        pg_collection.expt_dp_ag = expt_dp_ag
 
-def _forward_backward_grad_context(args):
-    """Grad context for a train step's forward/backward pass.
-
-    Returns a tuple of (grad_context, forward_only).
-    grad_context is ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
-    dumps), no parameter needs gradients, so there is no reason to build the
-    autograd graph. Otherwise returns a no-op context.
-    forward_only is True when all layers are frozen, False otherwise.
-    """
-    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
-    forward_only = getattr(args, "freeze_all_layers", False)
-    return grad_context, forward_only
+        print_rank_0("> created all-gather process groups for AG/RS overlap")
+        if separate_nccl_ub_param_gather:
+            print_rank_0(">   isolating captured custom gradient reductions from NCCL UBR")
+        if expt_dp_ag is not None:
+            print_rank_0(">   including expert parallelism AG group")
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
@@ -1737,18 +1728,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        if args.create_all_gather_group:
-            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
-            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
-                for_expert_parallelism=(args.expert_model_parallel_size > 1),
-                timeout=timeout,
-            )
-            pg_collection.dp_cp_ag = dp_cp_ag
-            pg_collection.expt_dp_ag = expt_dp_ag
-
-            print_rank_0("> created all-gather process groups for AG/RS overlap")
-            if expt_dp_ag is not None:
-                print_rank_0(">   including expert parallelism AG group")
+    _ensure_param_all_gather_groups(args, pg_collection)
 
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
@@ -1803,7 +1783,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        _freeze_all_model_chunks(model)
+        for model_module in model:
+            model_module.requires_grad_(False)
+            # Additionally freeze expert biases of routers
+            for module in model_module.modules():
+                if hasattr(module, "frozen_expert_bias"):
+                    module.frozen_expert_bias = True
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1860,7 +1845,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
-            DP = FullyShardedDataParallel
+            DP = megatron_FSDP
+            if args.overlap_moe_expert_parallel_comm and is_hybrid_model(args):
+                from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+                DP = functools.partial(megatron_FSDP, fsdp_unit_modules=[HybridStack])
         else:
             DP = DDP
 
@@ -1889,15 +1878,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
-        if config.cuda_graph_impl == "full_iteration":
-            # DDP initialization must use the full-iteration capture stream so its retained
-            # AccumulateGrad nodes do not reference a different, non-capturing stream.
-            ddp_stream = get_shared_capture_stream()
-        else:
-            # Preserve a dedicated initialization stream for all other implementations.
-            ddp_stream = torch.cuda.Stream()
+        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+        #  capture support with DDP, but we sync it with the current stream to avoid races.
+        ddp_stream = torch.cuda.Stream()
+        # Wait for the default stream to complete before starting ddp_stream
         ddp_stream.wait_stream(torch.cuda.current_stream())
-
+        # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -1914,7 +1900,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
+        # End of setup_stream
+        # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -2022,10 +2009,6 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
         kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
-        if args.use_megatron_fsdp and args.megatron_fsdp_version == 2:
-            # MFSDP v2 gathers parameters from module hooks rather than the V1
-            # start_param_sync path, so disable the V1-only startup all-gather knob.
-            kwargs["fsdp_all_gather_in_start_param_sync"] = False
         if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
             # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
             # operations (such as pointer dereferencing) that can break CUDA graph replay.
@@ -2040,6 +2023,39 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         return DistributedDataParallelConfig(**kwargs)
 
 
+def _warmup_gtp_nccl_communicators(
+    pg_collection: ProcessGroupCollection, optimizer=None
+) -> None:
+    """Initialize late first-use GTP collectives before persistent training buffers exist."""
+    logical_and_across_model_parallel_group(True, group=pg_collection.mp)
+
+    # A Hybrid/MoE ChainedOptimizer can reduce dense and expert gradient statistics on different
+    # groups (for example ``mp`` and ``tp_ep_pp``).  Warm the groups reported by the actual leaf
+    # optimizers instead of assuming that the dense model-parallel group covers every optimizer.
+    # This is the exact collective that get_grad_norm_fp32 issues after the first backward.
+    pending_optimizers = [optimizer] if optimizer is not None else []
+    warmed_group_ids = {id(pg_collection.mp)}
+    warmup_token = torch.zeros([], dtype=torch.int, device="cuda")
+    while pending_optimizers:
+        current_optimizer = pending_optimizers.pop()
+        chained_optimizers = getattr(current_optimizer, 'chained_optimizers', None)
+        if chained_optimizers is not None:
+            pending_optimizers.extend(chained_optimizers)
+            continue
+        grad_stats_group = current_optimizer.get_grad_stats_parallel_group()
+        if id(grad_stats_group) in warmed_group_ids:
+            continue
+        torch.distributed.all_reduce(warmup_token, group=grad_stats_group)
+        warmed_group_ids.add(id(grad_stats_group))
+
+    # Match finalize_model_grads' per-token-loss collective exactly. Under GTP, dp_cp_gtp_remat
+    # spans the rematerialization peers that own distinct tokens; ordinary dp_cp does not.
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+    if id(dp_cp_group) not in warmed_group_ids:
+        torch.distributed.all_reduce(warmup_token, group=dp_cp_group)
+    torch.cuda.synchronize()
+
+
 def setup_model_and_optimizer(
     model_type,
     model_provider_func=None,
@@ -2052,6 +2068,10 @@ def setup_model_and_optimizer(
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
+
+    # This must precede both model-builder branches. Config-container HybridStack recipes build
+    # through builder.build_distributed_models() and therefore do not call get_model().
+    _ensure_param_all_gather_groups(args, pg_collection)
 
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not args.skip_train
@@ -2073,12 +2093,6 @@ def setup_model_and_optimizer(
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
-
-            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
-            # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
-                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
-
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2103,6 +2117,7 @@ def setup_model_and_optimizer(
             fp8_recipe=getattr(args, 'fp8_recipe', None),
             fp8=getattr(args, 'fp8', None) is not None,
             calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+            delay_wgrad_compute=getattr(args, 'delay_wgrad_compute', False),
         )
 
     model = _build_model_wrapper(wrap_with_ddp)
@@ -2121,7 +2136,7 @@ def setup_model_and_optimizer(
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
 
-    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
+    if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2133,7 +2148,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
+    if args.logits_load_dir is not None:
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2169,6 +2184,19 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+        # NCCL initializes each communicator lazily. At large GTP degrees the first collectives
+        # on the model-parallel and full data-distribution groups may otherwise occur only after
+        # the first forward/backward has populated the persistent GTP cache and paged-stash
+        # buffers. NVLS then attempts its communicator allocation at peak memory and can fail even
+        # though there was ample room at startup. Materialize both communicators once, before any
+        # activation/cache allocation; end-of-step collectives use these exact groups and this
+        # adds no steady-state work.
+        if is_gtp_remat_active(args) and getattr(args, 'nccl_ub', False):
+            model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+            if model_pg_collection is None:
+                model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            _warmup_gtp_nccl_communicators(model_pg_collection, optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -2436,22 +2464,20 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        grad_context, forward_only = _forward_backward_grad_context(args)
-        with grad_context:
-            losses_reduced = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=get_num_microbatches(),
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=forward_only,
-                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-                force_all_reduce=save_wgrads_in_this_iteration,
-                p2p_communicator=p2p_communicator,
-                pg_collection=pg_collection,
-            )
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=get_num_microbatches(),
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+            force_all_reduce=save_wgrads_in_this_iteration,
+            p2p_communicator=p2p_communicator,
+            pg_collection=pg_collection,
+        )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2803,13 +2829,24 @@ def training_log(
             track_names.append("z_loss")
 
         if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                flatten_layer_type_list,
+                parse_hybrid_pattern,
+                validate_segment_layers,
             )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+
+            # Pass only MAIN-pattern MoE count (excluding MTP) to track_moe_metrics:
+            # the function adds mtp_num_layers internally to derive the divisor.
+            # get_hybrid_layer_counts already aggregates MTP, which would
+            # double-count and inflate the denominator.
+            parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            layers = 0
+            if parsed.main_pattern:
+                for segment in parsed.main_pattern.split(Symbols.PIPE):
+                    for char in flatten_layer_type_list(validate_segment_layers(segment)):
+                        if char == Symbols.MOE:
+                            layers += 1
         else:
             layers = args.num_layers
 
@@ -3184,6 +3221,27 @@ def _run_gpu_sniff_test(tag):
     print_datetime(f'finished GPU sniff test ({tag})')
 
 
+def _start_nsys_capture(nsys_nvtx_capture_range):
+    """Start exactly one Nsight capture-range backend."""
+    if nsys_nvtx_capture_range:
+        torch.cuda.nvtx.range_push(nsys_nvtx_capture_range)
+    else:
+        torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+
+
+def _stop_nsys_capture(nsys_nvtx_capture_range, nsys_nvtx_context):
+    """Stop the selected Nsight backend while preserving context-exit order."""
+    # Nsight capture-range backends are mutually exclusive: a named NVTX
+    # range owns collection when configured, otherwise retain the existing
+    # cudaProfilerApi start/stop behavior.
+    if not nsys_nvtx_capture_range:
+        torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+    if nsys_nvtx_context is not None:
+        nsys_nvtx_context.__exit__(None, None, None)
+    if nsys_nvtx_capture_range:
+        torch.cuda.nvtx.range_pop()
+
+
 def post_training_step_callbacks(
     model,
     optimizer,
@@ -3241,9 +3299,8 @@ def post_training_step_callbacks(
             if prof.execution_trace_observer is not None:
                 prof.execution_trace_observer.unregister_callback()
         else:
-            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
-            if nsys_nvtx_context is not None:
-                nsys_nvtx_context.__exit__(None, None, None)
+            nsys_nvtx_capture_range = os.environ.get("MEGATRON_NSYS_NVTX_CAPTURE_RANGE")
+            _stop_nsys_capture(nsys_nvtx_capture_range, nsys_nvtx_context)
 
     # GPU sniff test.
     if (
@@ -3563,9 +3620,7 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(
-        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
-    ) and args.overlap_grad_reduce:
+    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -3768,7 +3823,8 @@ def train(
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                nsys_nvtx_capture_range = os.environ.get("MEGATRON_NSYS_NVTX_CAPTURE_RANGE")
+                _start_nsys_capture(nsys_nvtx_capture_range)
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
                 nsys_nvtx_context.__enter__()
 
@@ -3954,9 +4010,7 @@ def train(
             and iteration ==  start_iteration + 1
         ):
             for model_chunk in model:
-                if isinstance(
-                    model_chunk, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
-                ) and getattr(
+                if isinstance(model_chunk, megatron_FSDP) and getattr(
                     model_chunk.ddp_config, "fsdp_manual_registration", False
                 ):
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
@@ -4179,7 +4233,9 @@ def train(
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
                     if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+                        nccl_allocator.deregister_mem_pool(
+                            buf.nccl_mem_pool, buf.param_gather_group
+                        )
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )

@@ -28,7 +28,7 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
-    copy_tensors_to_quantized_params,
+    copy_tensor_to_quantized_param,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
@@ -189,6 +189,8 @@ class _ParamAndGradBucketGroup:
         collective_group: intra_distributed_optimizer_instance_group if using distributed
             optimizer, data_parallel_group if not.
         collective_group_size: World size using the intra data-parallel group.
+        param_gather_group: Optional duplicate communicator used only for parameter all-gathers.
+            Gradient reductions continue to use collective_group.
     """
 
     def __init__(
@@ -197,9 +199,12 @@ class _ParamAndGradBucketGroup:
         ddp_config: DistributedDataParallelConfig,
         collective_group: torch.distributed.ProcessGroup,
         collective_group_size: int,
+        param_gather_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.buckets = buckets
         self.ddp_config = ddp_config
+        self.param_gather_group = param_gather_group or collective_group
+        assert self.param_gather_group.size() == collective_group_size
 
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
@@ -308,9 +313,6 @@ class _ParamAndGradBucketGroup:
                     # buffer to copy back from.
                     continue
                 has_non_quantized_weight = False
-                quantized_params = []
-                param_slices = []
-                flat_param_data = bucket.param_data.view(-1)
                 for param in bucket.params:
                     # Non-quantized weights are already mapped to param.data. Skip
                     # mixed buckets because zeroing bucket.param_data would also
@@ -319,11 +321,8 @@ class _ParamAndGradBucketGroup:
                         has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
-                    quantized_params.append(param)
-                    param_slices.append(flat_param_data[param_start:param_end])
-                # Cast the bucket in one call: these casts are small, so the per-param cost of
-                # issuing them is worth avoiding.
-                copy_tensors_to_quantized_params(quantized_params, param_slices)
+                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    copy_tensor_to_quantized_param(param, param_slice)
                 if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
@@ -425,7 +424,7 @@ class _ParamAndGradBucketGroup:
                 self.param_gather_dispatched = True
                 return
             local_rank = self.intra_distributed_optimizer_instance_rank
-            group = self.intra_distributed_optimizer_instance_group
+            group = self.param_gather_group
             layerwise_work_handles = []
             for bucket in self.buckets:
                 # Use param dtype (e.g., bf16), NOT grad dtype (which may be
@@ -508,7 +507,7 @@ class _ParamAndGradBucketGroup:
             # all_gather_into_tensor writes directly into a contiguous output buffer and
             # does not need a copy-back step, so coalescing works correctly.
             with _coalescing_manager(
-                self.intra_distributed_optimizer_instance_group, async_ops=async_op
+                self.param_gather_group, async_ops=async_op
             ) as cm:
                 for idx, bucket in enumerate(self.buckets):
                     if self.cached_param_buffer_shard_list[idx] is None:
@@ -521,7 +520,7 @@ class _ParamAndGradBucketGroup:
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
+                        group=self.param_gather_group,
                         async_op=async_op,
                     )
             if async_op:
@@ -893,10 +892,8 @@ def group_params_for_buffers(
     Each distinct buffer is identified by a BufferKey with three dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
-    - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
-      which requires a separate buffer for the expert data-parallel group. This is true for experts
-      when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
-      != GTP.
+    - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
+      which requires a separate buffer with a different data-parallel group.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -1038,6 +1035,7 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         param_layout: Optional['PerBufferParamLayout'] = None,
+        param_gather_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
 
         if pg_collection is None:
@@ -1065,9 +1063,16 @@ class _ParamAndGradBuffer:
         self.param_dtype = param_dtype
         self.grad_dtype = grad_dtype
         self.data_parallel_group = data_parallel_group
+        self.param_gather_group = param_gather_group or data_parallel_group
+        assert self.param_gather_group.size() == self.data_parallel_group.size()
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
+        self.separate_nccl_ub_param_and_grad = (
+            self.nccl_ub
+            and self.ddp_config.reduce_scatter_with_fp32_accumulation
+            and self.param_gather_group is not self.data_parallel_group
+        )
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -1143,43 +1148,39 @@ class _ParamAndGradBuffer:
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem,
                 pool,
-                group=self.data_parallel_group,
+                group=self.param_gather_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
             # Since nccl communicator group is created lazily, we need to perform a warmup call to
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
             torch.distributed.barrier()
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
-            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.param_gather_group)
             torch.distributed.barrier()
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
 
-        with mem_alloc_context():
-            # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
-            # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
-            # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(
-                is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
-            ):
-                self.shared_buffer = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
-                # For FP32 weight grads, only half of the buffer is used to store params in bf16.
-                if self.grad_dtype == torch.float32:
-                    self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
-                        torch.bfloat16
+        if self.separate_nccl_ub_param_and_grad:
+            # Full-iteration CUDA graphs cannot replay the custom FP32-accumulating
+            # reduce-scatter when its all-to-all input or output aliases an NCCL
+            # user-buffer allocation. Register only the parameter all-gather storage;
+            # keep gradient storage on the ordinary allocator and the unregistered DP
+            # communicator. This preserves both optimized collectives without a copy or
+            # host-side synchronization on either path.
+            assert self.ddp_config.use_distributed_optimizer
+            with mem_alloc_context():
+                if any(
+                    is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
+                ):
+                    # The shared MXFP8 layout represents gathered parameters in BF16.
+                    self.param_data = torch.zeros(
+                        self.numel,
+                        dtype=torch.bfloat16,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
                     )
                 else:
-                    self.param_data = self.shared_buffer
-                self.grad_data = self.shared_buffer
-            else:
-                # Only re-map param tensors if using distributed optimizer.
-                if self.ddp_config.use_distributed_optimizer:
                     numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
                     self.param_data = torch.zeros(
                         numel,
@@ -1187,12 +1188,56 @@ class _ParamAndGradBuffer:
                         device=torch.cuda.current_device(),
                         requires_grad=False,
                     )
-                self.grad_data = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+            self.grad_data = torch.zeros(
+                self.numel,
+                dtype=self.grad_dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Keeping custom FP32 gradient reductions on ordinary storage while "
+                "registering only the parameter all-gather buffer with NCCL UBR",
+            )
+        else:
+            with mem_alloc_context():
+                # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory
+                # efficiency. The buffer is mapped to weight gradients whose dtype is either
+                # bf16 or FP32. It can be temporarily reused by param AG.
+                if self.ddp_config.use_distributed_optimizer and any(
+                    is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
+                ):
+                    self.shared_buffer = torch.zeros(
+                        self.numel,
+                        dtype=self.grad_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                    # For FP32 weight grads, only half of the buffer is used to store params in bf16.
+                    if self.grad_dtype == torch.float32:
+                        self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
+                            torch.bfloat16
+                        )
+                    else:
+                        self.param_data = self.shared_buffer
+                    self.grad_data = self.shared_buffer
+                else:
+                    # Only re-map param tensors if using distributed optimizer.
+                    if self.ddp_config.use_distributed_optimizer:
+                        numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
+                        self.param_data = torch.zeros(
+                            numel,
+                            dtype=self.param_dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
+                    self.grad_data = torch.zeros(
+                        self.numel,
+                        dtype=self.grad_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
 
         self.grad_data_size = 0
         self.param_data_size = 0
@@ -1715,15 +1760,21 @@ def partition_buckets(
         buckets = []
         ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
+        param_gather_group = buffers[0].param_gather_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
         for buffer in buffers:
             assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
+            assert param_gather_group == buffer.param_gather_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
             buckets.extend(buffer.buckets)
 
         bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
+            buckets,
+            ddp_config,
+            data_parallel_group,
+            data_parallel_world_size,
+            param_gather_group,
         )
         return [bucket_group]
 
@@ -1739,6 +1790,7 @@ def partition_buckets(
                         buffer.ddp_config,
                         buffer.data_parallel_group,
                         buffer.data_parallel_world_size,
+                        buffer.param_gather_group,
                     )
                 )
         return bucket_groups
@@ -1762,9 +1814,10 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
-                            buffer.data_parallel_group,
-                            buffer.data_parallel_world_size,
+                            fp8_buffer.ddp_config,
+                            fp8_buffer.data_parallel_group,
+                            fp8_buffer.data_parallel_world_size,
+                            fp8_buffer.param_gather_group,
                         )
                     )
                     if non_fp8_buckets:
@@ -1772,9 +1825,10 @@ def partition_buckets(
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
-                                    buffer.data_parallel_group,
-                                    buffer.data_parallel_world_size,
+                                    fp8_buffer.ddp_config,
+                                    fp8_buffer.data_parallel_group,
+                                    fp8_buffer.data_parallel_world_size,
+                                    fp8_buffer.param_gather_group,
                                 )
                             )
 
@@ -1787,9 +1841,10 @@ def partition_buckets(
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
-                    buffer.data_parallel_group,
-                    buffer.data_parallel_world_size,
+                    fp8_buffer.ddp_config,
+                    fp8_buffer.data_parallel_group,
+                    fp8_buffer.data_parallel_world_size,
+                    fp8_buffer.param_gather_group,
                 )
             )
         return bucket_groups

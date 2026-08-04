@@ -553,6 +553,48 @@ def test_separate_all_gather_group():
     Utils.destroy_model_parallel()
 
 
+def test_separate_all_gather_group_with_gtp_remat():
+    """The duplicate DP group must not count the explicit GTP axis twice."""
+    if world_size < 2:
+        pytest.skip("Requires at least two distributed ranks")
+
+    Utils.initialize_model_parallel(gtp_remat_size=2)
+
+    dp_cp_group = ps.get_data_parallel_group(
+        with_context_parallel=True, with_gtp_remat=False
+    )
+    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+
+    assert torch.distributed.get_process_group_ranks(dp_cp_ag_group) == dp_cp_ranks
+    assert dp_cp_ag_group != dp_cp_group
+
+    Utils.destroy_model_parallel()
+
+
+def test_separate_gtp_delayed_wgrad_reduce_scatter_group():
+    """Delayed GTP wgrads use a same-rank, distinct communicator when GTP spans ranks."""
+    if world_size < 2:
+        pytest.skip("Requires at least two distributed ranks")
+
+    Utils.initialize_model_parallel(gtp_remat_size=2)
+
+    gtp_group = ps.get_gtp_weight_remat_group()
+    rs_group = ps.get_gtp_weight_remat_rs_group()
+    assert torch.distributed.get_process_group_ranks(rs_group) == (
+        torch.distributed.get_process_group_ranks(gtp_group)
+    )
+    assert rs_group != gtp_group
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['gtp_remat', 'gtp_remat_rs']
+    )
+    assert pg_collection.gtp_remat == gtp_group
+    assert pg_collection.gtp_remat_rs == rs_group
+
+    Utils.destroy_model_parallel()
+
+
 def test_expert_all_gather_group():
     """Test expert AG groups for MoE models with AG/RS overlap."""
     # Initialize model parallel with expert parallelism

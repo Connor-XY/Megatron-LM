@@ -31,7 +31,9 @@ class TestReduceScatterWithFP32Accumulation:
     @pytest.mark.parametrize("async_op", [True, False])
     @pytest.mark.parametrize("baseline_reduce_scatter_in_fp32", [True, False])
     def test_reduce_scatter_with_fp32_accumulation(
-        self, async_op: bool, baseline_reduce_scatter_in_fp32: bool
+        self,
+        async_op: bool,
+        baseline_reduce_scatter_in_fp32: bool,
     ):
         num_tests = 20
         rank = Utils.rank
@@ -42,7 +44,11 @@ class TestReduceScatterWithFP32Accumulation:
             tensor2 = tensor1.clone()
 
             # Make sure the two APIs are *identical*.
-            kwargs = {"op": torch.distributed.ReduceOp.SUM, "group": None, "async_op": async_op}
+            kwargs = {
+                "op": torch.distributed.ReduceOp.SUM,
+                "group": None,
+                "async_op": async_op,
+            }
 
             # Reduce-scatter with all-to-alls.
             args = [

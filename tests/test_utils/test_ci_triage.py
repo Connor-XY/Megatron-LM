@@ -157,16 +157,60 @@ def test_all_generated_test_types_enable_error_extraction():
     assert functional.count('"--enable-error-extraction"') >= 2
 
 
-def test_functional_notifications_are_parent_aggregate_only():
-    launcher = Path("tests/test_utils/python_scripts/launch_jet_workload.py").read_text()
-    functional = yaml.safe_load(Path(".gitlab/stages/04.functional-tests.yml").read_text())
-    notify_script = "\n".join(functional["functional:x_notify"]["script"])
+@pytest.mark.parametrize(("test_type", "expected_alerts"), [("regular", 0), ("release", 1)])
+def test_retry_exhaustion_per_test_alert_is_release_only(
+    monkeypatch, tmp_path, test_type, expected_alerts
+):
+    pytest.importorskip("jetclient")
+    from tests.test_utils.python_scripts import launch_jet_workload
 
-    assert "send_slack_alert" not in launcher
-    assert "notify.py" not in launcher
-    assert notify_script.count("python tests/test_utils/python_scripts/notify.py") == 1
-    assert "--check-for functional-tests" in notify_script
-    assert "--pipeline-context $CONTEXT" in notify_script
+    base_path = tmp_path / "tests" / "test_utils" / "python_scripts"
+    model_config = (
+        tmp_path
+        / "tests"
+        / "functional_tests"
+        / "test_cases"
+        / "model"
+        / "case"
+        / "model_config.yaml"
+    )
+    base_path.mkdir(parents=True)
+    model_config.parent.mkdir(parents=True)
+    model_config.write_text(f"TEST_TYPE: {test_type}\n")
+
+    job = Mock()
+    job.name = "basic-job"
+    pipeline = Mock()
+    pipeline.get_jobs.return_value = [job]
+    launch = Mock(return_value=pipeline)
+    alert = Mock()
+    telemetry = Mock()
+    monkeypatch.setattr(launch_jet_workload, "BASE_PATH", base_path)
+    monkeypatch.setattr(launch_jet_workload, "launch_and_wait_for_completion", launch)
+    monkeypatch.setattr(launch_jet_workload, "download_job_assets", Mock(return_value=None))
+    monkeypatch.setattr(launch_jet_workload, "send_slack_alert", alert)
+    monkeypatch.setattr(launch_jet_workload, "telemetrics_and_exit", telemetry)
+
+    launch_jet_workload.main.callback(
+        model="model",
+        test_case="case",
+        environment="dev",
+        n_repeat=1,
+        time_limit=1,
+        scope="mr",
+        account="mcore",
+        partition=None,
+        cluster="cluster",
+        platform="platform",
+        container_tag="tag",
+        record_checkpoints="false",
+        run_name="run",
+        wandb_experiment="experiment",
+    )
+
+    assert launch.call_count == 9
+    assert alert.call_count == expected_alerts
+    telemetry.assert_called_once()
 
 
 def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
@@ -408,8 +452,7 @@ def test_slack_followup_uses_upstream_detailed_and_execution_summaries():
     assert 'if [[ -z "${THREAD_TIMESTAMP}" ]]' in script
 
 
-@pytest.mark.parametrize("pipeline_context", ["mr", "nightly", "weekly", "release"])
-def test_notification_delegates_to_triage_package(monkeypatch, notify_module, pipeline_context):
+def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
     notify = notify_module
     project = Mock()
     pipeline_jobs = [("functional:run_dev_dgx_h100", 101, [{"status": "failed"}])]
@@ -432,7 +475,7 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module, pi
             "--check-for",
             "functional-tests",
             "--pipeline-context",
-            pipeline_context,
+            "mr",
             "--pipeline-created-at",
             "2026-07-12T00:00:00Z",
         ],
@@ -441,7 +484,7 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module, pi
     assert result.exit_code == 0, result.output
     sender.assert_called_once_with(
         "megatron-lm",
-        pipeline_context,
+        "mr",
         pipeline_jobs,
         None,
         webhook_url="https://slack.invalid/webhook",

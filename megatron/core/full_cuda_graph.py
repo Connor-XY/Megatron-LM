@@ -222,6 +222,20 @@ class FullCudaGraphWrapper:
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
+            # GTP's eager warmups may leave satisfied buffer-reuse events in its cache. A new
+            # CUDA graph cannot wait on events recorded outside its capture, so forget those
+            # dependencies after the synchronization while preserving all stable buffer/ticket
+            # addresses. Import lazily: full CUDA graphs do not otherwise depend on GTP/TE.
+            try:
+                from megatron.core.tensor_parallel.gtp_api import (
+                    HAVE_GTP,
+                    prepare_gtp_for_full_cuda_graph_capture,
+                )
+
+                if HAVE_GTP:
+                    prepare_gtp_for_full_cuda_graph_capture()
+            except ImportError:
+                pass
             capture_stream = get_shared_capture_stream()
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],

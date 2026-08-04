@@ -57,7 +57,7 @@ def reduce_scatter_with_fp32_accumulation(
         input_tensor (torch.Tensor): Input tensor that needs to be reduce-scattered.
         op (torch.distributed.ReduceOp): Only torch.distributed.ReduceOp.SUM is supported.
         group (torch.distributed.ProcessGroup): Process group to use for reduce-scatter.
-        async_op (bool): Only False is supported right now.
+        async_op (bool): Return a work handle instead of completing the reduction immediately.
     """
     # Make sure arguments conform to the implementation.
     assert op == torch.distributed.ReduceOp.SUM
@@ -76,7 +76,10 @@ def reduce_scatter_with_fp32_accumulation(
     # cannot be performed in-place).
     all_to_all_output_tensor = torch.empty_like(input_tensor)
     all_to_all_handle = torch.distributed.all_to_all_single(
-        output=all_to_all_output_tensor, input=input_tensor, group=group, async_op=async_op
+        output=all_to_all_output_tensor,
+        input=input_tensor,
+        group=group,
+        async_op=async_op,
     )
 
     # Create a work handle to finish communication and reduction.

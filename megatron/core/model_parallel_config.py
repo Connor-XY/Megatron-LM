@@ -322,9 +322,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+    """Cross-entropy fusion implementation. ``native`` fuses the vocabulary-parallel
+       cross entropy, ``te`` uses Transformer Engine, and ``linear`` fuses the output
+       projection with cross entropy to avoid materializing full-vocabulary logits.
+       Defaults to ``native``.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

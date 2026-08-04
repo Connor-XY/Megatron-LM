@@ -837,14 +837,10 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    fuse_linear_cross_entropy = (
+        config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+    )
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
@@ -852,7 +848,24 @@ def process_mtp_loss(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        if fuse_linear_cross_entropy:
+            mtp_loss = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=mtp_labels,
+            )
+            mtp_logits = None
+        else:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
         mtp_loss = loss_mask * mtp_loss
 
@@ -860,9 +873,18 @@ def process_mtp_loss(
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
-            )
+            if mtp_logits is None:
+                correct = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+                total = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+            else:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits,
+                    mtp_labels,
+                    loss_mask,
+                    output_layer,
+                    runtime_gather_output,
+                    tp_group,
+                )
 
             MTPLossLoggingHelper.save_metrics_to_tracker(
                 mtp_loss_for_log,

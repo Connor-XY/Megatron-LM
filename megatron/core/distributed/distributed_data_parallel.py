@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import torch
@@ -84,6 +84,8 @@ class DistributedDataParallel(_BaseDataParallel):
         self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
         self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
+        self.dp_cp_ag_group = process_group_dict['dp_cp_ag_group']
+        self.expt_dp_ag_group = process_group_dict['expt_dp_ag_group']
         self.tp_group = process_group_dict['tp_group']
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
@@ -219,10 +221,22 @@ class DistributedDataParallel(_BaseDataParallel):
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
+                param_gather_group = self.expt_dp_ag_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
                 data_parallel_group = self.intra_dp_cp_group
+                param_gather_group = self.dp_cp_ag_group
                 scaling_factor = gradient_scaling_factor
+
+            if param_gather_group is None:
+                param_gather_group = data_parallel_group
+            elif self.ddp_config.nccl_ub:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "Registering the parameter buffer with a dedicated all-gather communicator; "
+                    "gradient reductions remain on the unregistered DP communicator",
+                )
 
             if not config.calculate_per_token_loss:
                 target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
@@ -259,6 +273,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                param_gather_group=param_gather_group,
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)
@@ -355,14 +370,45 @@ class DistributedDataParallel(_BaseDataParallel):
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
-        for param in self.module.parameters():
-            if param.requires_grad:
-                # When delay_wgrad_compute is True and the param is marked with
-                # skip_backward_post_hook, register the backward post hook for its module
-                # instead of the param so that the wgrad accumulation and reduce will be performed
-                # in backward_dw() method of the module instead of the hook of backward() method.
-                # Otherwise, register the backward post hook for the param.
-                if self.ddp_config.delay_wgrad_compute and getattr(
+        full_iteration_cg = getattr(self.config, 'cuda_graph_impl', 'none') == 'full_iteration'
+        if full_iteration_cg:
+            # AccumulateGrad snapshots the current CUDA stream when it is materialized. Keep
+            # full-iteration DDP nodes on the stream that will own capture so fine-grained 1F1B
+            # producers on captured side streams never depend on a stale warmup stream.
+            from ..full_cuda_graph import get_shared_capture_stream
+
+            grad_acc_stream_context = torch.cuda.stream(get_shared_capture_stream())
+        else:
+            grad_acc_stream_context = nullcontext()
+
+        with grad_acc_stream_context:
+            for param in self.module.parameters():
+                if not param.requires_grad:
+                    continue
+
+                is_gtp_param = getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                    param, 'register_grad_accum_hook'
+                )
+                grad_acc = None
+                if full_iteration_cg or is_gtp_param:
+                    # Full-iteration capture needs a stable node for every trainable parameter,
+                    # including module-hook-delayed wgrads. GTP also needs stable lifetime in the
+                    # non-graph case while retaining manual grad-ready ordering.
+                    param_tmp = param.expand_as(param)
+                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    self.grad_accs.append(grad_acc)
+
+                if is_gtp_param:
+                    # GTP owns main_grad accumulation even when TE delays the wgrad GEMM. Drive
+                    # grad-ready from GTP's finalize path after its reduce-scatter + main_grad add,
+                    # rather than from autograd or TE's module-level delayed-wgrad hook. No hook
+                    # is registered on AccumulateGrad itself, so grad-ready remains exclusively
+                    # GTP-driven.
+                    param.register_grad_accum_hook(grad_acc, self._make_backward_post_hook(param))
+                # When delay_wgrad_compute is True and a non-GTP param is marked with
+                # skip_backward_post_hook, register the backward post hook for its module instead
+                # of the param so accumulation/reduction happens from backward_dw().
+                elif self.ddp_config.delay_wgrad_compute and getattr(
                     param, 'skip_backward_post_hook', False
                 ):
                     for module in self.module.modules():
@@ -374,24 +420,13 @@ class DistributedDataParallel(_BaseDataParallel):
                                     )
                                     break
                 else:
-                    # Expand so we get access to grad_fn.
-                    param_tmp = param.expand_as(param)
-                    # Get the gradient accumulator function.
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
-                        param, 'register_grad_accum_hook'
-                    ):
-                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
-                        # AccumulateGrad sees only a dummy; grad-ready is driven manually from
-                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
-                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
-                        # No autograd hook or grad_accs entry: either would fire on a stale grad.
-                        param.register_grad_accum_hook(
-                            grad_acc, self._make_backward_post_hook(param)
-                        )
-                    else:
-                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                    if grad_acc is None:
+                        # Expand so we get access to grad_fn.
+                        param_tmp = param.expand_as(param)
+                        # Get the gradient accumulator function.
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
                         self.grad_accs.append(grad_acc)
+                    grad_acc.register_hook(self._make_backward_post_hook(param))
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True

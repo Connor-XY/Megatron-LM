@@ -27,6 +27,9 @@ Test groups
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
 
+import functools
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -72,6 +75,77 @@ class _FakeGroup:
 
     def rank(self):
         return self._rank
+
+
+def test_gtp_nccl_warmup_uses_full_data_distribution_group(monkeypatch):
+    """Warm the exact late first-use groups before GTP cache allocation."""
+    import megatron.training.training as training
+
+    calls = []
+    token = object()
+    pg_collection = SimpleNamespace(mp=object(), dp_cp=object(), dp_cp_gtp_remat=object())
+    expert_grad_stats_group = object()
+    optimizer = SimpleNamespace(
+        chained_optimizers=[
+            SimpleNamespace(get_grad_stats_parallel_group=lambda: pg_collection.mp),
+            SimpleNamespace(get_grad_stats_parallel_group=lambda: expert_grad_stats_group),
+            # Duplicate leaves must not materialize the same communicator twice.
+            SimpleNamespace(get_grad_stats_parallel_group=lambda: expert_grad_stats_group),
+        ]
+    )
+
+    monkeypatch.setattr(
+        training,
+        "logical_and_across_model_parallel_group",
+        lambda value, group: calls.append(("model", value, group)),
+    )
+    monkeypatch.setattr(
+        training.torch,
+        "zeros",
+        lambda shape, dtype, device: calls.append(("tensor", shape, dtype, device)) or token,
+    )
+    monkeypatch.setattr(
+        training.torch.distributed,
+        "all_reduce",
+        lambda tensor, group: calls.append(("data", tensor, group)),
+    )
+    monkeypatch.setattr(training.torch.cuda, "synchronize", lambda: calls.append(("sync",)))
+
+    training._warmup_gtp_nccl_communicators(pg_collection, optimizer)
+
+    assert calls == [
+        ("model", True, pg_collection.mp),
+        ("tensor", [], torch.int, "cuda"),
+        ("data", token, expert_grad_stats_group),
+        ("data", token, pg_collection.dp_cp_gtp_remat),
+        ("sync",),
+    ]
+
+    calls.clear()
+    pg_collection.dp_cp_gtp_remat = None
+    training._warmup_gtp_nccl_communicators(pg_collection, optimizer)
+    assert calls[-2] == ("data", token, pg_collection.dp_cp)
+
+
+def test_prepare_full_cuda_graph_capture_drops_only_reuse_events():
+    """The warmup/capture boundary keeps cache addresses but removes external event edges."""
+    old_cache = gtp_module._GTP_CACHE
+    old_pool_events = dict(gtp_module._wgrad_buf_reuse_events)
+    cache = gtp_module.GTPWeightCache()
+    cached_buffer = object()
+    cache._pool[("sentinel",)] = [cached_buffer]
+    cache._reuse_events[1] = object()
+    gtp_module._GTP_CACHE = cache
+    gtp_module._wgrad_buf_reuse_events[2] = object()
+    try:
+        gtp_module.prepare_gtp_for_full_cuda_graph_capture()
+        assert cache._reuse_events == {}
+        assert gtp_module._wgrad_buf_reuse_events == {}
+        assert cache._pool[("sentinel",)] == [cached_buffer]
+    finally:
+        gtp_module._GTP_CACHE = old_cache
+        gtp_module._wgrad_buf_reuse_events.clear()
+        gtp_module._wgrad_buf_reuse_events.update(old_pool_events)
 
 
 def _worker_sharding_aligned(rank, world_size, port):
@@ -170,6 +244,170 @@ class TestWrapModuleParams:
     def test_grouped_linear_weight_list(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_grouped_weight_list, 4)
+
+
+def test_hybridep_arbiter_waits_only_dense_gtp_ag(monkeypatch):
+    """The experimental pre-launch hook must preserve expert-GTP concurrency."""
+
+    class _CurrentStream:
+        def __init__(self):
+            self.waited = []
+
+        def wait_stream(self, stream):
+            self.waited.append(stream)
+
+    current = _CurrentStream()
+    dense_stream = object()
+    expert_stream = object()
+
+    class _InflightParam:
+        def __init__(self, is_routed_expert):
+            self.is_routed_expert = is_routed_expert
+            self.gather_waits = 0
+            self.recompute_waits = 0
+
+        def _wait_param_gather(self):
+            self.gather_waits += 1
+
+        def _wait_recompute_param_gather(self):
+            self.recompute_waits += 1
+
+    dense_param = _InflightParam(is_routed_expert=False)
+    expert_param = _InflightParam(is_routed_expert=True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
+    monkeypatch.setattr(
+        gtp_module,
+        "_AG_STREAMS",
+        {("GTP_graphed", 1): dense_stream, ("GTP_graphed", 2): expert_stream},
+    )
+    monkeypatch.setattr(
+        gtp_module, "_AG_IS_ROUTED_EXPERT", {("GTP_graphed", 1): False, ("GTP_graphed", 2): True}
+    )
+    monkeypatch.setattr(gtp_module, "_inflight_comm_params", {dense_param, expert_param})
+    monkeypatch.setattr(gtp_module, "_hybrid_ep_dense_ag_policy", "1")
+
+    gtp_module.wait_dense_gtp_all_gathers_on_current_stream("dispatch")
+
+    assert current.waited == [dense_stream]
+    assert (dense_param.gather_waits, dense_param.recompute_waits) == (1, 1)
+    assert (expert_param.gather_waits, expert_param.recompute_waits) == (0, 0)
+
+
+def test_hybridep_combine_policy_preserves_dispatch_overlap(monkeypatch):
+    """The operation-scoped policy must drain only before physical combine launches."""
+    calls = []
+    monkeypatch.setattr(gtp_module, "_hybrid_ep_dense_ag_policy", "combine")
+    monkeypatch.setattr(gtp_module, "_inflight_comm_params", set())
+    monkeypatch.setattr(gtp_module, "_AG_STREAMS", {})
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: calls.append("drain"))
+
+    gtp_module.wait_dense_gtp_all_gathers_on_current_stream("dispatch")
+    assert calls == []
+
+    gtp_module.wait_dense_gtp_all_gathers_on_current_stream("combine")
+    assert calls == ["drain"]
+
+
+def test_hybridep_high_priority_stream_is_dense_only(monkeypatch):
+    """The priority experiment must not change the routed-expert GTP stream."""
+
+    class _FakeStream:
+        @staticmethod
+        def priority_range():
+            return (0, -1)
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(torch.cuda, "Stream", _FakeStream)
+    monkeypatch.setattr(gtp_module, "_AG_STREAMS", {})
+    monkeypatch.setattr(gtp_module.GTP_CONFIG, "dense_ag_high_priority", True)
+
+    dense_group = object()
+    expert_group = object()
+    dense_stream = gtp_module.get_ag_stream("GTP_graphed", dense_group, is_routed_expert=False)
+    expert_stream = gtp_module.get_ag_stream("GTP_graphed", expert_group, is_routed_expert=True)
+
+    assert dense_stream.kwargs == {"priority": -1}
+    assert expert_stream.kwargs == {}
+
+
+def test_hybridep_pre_launch_hook_receives_physical_operation(monkeypatch):
+    """Every HybridEP autograd entry point must report its physical collective."""
+    from megatron.core.transformer.moe import fused_a2a
+
+    operations = []
+
+    class _FakeHybridEPBuffer:
+        def dispatch_with_permute(self, **kwargs):
+            return object(), object(), object(), object(), object()
+
+        def combine_with_unpermute(self, **kwargs):
+            return object(), object()
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", _FakeHybridEPBuffer())
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_pre_launch_hook", operations.append)
+
+    dispatch_ctx = type("DispatchContext", (), {})()
+    fused_a2a.HybridEPDispatch.forward(dispatch_ctx, object(), object(), object(), None, 1)
+    fused_a2a.HybridEPDispatch.backward(
+        dispatch_ctx, object(), object(), object(), object(), object()
+    )
+
+    combine_ctx = type("CombineContext", (), {})()
+    fused_a2a.HybridEPCombine.forward(combine_ctx, object(), object())
+    fused_a2a.HybridEPCombine.backward(combine_ctx, object())
+
+    assert operations == ["dispatch", "combine", "combine", "dispatch"]
+
+
+def test_hybridep_arbiter_configuration_is_not_sticky(monkeypatch):
+    """Reconfiguring a model in-process must restore the default no-hook path."""
+    from megatron.core.transformer.moe import fused_a2a
+
+    previous_delay_wgrad = gtp_module.GTP_CONFIG.delay_wgrad_compute
+    previous_dense_ag_high_priority = gtp_module.GTP_CONFIG.dense_ag_high_priority
+    previous_policy = gtp_module._hybrid_ep_dense_ag_policy
+    previous_hook = fused_a2a._hybrid_ep_pre_launch_hook
+    try:
+        monkeypatch.setenv("GTP_HYBRIDEP_DENSE_AG_SERIALIZE", "1")
+        monkeypatch.setenv("GTP_HYBRIDEP_DENSE_AG_HIGH_PRIORITY", "1")
+        gtp_module.configure_gtp_remat_from_recipe(delay_wgrad_compute=True)
+        assert (
+            fused_a2a._hybrid_ep_pre_launch_hook
+            is gtp_module.wait_dense_gtp_all_gathers_on_current_stream
+        )
+        assert gtp_module._hybrid_ep_dense_ag_policy == "1"
+        assert gtp_module.GTP_CONFIG.dense_ag_high_priority is True
+
+        monkeypatch.setenv("GTP_HYBRIDEP_DENSE_AG_SERIALIZE", "combine")
+        gtp_module.configure_gtp_remat_from_recipe(delay_wgrad_compute=True)
+        assert (
+            fused_a2a._hybrid_ep_pre_launch_hook
+            is gtp_module.wait_dense_gtp_all_gathers_on_current_stream
+        )
+        assert gtp_module._hybrid_ep_dense_ag_policy == "combine"
+
+        monkeypatch.setenv("GTP_HYBRIDEP_DENSE_AG_SERIALIZE", "invalid")
+        with pytest.raises(ValueError, match="must be '0', '1', or 'combine'"):
+            gtp_module.configure_gtp_remat_from_recipe(delay_wgrad_compute=True)
+
+        monkeypatch.delenv("GTP_HYBRIDEP_DENSE_AG_SERIALIZE")
+        gtp_module.configure_gtp_remat_from_recipe(delay_wgrad_compute=False)
+        assert fused_a2a._hybrid_ep_pre_launch_hook is None
+        assert gtp_module._hybrid_ep_dense_ag_policy == "0"
+        assert gtp_module.GTP_CONFIG.dense_ag_high_priority is False
+
+        monkeypatch.setenv("GTP_HYBRIDEP_DENSE_AG_HIGH_PRIORITY", "invalid")
+        with pytest.raises(ValueError, match="must be '0' or '1'"):
+            gtp_module.configure_gtp_remat_from_recipe(delay_wgrad_compute=True)
+    finally:
+        gtp_module.update_gtp_config(
+            delay_wgrad_compute=previous_delay_wgrad,
+            dense_ag_high_priority=previous_dense_ag_high_priority,
+        )
+        gtp_module._hybrid_ep_dense_ag_policy = previous_policy
+        fused_a2a.set_hybrid_ep_pre_launch_hook(previous_hook)
 
 
 # ---------------------------------------------------------------------------
@@ -415,178 +653,6 @@ class TestGTPPrefetchChain:
         _run_distributed(_worker_chain_async_prefetch, 4)
 
 
-class TestGroupedExpertChainClassification:
-    """Routed grouped experts get their own per-role homogeneous prefetch chains
-    (one-block-ahead), while sharing a single IB stream. Pure classification logic,
-    no GPU/distributed needed."""
-
-    FC1 = "decoder.layers.3.mlp.experts.linear_fc1.weight0"
-    FC2 = "decoder.layers.3.mlp.experts.linear_fc2.weight0"
-    SHARED = "decoder.layers.3.mlp.shared_experts.linear_fc1.weight"
-    MIXER = "decoder.layers.3.mixer.in_proj.weight"
-
-    def teardown_method(self, method):
-        # Restore the module default so other tests see a clean CG config.
-        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
-
-    def test_ungraphed_moe_splits_fc1_fc2_into_own_chains(self):
-        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
-        c1 = gtp_module._classify_param_chain(self.FC1)
-        c2 = gtp_module._classify_param_chain(self.FC2)
-        assert c1 == "GTP_remat_grouped_fc1_ungraphed", c1
-        assert c2 == "GTP_remat_grouped_fc2_ungraphed", c2
-        # Separate linked-list chains so next_w links consecutive MoE layers (one-block-ahead).
-        assert c1 != c2
-        # Removed from the general chain; other layer kinds are unaffected.
-        assert gtp_module._classify_param_chain(self.SHARED) == "GTP_ungraphed"
-        assert gtp_module._classify_param_chain(self.MIXER) == "GTP_ungraphed"
-
-    def test_fc1_fc2_share_one_ib_stream(self):
-        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
-        group = object()  # same EGTP group for both roles
-        c1 = gtp_module._classify_param_chain(self.FC1)
-        c2 = gtp_module._classify_param_chain(self.FC2)
-        # Distinct chains but ONE shared IB stream (serialize fc1 then fc2).
-        assert gtp_module._stream_key(c1, group) == gtp_module._stream_key(c2, group)
-        # Distinct from the general ungraphed chain's stream.
-        assert gtp_module._stream_key(c1, group) != gtp_module._stream_key("GTP_ungraphed", group)
-
-    def test_graphed_moe_keeps_grouped_in_plain_graphed_chain(self):
-        # When MoE is captured, grouped weights stay in the plain GRAPHED chain so the
-        # cross-graph drain wait_async_comms(GRAPHED) still targets them by exact chain id.
-        gtp_module.set_cuda_graph_modules({"moe"}, cuda_graph_impl="local")
-        assert gtp_module._classify_param_chain(self.FC1) == "GTP_graphed"
-        assert gtp_module._classify_param_chain(self.FC2) == "GTP_graphed"
-
-    def test_graphness_helpers(self):
-        # "ungraphed" is the eager suffix; everything else is captured.
-        assert not gtp_module._chain_is_graphed("GTP_remat_grouped_fc1_ungraphed")
-        assert not gtp_module._chain_is_graphed("GTP_ungraphed")
-        assert gtp_module._chain_is_graphed("GTP_graphed")
-
-
-class TestGroupedDoubleBuffer:
-    """One-block-ahead grouped chains must double-buffer: consecutive MoE layers get distinct
-    gather buffers (else prefetching layer N+1 clobbers layer N's in-use weight). Pure cache-key
-    logic, no GPU/distributed needed."""
-
-    class _Fake:
-        _unsharded_shape_padded = (128, 256)
-        expert_idx = 0
-
-        def __init__(self, chain_id):
-            self.chain_id = chain_id
-
-        _double_buffer_parity = gtp_module.GTPShardedParam._double_buffer_parity
-        _get_cache_key = gtp_module.GTPShardedParam._get_cache_key
-
-    def setup_method(self, method):
-        gtp_module.reset_gtp_state()
-
-    def teardown_method(self, method):
-        gtp_module.reset_gtp_state()
-
-    def _key(self, chain_id):
-        return self._Fake(chain_id)._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
-
-    def test_consecutive_layers_use_two_alternating_buffers(self):
-        keys = [self._key("GTP_remat_grouped_fc1_ungraphed") for _ in range(4)]
-        # Consecutive layers differ (no clobber); alternating layers share; exactly two buffers.
-        assert keys[0] != keys[1]
-        assert keys[1] != keys[2]
-        assert keys[0] == keys[2]
-        assert keys[1] == keys[3]
-        assert len(set(keys)) == 2
-
-    def test_fc1_fc2_never_share_a_buffer(self):
-        # Both can be in-flight at once on the shared IB stream; role folded into key keeps
-        # them distinct even when gathered shapes match (as in this fake).
-        assert self._key("GTP_remat_grouped_fc1_ungraphed") != self._key(
-            "GTP_remat_grouped_fc2_ungraphed"
-        )
-
-    def test_non_grouped_key_unchanged(self):
-        assert self._key("GTP_ungraphed") == ((128, 256), torch.bfloat16, 0, False)
-
-    def test_parity_cached_and_stable(self):
-        f = self._Fake("GTP_remat_grouped_fc1_ungraphed")
-        fwd = f._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
-        bwd = f._get_cache_key(torch.bfloat16, fwd=False, reduce_scatter=False)
-        rs = f._get_cache_key(torch.bfloat16, fwd=False, reduce_scatter=True)
-        # Same parity for all of this weight's buffers (distinct from neighbours, consistent here).
-        assert f._buf_parity == 0
-        assert fwd[-1] == 0 and bwd[-1] == 0 and rs[-1] == 0
-
-
-def _worker_same_key_neighbours_dont_share_a_buffer(rank, world_size, port):
-    """Two same-shaped weights adjacent in a plain (non-grouped) chain need two buffers.
-
-    This is the GTP_ungraphed chain under CUDA graphs: every layer weight is captured, leaving
-    only embedding + output_layer behind — same shape, same dtype, same cache key. One-step-ahead
-    prefetch keeps both live (w0's consume issues w1's gather), so one buffer means w1's gather
-    lands on the weight w0's GEMM is still reading.
-    """
-    torch.manual_seed(0)
-    in_f, out_f = 32, 64
-    dtype = torch.bfloat16
-    gtp_remat_group = dist.new_group(list(range(world_size)))
-
-    l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
-    l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
-    # Distinct values so a clobber shows up in the gathered data, not just in the address.
-    with torch.no_grad():
-        l0.weight.fill_(1.0)
-        l1.weight.fill_(-1.0)
-
-    inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
-    dist.broadcast(inp, src=0)
-
-    # First pass wires the chain; the second is the one that prefetches.
-    for _ in range(2):
-        l0(inp, is_first_microbatch=True)
-        l1(inp, is_first_microbatch=True)
-
-    w0, w1 = l0.weight, l1.weight
-    assert w0.next_w is w1 and w1.prev_w is w0, "w0 and w1 must be adjacent in one chain"
-    assert w0._gather_buffer_identity(dtype) == w1._gather_buffer_identity(
-        dtype
-    ), "nothing is being tested unless both weights want the same buffer"
-
-    cache = gtp_module.get_global_GTP_cache()
-    b0, b1 = cache.get(w0._ag_ticket_fwd), cache.get(w1._ag_ticket_fwd)
-    torch.cuda.synchronize()
-    assert b0.data_ptr() != b1.data_ptr(), (
-        "same-key chain neighbours share one gather buffer — w1's prefetch can clobber "
-        "the weight w0's GEMM is still reading"
-    )
-    assert (b0 == 1).all(), "w0's gathered weight was clobbered by w1's prefetch"
-    assert (b1 == -1).all(), "w1's buffer does not hold w1's weight"
-
-
-class TestSameKeyNeighbourTiebreak:
-    """A non-grouped chain buys a second buffer only where two adjacent weights would actually
-    share one — unlike the grouped chains above, which alternate unconditionally."""
-
-    _Fake = TestGroupedDoubleBuffer._Fake
-
-    def _key(self, parity=None):
-        f = self._Fake("GTP_ungraphed")
-        if parity is not None:
-            f._buf_parity = parity
-        return f._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
-
-    def test_parity_zero_keeps_the_shared_buffer(self):
-        # Unset and 0 must give the same key: only the second weight of a pair pays.
-        assert self._key(0) == self._key() == ((128, 256), torch.bfloat16, 0, False)
-
-    def test_parity_one_gets_its_own_buffer(self):
-        assert self._key(1) != self._key()
-
-    def test_adjacent_same_shape_weights_get_distinct_buffers(self):
-        _requires_multi_gpu(4)
-        _run_distributed(_worker_same_key_neighbours_dont_share_a_buffer, 4)
-
-
 # ---------------------------------------------------------------------------
 # Wgrad reduce-scatter: shape and deferred async path
 # ---------------------------------------------------------------------------
@@ -637,6 +703,101 @@ def _worker_multilayer_deferred_rs(rank, world_size, port):
         assert w.main_grad is not None, f"No main_grad on {lyr.__class__.__name__}.weight"
 
 
+def _worker_delay_wgrad_order_independent_rs(rank, world_size, port):
+    """Delayed and ordinary wgrads may repeat/reorder while RS records remain queued."""
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    ranks = list(range(world_size))
+    gtp_remat_group = dist.new_group(ranks)
+    gtp_remat_rs_group = dist.new_group(ranks)
+
+    layers = [
+        te.Linear(
+            in_f, out_f, bias=False, params_dtype=dtype, device="cuda", delay_wgrad_compute=True
+        )
+        for _ in range(2)
+    ]
+    ordinary_layer = te.Linear(
+        in_f, out_f, bias=False, params_dtype=dtype, device="cuda", delay_wgrad_compute=False
+    )
+    all_layers = [*layers, ordinary_layer]
+    for layer in all_layers:
+        wrap_module_params_gtp(layer, ["weight"], gtp_remat_group)
+        layer.weight.rs_group = gtp_remat_rs_group
+        layer.weight.main_grad = torch.zeros_like(layer.weight)
+
+    previous_delay_wgrad = gtp_module.GTP_CONFIG.delay_wgrad_compute
+    gtp_module.update_gtp_config(delay_wgrad_compute=True)
+    cache = gtp_module.get_global_GTP_cache()
+    initial_rs_tickets = {ticket for ticket, slot in cache._slots.items() if slot.reduce_scatter}
+    try:
+        # Two microbatches make l0 repeat while its first immutable RS record can still be queued.
+        for _ in range(2):
+            inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
+            dist.broadcast(inp, src=0)
+            # The ordinary layer finalizes inside autograd, before the two explicit delayed
+            # backward_dw calls. This reproduces the mixed embedding/dense chain ordering that
+            # failed in the full HybridEP smoke.
+            (layers[0](inp) + layers[1](inp) + ordinary_layer(inp)).sum().backward()
+            # Explicit forward order intentionally differs from the reverse autograd chain.
+            layers[0].backward_dw()
+            layers[1].backward_dw()
+        gtp_module.finalize_deferred_gtp_rs()
+
+        for layer in all_layers:
+            assert torch.count_nonzero(layer.weight.main_grad) > 0
+        remaining_rs_tickets = {
+            ticket for ticket, slot in cache._slots.items() if slot.reduce_scatter
+        }
+        assert remaining_rs_tickets == initial_rs_tickets
+    finally:
+        gtp_module.finalize_deferred_gtp_rs()
+        gtp_module.update_gtp_config(delay_wgrad_compute=previous_delay_wgrad)
+
+
+def _worker_delayed_graphed_wgrad_preserves_source_lifetime(rank, world_size, port):
+    """Delayed GRAPHED wgrad scratch must never enter the eager reuse pool."""
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    ranks = list(range(world_size))
+    gtp_remat_group = dist.new_group(ranks)
+    gtp_remat_rs_group = dist.new_group(ranks)
+
+    layer = te.Linear(
+        in_f, out_f, bias=False, params_dtype=dtype, device="cuda", delay_wgrad_compute=True
+    )
+    wrap_module_params_gtp(layer, ["weight"], gtp_remat_group)
+    layer.weight.rs_group = gtp_remat_rs_group
+    layer.weight.chain_id = gtp_module.GTPChain.GRAPHED.value
+    layer.weight.main_grad = torch.zeros_like(layer.weight)
+
+    pool_puts = []
+    original_pool_put = gtp_module._wgrad_pool_put
+
+    def track_pool_put(buf, reuse_event=None):
+        pool_puts.append(buf)
+        return original_pool_put(buf, reuse_event=reuse_event)
+
+    previous_delay_wgrad = gtp_module.GTP_CONFIG.delay_wgrad_compute
+    gtp_module._wgrad_pool_put = track_pool_put
+    gtp_module.update_gtp_config(delay_wgrad_compute=True)
+    try:
+        inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
+        dist.broadcast(inp, src=0)
+        layer(inp).sum().backward()
+        layer.backward_dw()
+        gtp_module.finalize_deferred_gtp_rs()
+
+        assert torch.count_nonzero(layer.weight.main_grad) > 0
+        assert not pool_puts, "GRAPHED wgrad buffers were returned to the eager reuse pool"
+    finally:
+        gtp_module.finalize_deferred_gtp_rs()
+        gtp_module.update_gtp_config(delay_wgrad_compute=previous_delay_wgrad)
+        gtp_module._wgrad_pool_put = original_pool_put
+
+
 class TestGTPWgradRS:
     def test_wgrad_shape_matches_shard(self):
         _requires_multi_gpu(4)
@@ -645,6 +806,14 @@ class TestGTPWgradRS:
     def test_multilayer_deferred_rs(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_multilayer_deferred_rs, 4)
+
+    def test_delay_wgrad_uses_order_independent_rs_records(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_delay_wgrad_order_independent_rs, 4)
+
+    def test_delayed_graphed_wgrad_preserves_source_lifetime(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_delayed_graphed_wgrad_preserves_source_lifetime, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -1213,18 +1382,15 @@ class TestGTPDDPBucketAlignment:
 # ---------------------------------------------------------------------------
 
 
-def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
+def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port, delay_wgrad_compute=False):
     """GTP params must drive DDP grad-ready from GTP's manual hook, not autograd.
 
     GTP defers the main_grad accumulation to a later backward node, so autograd's AccumulateGrad can
     fire register_grad_ready before the grad lands and dispatch the bucket reduce-scatter on stale
     grad_data (corrupts reduce_scatter_with_fp32_accumulation). The fix routes grad-ready through
-    register_grad_accum_hook (fired after the add) and skips the autograd hook. This pins that
-    wiring: every GTP weight has _grad_accum_hook set and none falls through to the autograd list.
-
-    It also checks that the AccumulateGrad node is materialized and stored on the param. Holding
-    that reference is what keeps the leaf on the capture stream for full-iteration CUDA-graph
-    capture.
+    register_grad_accum_hook (fired after the add) and skips the autograd hook. DDP must still
+    retain each parameter's AccumulateGrad node so its lifetime and stream identity are stable
+    across full-iteration CUDA-graph warmup/capture.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -1241,19 +1407,30 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
         class _TwoLayerModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                # bias=False -> all params are GTP_remat weights, so grad_accs must end up empty.
-                self.fc0 = te.Linear(64, 128, bias=False, device="cuda")
-                self.fc1 = te.Linear(64, 128, bias=False, device="cuda")
+                # bias=False -> all params are GTP_remat weights.
+                self.fc0 = te.Linear(
+                    64, 128, bias=False, device="cuda", delay_wgrad_compute=delay_wgrad_compute
+                )
+                self.fc1 = te.Linear(
+                    64, 128, bias=False, device="cuda", delay_wgrad_compute=delay_wgrad_compute
+                )
 
         model = _TwoLayerModel()
         wrap_module_params_gtp(model.fc0, ["weight"], gtp_remat_group)
         wrap_module_params_gtp(model.fc1, ["weight"], gtp_remat_group)
+        if delay_wgrad_compute:
+            # Native-FP8 GTP reclasses TE's original parameter, so this marker survives wrapping.
+            # Keep it here for BF16 too to pin GTP's precedence over TE's module-level hook.
+            model.fc0.weight.skip_backward_post_hook = True
+            model.fc1.weight.skip_backward_post_hook = True
 
         config = TransformerConfig(
             num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
         )
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True, overlap_grad_reduce=True
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=True,
+            delay_wgrad_compute=delay_wgrad_compute,
         )
         ddp_model = DistributedDataParallel(config, ddp_config, model)
 
@@ -1263,17 +1440,12 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
             assert (
                 getattr(w, "_grad_accum_hook", None) is not None
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
-            # The node must also be RETAINED: a live strong reference across the
-            # warmup->capture boundary is what keeps the leaf on the capture stream.
-            # Identity (not just non-None): a dropped node would be recreated by expand_as here.
-            assert (
-                getattr(w, "_grad_accum_node", None) is w.expand_as(w).grad_fn.next_functions[0][0]
-            ), f"{name}.weight must retain its AccumulateGrad node (full-iteration CG capture)"
 
-        # bias=False -> all params are GTP_remat -> none took the autograd path.
-        assert len(ddp_model.grad_accs) == 0, (
-            "GTP params must not register an autograd AccumulateGrad hook "
-            f"(grad_accs has {len(ddp_model.grad_accs)} entries)"
+        # Retaining an AccumulateGrad node does not register DDP's hook on it: GTP stores and
+        # invokes the hook manually after its reduce-scatter/main_grad add.
+        assert len(ddp_model.grad_accs) == 2, (
+            "DDP must retain one AccumulateGrad node per GTP param for CUDA-graph stability "
+            f"(expected 2, got {len(ddp_model.grad_accs)})"
         )
     finally:
         ps.destroy_model_parallel()
@@ -1281,7 +1453,13 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
 
 
 class TestGTPDDPGradReadyWiring:
-    def test_gtp_params_use_manual_grad_ready_hook(self):
+    @pytest.mark.parametrize("delay_wgrad_compute", [False, True])
+    def test_gtp_params_use_manual_grad_ready_hook(self, delay_wgrad_compute):
         """GTP params route DDP grad-ready through register_grad_accum_hook, not autograd."""
         _requires_multi_gpu(4)
-        _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)
+        _run_distributed(
+            functools.partial(
+                _worker_gtp_ddp_grad_ready_wiring, delay_wgrad_compute=delay_wgrad_compute
+            ),
+            4,
+        )

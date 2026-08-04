@@ -46,6 +46,8 @@ class ProcessGroupCollection:
         tp_ep_pp: Tensor, expert, and pipeline parallel group
         tp_ep_pp_with_egtp_remat: tp_ep_pp merged across EGTP peers (dense ``mp`` analog);
             identical to ``tp_ep_pp`` when EGTP_remat_size=1
+        gtp_remat_rs: Dedicated communicator for delayed dense GTP gradient reduce-scatter
+        expt_gtp_remat_rs: Dedicated communicator for delayed expert GTP gradient reduce-scatter
 
         # Data Parallelism Groups
         dp: Data parallel process group
@@ -137,8 +139,14 @@ class ProcessGroupCollection:
     # _GTP_WEIGHT_REMAT_GROUP
     gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
+    # _GTP_WEIGHT_REMAT_RS_GROUP
+    gtp_remat_rs: torch.distributed.ProcessGroup = field(init=False)
+
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP
+    expt_gtp_remat_rs: torch.distributed.ProcessGroup = field(init=False)
 
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
@@ -305,8 +313,14 @@ class ProcessGroupCollection:
             'gtp_remat': partial(
                 parallel_state.get_gtp_weight_remat_group, check_initialized=False
             ),
+            'gtp_remat_rs': partial(
+                parallel_state.get_gtp_weight_remat_rs_group, check_initialized=False
+            ),
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
+            ),
+            'expt_gtp_remat_rs': partial(
+                parallel_state.get_expert_gtp_weight_remat_rs_group, check_initialized=False
             ),
         }
 
@@ -612,6 +626,8 @@ class ProcessGroupCollection:
                     if ddp_config.use_distributed_optimizer
                     else None
                 ),
+                'dp_cp_ag_group': None,
+                'expt_dp_ag_group': None,
             }
         else:
             # Use provided process group collection with validation and fallbacks
@@ -685,6 +701,8 @@ class ProcessGroupCollection:
             # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
             result['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
             result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
+            result['dp_cp_ag_group'] = getattr(pg_collection, 'dp_cp_ag', None)
+            result['expt_dp_ag_group'] = getattr(pg_collection, 'expt_dp_ag', None)
 
             return result
 
