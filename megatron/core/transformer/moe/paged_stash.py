@@ -995,7 +995,24 @@ class PagedStashRunner:
 
         # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
         # -> megatron.core (still loading).
+        from megatron.core.transformer.cuda_graphs import _graphable_leaves
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+        def _moe_mlps_in(layer):
+            # Discover MoE mlps, descending into HybridStack (whose inner Mamba/attn/MoE
+            # leaves are not reachable via decoder.layers[].mlp -- that is None for a
+            # HybridStack). _graphable_leaves yields the layer itself for plain layers and
+            # the inner leaves for a HybridStack; MTP wrappers are unwrapped.
+            if isinstance(layer, MultiTokenPredictionLayer):
+                layer = layer.mtp_model_layer
+            for leaf in _graphable_leaves(layer):
+                mlp = getattr(leaf, "mlp", None)
+                if (
+                    mlp is not None
+                    and hasattr(mlp, 'token_dispatcher')
+                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
+                ):
+                    yield mlp
 
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
@@ -1003,30 +1020,10 @@ class PagedStashRunner:
             )
             _track_cfg(model_with_decoder.config)
             for layer in model_with_decoder.decoder.layers:
-                transformer_layer = (
-                    layer.mtp_model_layer if isinstance(layer, MultiTokenPredictionLayer) else layer
-                )
-                mlp = getattr(transformer_layer, "mlp", None)
-                if (
-                    mlp is not None
-                    and hasattr(mlp, 'token_dispatcher')
-                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
-                ):
-                    self.moe_layers.append(mlp)
+                self.moe_layers.extend(_moe_mlps_in(layer))
             if model_with_decoder.mtp_process:
                 for layer in model_with_decoder.mtp.layers:
-                    transformer_layer = (
-                        layer.mtp_model_layer
-                        if isinstance(layer, MultiTokenPredictionLayer)
-                        else layer
-                    )
-                    mlp = getattr(transformer_layer, "mlp", None)
-                    if (
-                        mlp is not None
-                        and hasattr(mlp, 'token_dispatcher')
-                        and hasattr(mlp.token_dispatcher, 'check_over_budget')
-                    ):
-                        self.moe_layers.append(mlp)
+                    self.moe_layers.extend(_moe_mlps_in(layer))
 
     def _set_moe_paged_stash_all(self, value: bool) -> None:
         """Set moe_paged_stash on every tracked config (train + per VP chunk root)."""

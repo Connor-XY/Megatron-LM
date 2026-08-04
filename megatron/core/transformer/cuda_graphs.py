@@ -1927,6 +1927,26 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _graphable_leaves(module):
+    """Yield graphable leaf layers, descending into grouped HybridStack modules.
+
+    The hybrid EP-overlap pattern wraps inner Mamba/Transformer layers inside
+    ``HybridStack`` (a ``MegatronModule``, not a ``GraphableMegatronModule``), so
+    iterating ``decoder.layers`` directly finds zero graphable layers. Descend
+    into the stack to reach the inner graphable layers.
+    """
+    try:
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+    except ImportError:
+        # Hybrid models are optional; with no HybridStack there is nothing to descend into.
+        HybridStack = ()
+    if isinstance(module, HybridStack):
+        for inner in module.layers:
+            yield from _graphable_leaves(inner)
+    else:
+        yield module
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
