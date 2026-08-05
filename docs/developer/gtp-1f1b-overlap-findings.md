@@ -150,3 +150,11 @@ means the cross-micro-batch mechanism cannot engage, so parity is the structural
 At `GBS=256` the mechanism engages and 1F1B is faster by 0.699%, p about 0.029 over thirteen
 accepted runs. Three of the last six allocations failed outright, so the sample is smaller than
 intended and independent confirmation would strengthen it.
+
+## Related: Illegal Memory Access in the GTP Deferred Reduce-Scatter
+
+Runs combining `--delay-wgrad-compute` with `--overlap-grad-reduce` can abort with
+`cudaErrorIllegalAddress` once the MoE paged stash is tight enough to force allocator reuse. The
+cause, the evidence and a proposed one-line fix are written up separately in
+[gtp-deferred-rs-ima-fix.md](gtp-deferred-rs-ima-fix.md), since that document is a bug report for
+the GTP owner rather than a throughput finding.
