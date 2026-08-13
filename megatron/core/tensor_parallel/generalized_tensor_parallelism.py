@@ -1486,6 +1486,9 @@ class GTPShardedParam(torch.nn.Parameter):
         if rs_stream is None:
             rs_stream = get_rs_stream(self.chain_id, self.group)
             self._cached_rs_stream = rs_stream
+        caller_stream = torch.cuda.current_stream()
+        finalized_weights = None
+        grads_ready_event = None
         with torch.cuda.stream(rs_stream):
             if self._wgrad_rs_handle is not None:
                 self._wgrad_rs_handle.wait()
@@ -1497,13 +1500,28 @@ class GTPShardedParam(torch.nn.Parameter):
                         wgrad_rs = cache.get(w._rs_ticket)
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
-                    # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
-                    # grad-ready can't dispatch the RS before a sibling's add). With autograd
-                    # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
-                    # is the only grad-ready for a weight finalized here; else the bucket orphans.
-                    for w in self._weights:
-                        self._handle_megatron_grad_accum(w)
+                    # The adds above run on rs_stream, so fence before grad-ready is fired
+                    # from the caller stream below.
+                    grads_ready_event = torch.cuda.Event()
+                    grads_ready_event.record(rs_stream)
+                    finalized_weights = list(self._weights)
                     self._already_finalized = True
+        if finalized_weights is not None:
+            caller_stream.wait_event(grads_ready_event)
+            # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
+            # grad-ready can't dispatch the RS before a sibling's add). With autograd
+            # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
+            # is the only grad-ready for a weight finalized here; else the bucket orphans.
+            #
+            # Fire on the CALLER stream, not rs_stream. Under --overlap-grad-reduce this hook
+            # runs DDP start_grad_sync -> reduce_scatter_with_fp32_accumulation, which allocates
+            # through torch.empty_like. Inside the rs_stream context that allocation is
+            # stream-associated to rs_stream while its real consumers run on the caller stream,
+            # and since that path makes no record_stream() call the caching allocator may recycle
+            # the block while it is still in use -- an illegal memory access, observed once the
+            # paged stash is tight enough to force reuse.
+            for w in finalized_weights:
+                self._handle_megatron_grad_accum(w)
         # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
         # GRAPHED just drops Python refs (addresses must stay stable for CG).
         if getattr(self, "_wgrad_input_bufs", None) is not None:
