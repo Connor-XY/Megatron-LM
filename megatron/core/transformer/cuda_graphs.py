@@ -2036,11 +2036,17 @@ class TECudaGraphHelper:
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    mtp_model_layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                    # For hybrid models mtp_model_layer is a HybridStack, which is a
+                    # MegatronModule rather than a GraphableMegatronModule, so testing it
+                    # directly finds nothing and the MTP layers are silently left ungraphed.
+                    # Descend to the inner graphable leaves, as the decoder path does for
+                    # ungrouped hybrid patterns.
+                    for layer in _graphable_leaves(mtp_model_layer):
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(True)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -2161,8 +2167,21 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+
+            # Compare against graphable leaves, not just the top-level layers: for hybrid
+            # models a decoder entry or an mtp_model_layer may be a HybridStack whose inner
+            # layers are what actually get captured.
+            def _chunk_tops(chunk):
+                yield from chunk.decoder.layers
+                mtp = getattr(chunk, 'mtp', None)
+                if mtp is not None:
+                    for mtp_layer in mtp.layers:
+                        yield mtp_layer.mtp_model_layer
+
+            assert any(
+                layer is leaf
+                for top in _chunk_tops(chunk_of_the_layer)
+                for leaf in _graphable_leaves(top)
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
@@ -2812,14 +2831,20 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
+        # Set on graphable leaves: _te_cuda_graph_replay reads current_microbatch off the
+        # module it replays, which for hybrid models is an inner layer of a HybridStack
+        # rather than the stack itself. _graphable_leaves yields the module unchanged for
+        # plain layers, so non-hybrid models see no behaviour change.
         for layer in model_with_decoder.decoder.layers:
-            layer.current_microbatch = microbatch_id
+            for leaf in _graphable_leaves(layer):
+                leaf.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
+                for leaf in _graphable_leaves(layer.mtp_model_layer):
+                    leaf.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,
