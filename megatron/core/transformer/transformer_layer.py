@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -299,6 +300,37 @@ class BaseTransformerLayer(ABC):
         pass
 
 
+def _skip_attn_only_cuda_graph(config, submodules_config) -> bool:
+    """Whether an attention-only layer should skip owning a local CUDA graph.
+
+    Applies to hybrid patterns, where attention and the MoE live in separate layer
+    objects. Returns True only when all of the following hold, so GPT models and
+    attention-only cuda_graph_modules configurations are unaffected:
+
+    * ``MCORE_HYBRID_SKIP_ATTN_CG=1`` is set (opt-in; unset means preserve today's
+      behaviour),
+    * the layer has no MLP of its own -- i.e. it is one half of a hybrid pattern's
+      attention/MoE pair rather than a complete GPT-style layer, and
+    * the MoE layers are running partial capture (``moe_router``/``moe_preprocess``),
+      which is the case where GPT leaves attention eager.
+
+    Args:
+        config: the ``TransformerConfig`` for this layer.
+        submodules_config: the layer's ``TransformerLayerSubmodules``.
+
+    Returns:
+        True if this layer should not create a ``CudaGraphManager``.
+    """
+    if os.getenv("MCORE_HYBRID_SKIP_ATTN_CG", "0") != "1":
+        return False
+    if submodules_config.mlp != IdentityOp:
+        return False
+    return (
+        CudaGraphModule.moe_router in config.cuda_graph_modules
+        or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
+    )
+
+
 class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
@@ -543,7 +575,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             CudaGraphModule.attn in self.config.cuda_graph_modules
             and self.submodules_config.self_attention != IdentityOp
         ):
-            self.cudagraph_manager = CudaGraphManager(config)
+            # Hybrid patterns put attention and the MoE in separate layer objects, so an
+            # attention-only layer takes a graph of its own. A GPT layer holds both in one
+            # MoETransformerLayer, whose create_mcore_cudagraph_manager override does not
+            # chain to this one: under moe_router/moe_preprocess it captures only router and
+            # postprocess and leaves attention eager. Hybrid therefore captures one graph
+            # more than GPT for the same cuda_graph_modules, and pays an extra graph
+            # boundary -- the elementwise ops between attention and the router are stranded
+            # between two graphs instead of trailing a single eager region.
+            #
+            # Opt in to matching GPT's structure by skipping this graph. Off by default: it
+            # trades attention's launch-overhead saving against the boundary cost, and which
+            # side wins has not been measured. See _skip_attn_only_cuda_graph.
+            if not _skip_attn_only_cuda_graph(self.config, self.submodules_config):
+                self.cudagraph_manager = CudaGraphManager(config)
         elif (
             CudaGraphModule.mlp in self.config.cuda_graph_modules
             and self.submodules_config.mlp != IdentityOp
