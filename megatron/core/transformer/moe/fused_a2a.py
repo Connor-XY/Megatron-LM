@@ -281,6 +281,58 @@ _hybrid_ep_buffer = None
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
+def _zero_hybridep_padding(hidden, probs, padded_tokens_per_expert, handle, pad_multiple=None):
+    '''
+    Zero HybridEP's unused expert-padding rows without a host synchronization.
+
+    HybridEP pads each expert's token segment to an alignment multiple and leaves the
+    padding rows uninitialized. Downstream consumers (the cuDNN CuteDSL grouped-GEMM
+    kernels) only receive the padded per-expert offsets and read the full padded extent:
+    the fused wgrad kernel reduces dW over the padded token dimension, and the MXFP8
+    column-block scale mixes boundary-block padding into scales that multiply valid
+    tokens. Uninitialized padding therefore perturbs valid gradients run-dependently and
+    breaks bitwise determinism. Zeroing the padding rows at this producer boundary makes
+    those reads well-defined at no measurable cost.
+
+    Args:
+        hidden (torch.Tensor): Dispatched hidden states in padded permuted layout.
+        probs (Optional[torch.Tensor]): Dispatched probs in the same layout, if any.
+        padded_tokens_per_expert (Optional[torch.Tensor]): Aligned per-expert counts as
+            returned by ``dispatch_with_permute``; derived from ``pad_multiple`` when None.
+        handle (tuple): HybridEP dispatch handle; index 7 holds the unpadded counts.
+        pad_multiple (Optional[int]): Per-expert alignment used by the dispatch.
+    '''
+    actual_tokens_per_expert = handle[7].to(device=hidden.device, dtype=torch.int64)
+    if padded_tokens_per_expert is None:
+        if pad_multiple is None or pad_multiple <= 0:
+            padded_tokens_per_expert = actual_tokens_per_expert
+        else:
+            padded_tokens_per_expert = (
+                torch.div(
+                    actual_tokens_per_expert + pad_multiple - 1, pad_multiple, rounding_mode="floor"
+                )
+                * pad_multiple
+            )
+    else:
+        padded_tokens_per_expert = padded_tokens_per_expert.to(
+            device=hidden.device, dtype=torch.int64
+        )
+    padded_offsets = torch.cumsum(padded_tokens_per_expert, dim=0)
+    start_offsets = torch.cat((padded_offsets.new_zeros(1), padded_offsets[:-1]), dim=0)
+    rows = torch.arange(hidden.shape[0], device=hidden.device, dtype=torch.int64)
+    expert_ids = torch.bucketize(rows, padded_offsets, right=True)
+    in_expert_storage = expert_ids < padded_tokens_per_expert.numel()
+    safe_expert_ids = expert_ids.clamp_max(padded_tokens_per_expert.numel() - 1)
+    valid_rows = in_expert_storage & (
+        rows - start_offsets[safe_expert_ids] < actual_tokens_per_expert[safe_expert_ids]
+    )
+
+    hidden.masked_fill_(~valid_rows.unsqueeze(-1), 0)
+    if probs is not None:
+        probs_mask = valid_rows.reshape((hidden.shape[0],) + (1,) * (probs.ndim - 1))
+        probs.masked_fill_(~probs_mask, 0)
+
+
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
@@ -432,6 +484,7 @@ class HybridEPDispatch(torch.autograd.Function):
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
         )
+        _zero_hybridep_padding(dispatched_hidden, dispatched_probs, tokens_per_expert, handle)
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -503,13 +556,22 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
-        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
-            hidden=grad_x,
-            scaling_factor=None,
-            handle=handle,
+        dispatched_hidden, _, _, tokens_per_expert, returned_handle = (
+            _hybrid_ep_buffer.dispatch_with_permute(
+                hidden=grad_x,
+                scaling_factor=None,
+                handle=handle,
+                pad_multiple=ctx.pad_multiple,
+                num_permuted_tokens=ctx.num_permuted_tokens,
+                **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
+            )
+        )
+        _zero_hybridep_padding(
+            dispatched_hidden,
+            None,
+            tokens_per_expert,
+            returned_handle,
             pad_multiple=ctx.pad_multiple,
-            num_permuted_tokens=ctx.num_permuted_tokens,
-            **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
         return dispatched_hidden, None, None, None, None
 
