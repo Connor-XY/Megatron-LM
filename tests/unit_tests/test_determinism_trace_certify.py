@@ -16,6 +16,7 @@ def _write_trace(
     fp32_accumulation=True,
     hierarchical_fp32_accumulation=True,
     group_size=2,
+    device_hash=False,
     event_names=(),
 ):
     path = root / f"iter_{iteration:07d}" / f"rank_{rank:05d}{suffix}.jsonl"
@@ -68,7 +69,9 @@ def _write_trace(
             "rank": rank,
             "kind": "collective",
             "name": "data_parallel.grad_reduce.bucket_0.end",
-            "payload": {"outputs": [{"sha256": "abc"}]},
+            "payload": {
+                "outputs": [{"device_digest": "abc"} if device_hash else {"sha256": "abc"}]
+            },
         },
         {
             "schema_version": 1,
@@ -98,6 +101,60 @@ def _write_trace(
     return path
 
 
+def _write_summary_trace(root, *, rank=0, iteration=1, grad_norm=1.0):
+    path = root / f"iter_{iteration:07d}" / f"rank_{rank:05d}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "schema_version": 1,
+            "sequence": 0,
+            "iteration": iteration,
+            "rank": rank,
+            "kind": "runtime",
+            "name": "runtime",
+            "payload": {"deterministic_algorithms": True, "trace_detail": "summary"},
+        },
+        {
+            "schema_version": 1,
+            "sequence": 1,
+            "iteration": iteration,
+            "rank": rank,
+            "kind": "phase",
+            "name": "iteration.begin",
+            "payload": {},
+        },
+        {
+            "schema_version": 1,
+            "sequence": 2,
+            "iteration": iteration,
+            "rank": rank,
+            "kind": "phase",
+            "name": "forward_backward.end",
+            "payload": {"losses_reduced": [{"lm loss": 1.25}]},
+        },
+        {
+            "schema_version": 1,
+            "sequence": 3,
+            "iteration": iteration,
+            "rank": rank,
+            "kind": "optimizer",
+            "name": "optimizer.end",
+            "payload": {"grad_norm": grad_norm},
+        },
+        {
+            "schema_version": 1,
+            "sequence": 4,
+            "iteration": iteration,
+            "rank": rank,
+            "kind": "phase",
+            "name": "iteration.end",
+            "payload": {"pending_collectives": 0},
+        },
+    ]
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    return path
+
+
 def test_certifies_complete_bit_exact_trace(tmp_path):
     _write_trace(tmp_path)
 
@@ -114,6 +171,71 @@ def test_certifies_complete_bit_exact_trace(tmp_path):
     assert report["trace_files"] == 1
     assert report["recomputes"] == 1
     assert report["pending_collectives"] == 0
+
+
+def test_certifies_sampled_rank_set_with_device_digests(tmp_path):
+    _write_trace(tmp_path, rank=0, device_hash=True)
+    _write_trace(tmp_path, rank=3, device_hash=True)
+
+    report = certify_trace_path(tmp_path, expected_rank_spec="0,3", expected_iterations=1)
+
+    assert report["equal"]
+    assert report["ranks"] == [0, 3]
+    assert report["tensor_digest_counts"] == {"sha256": 0, "device_digest": 2}
+    assert report["diagnostic_only"]
+
+
+def test_accepts_complete_summary_trace_as_diagnostic_only(tmp_path):
+    _write_summary_trace(tmp_path, rank=0)
+    _write_summary_trace(tmp_path, rank=1)
+
+    report = certify_trace_path(tmp_path, expected_ranks=2, expected_iterations=1)
+
+    assert report["equal"]
+    assert report["trace_detail_counts"] == {"summary": 2}
+    assert report["forward_backward_ends"] == 2
+    assert report["optimizer_ends"] == 2
+    assert report["recomputes"] == 0
+    assert report["collectives"] == 0
+    assert report["diagnostic_only"]
+
+
+def test_rejects_incomplete_summary_trace(tmp_path):
+    path = _write_summary_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    events = [event for event in events if event["name"] != "optimizer.end"]
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    report = certify_trace_path(tmp_path)
+
+    assert not report["equal"]
+    assert "found 0 optimizer.end events for 1 files" in report["failures"]
+
+
+def test_rejects_truncated_trace(tmp_path):
+    path = _write_trace(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    events.insert(
+        -1,
+        {
+            "schema_version": 1,
+            "iteration": 1,
+            "rank": 0,
+            "kind": "runtime",
+            "name": "trace.truncated",
+            "payload": {"max_events": 5},
+        },
+    )
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    report = certify_trace_path(tmp_path)
+
+    assert not report["equal"]
+    assert report["trace_truncations"] == 1
 
 
 def test_reports_recompute_pending_and_reduction_failures(tmp_path):
@@ -189,6 +311,19 @@ def test_cli_does_not_call_one_trace_tree_a_determinism_certificate(tmp_path, ca
 
     assert main([str(tmp_path), "--expected-ranks", "1"]) == 0
     assert capsys.readouterr().out.startswith("TRACE INVARIANTS PASSED:")
+
+
+def test_cli_calls_sampled_device_digest_comparison_a_diagnostic_match(tmp_path, capsys):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_trace(left, rank=3, device_hash=True)
+    _write_trace(right, rank=3, device_hash=True)
+
+    assert (
+        main([str(left), str(right), "--expected-rank-spec", "3", "--expected-iterations", "1"])
+        == 0
+    )
+    assert capsys.readouterr().out.startswith("DIAGNOSTIC MATCH:")
 
 
 def test_rejects_duplicate_pair_that_hides_missing_rank_iteration_coverage(tmp_path):

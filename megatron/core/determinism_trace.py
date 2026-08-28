@@ -44,7 +44,7 @@ class EventKind(str, Enum):
 
 @dataclass(frozen=True)
 class TensorFingerprint:
-    """Stable metadata and an optional exact byte hash for one tensor."""
+    """Stable metadata and an optional tensor-content digest."""
 
     shape: list[int]
     dtype: str
@@ -53,6 +53,7 @@ class TensorFingerprint:
     numel: int
     requires_grad: bool
     sha256: str | None = None
+    device_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,72 @@ def _distributed_rank() -> int:
     return int(os.environ.get("RANK", 0))
 
 
+def _distributed_world_size() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def parse_rank_spec(rank_spec: str | None) -> set[int] | None:
+    """Parse ``all`` or a comma-separated rank/range selection.
+
+    ``None``, ``all``, and ``*`` select every rank. An explicit selection such
+    as ``0,3,8-15`` returns the corresponding set.
+    """
+    if rank_spec is None or rank_spec.strip().lower() in ("all", "*"):
+        return None
+    if not rank_spec.strip():
+        raise ValueError("rank specification must not be empty")
+
+    selected = set()
+    for token in rank_spec.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"invalid empty item in rank specification {rank_spec!r}")
+        if "-" not in token:
+            try:
+                rank = int(token)
+            except ValueError as error:
+                raise ValueError(f"invalid rank {token!r} in {rank_spec!r}") from error
+            if rank < 0:
+                raise ValueError(f"rank must be non-negative in {rank_spec!r}")
+            selected.add(rank)
+            continue
+
+        bounds = token.split("-")
+        if len(bounds) != 2:
+            raise ValueError(f"invalid rank range {token!r} in {rank_spec!r}")
+        try:
+            start, end = (int(bound) for bound in bounds)
+        except ValueError as error:
+            raise ValueError(f"invalid rank range {token!r} in {rank_spec!r}") from error
+        if start < 0 or end < start:
+            raise ValueError(f"invalid rank range {token!r} in {rank_spec!r}")
+        selected.update(range(start, end + 1))
+    return selected
+
+
+def rank_is_selected(
+    rank_spec: str | None, *, rank: int | None = None, world_size: int | None = None
+) -> bool:
+    """Return whether this rank is selected by ``rank_spec``.
+
+    Explicit ranks outside the current world size are rejected so a typo does
+    not silently produce incomplete diagnostic evidence.
+    """
+    selected = parse_rank_spec(rank_spec)
+    if selected is None:
+        return True
+    rank = _distributed_rank() if rank is None else rank
+    world_size = _distributed_world_size() if world_size is None else world_size
+    out_of_range = sorted(selected - set(range(world_size)))
+    if out_of_range:
+        raise ValueError(
+            f"trace rank specification selects ranks {out_of_range} outside world size {world_size}"
+        )
+    return rank in selected
+
+
 def _callable_name(function: Any) -> str:
     """Return a stable module-qualified name for a traced callable."""
     module = getattr(function, "__module__", None)
@@ -144,9 +211,14 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     return value.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
-def fingerprint_tensor(tensor: torch.Tensor, *, include_hash: bool) -> TensorFingerprint:
-    """Describe a tensor and optionally hash all of its bytes exactly."""
-    digest = hashlib.sha256(_tensor_bytes(tensor)).hexdigest() if include_hash else None
+def fingerprint_tensor(
+    tensor: torch.Tensor, *, include_hash: bool, device_hash: bool = False
+) -> TensorFingerprint:
+    """Describe a tensor and optionally digest all bytes on the host or device."""
+    if include_hash and device_hash:
+        raise ValueError("exact SHA-256 and device digest modes are mutually exclusive")
+    exact_digest = hashlib.sha256(_tensor_bytes(tensor)).hexdigest() if include_hash else None
+    compact_digest = tensor_signature(tensor)["digest"] if device_hash else None
     return TensorFingerprint(
         shape=list(tensor.shape),
         dtype=str(tensor.dtype),
@@ -154,8 +226,17 @@ def fingerprint_tensor(tensor: torch.Tensor, *, include_hash: bool) -> TensorFin
         layout=str(tensor.layout),
         numel=tensor.numel(),
         requires_grad=tensor.requires_grad,
-        sha256=digest,
+        sha256=exact_digest,
+        device_digest=compact_digest,
     )
+
+
+def _fingerprint_payload(fingerprint: TensorFingerprint) -> dict[str, Any]:
+    """Serialize a fingerprint without changing the existing exact-trace shape."""
+    payload = asdict(fingerprint)
+    if payload["device_digest"] is None:
+        del payload["device_digest"]
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -234,11 +315,37 @@ def _device_digest(x: torch.Tensor) -> str:
     return f"{h1:016x}{h2:016x}"
 
 
+# Raw buffers backing a quantized tensor subclass, in a fixed order so the
+# combined digest is comparable across processes. Quantized tensors (MXFP8,
+# NVFP4, Float8) refuse ``reshape`` across the inner dimension, so the flat byte
+# view used for ordinary tensors raises on them; their plain uint8 payload and
+# scale buffers carry the same bits and do reshape.
+_QUANTIZED_BUFFER_ATTRS = (
+    "_data",
+    "_rowwise_data",
+    "_columnwise_data",
+    "_scale_inv",
+    "_rowwise_scale_inv",
+    "_columnwise_scale_inv",
+)
+
+
+def _quantized_buffers(x: Any) -> list[tuple[str, torch.Tensor]]:
+    """Plain-tensor buffers backing a quantized tensor subclass, in a fixed order."""
+    buffers = []
+    for name in _QUANTIZED_BUFFER_ATTRS:
+        part = getattr(x, name, None)
+        if type(part) is torch.Tensor and part.numel():  # pylint: disable=unidiomatic-typecheck
+            buffers.append((name, part))
+    return buffers
+
+
 def tensor_signature(tensor: Any) -> dict[str, Any] | None:
     """Cross-process-stable fingerprint of a tensor as a JSON-ready dict.
 
     Returns ``None`` for non-tensors. The digest covers every raw byte of the
     tensor (complex tensors are viewed as interleaved real/imaginary floats).
+    Quantized tensor subclasses are digested through their underlying buffers.
     """
     if not isinstance(tensor, torch.Tensor):
         return None
@@ -247,40 +354,71 @@ def tensor_signature(tensor: Any) -> dict[str, Any] | None:
     numel = tensor.numel()
     if numel == 0:
         return {"shape": shape, "dtype": dtype, "numel": 0, "digest": _SIG_EMPTY_DIGEST}
-    x = tensor.detach()
-    if x.is_complex():
-        x = torch.view_as_real(x)
-    if x.layout != torch.strided:
-        x = x.to_dense()
-    x = x.contiguous()
-    return {"shape": shape, "dtype": dtype, "numel": numel, "digest": _device_digest(x)}
+    base = {"shape": shape, "dtype": dtype, "numel": numel}
+    # Digesting a tensor must never take down the run being traced. An MXFP8
+    # model would otherwise abort the moment the first quantized activation
+    # reached the op tracer.
+    try:
+        if type(tensor) is not torch.Tensor:  # pylint: disable=unidiomatic-typecheck
+            buffers = _quantized_buffers(tensor)
+            if buffers:
+                parts = [
+                    f"{name}:{_device_digest(part.detach().contiguous())}" for name, part in buffers
+                ]
+                digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+                return {**base, "digest": digest, "quantized": type(tensor).__name__}
+        x = tensor.detach()
+        if x.is_complex():
+            x = torch.view_as_real(x)
+        if x.layout != torch.strided:
+            x = x.to_dense()
+        x = x.contiguous()
+        return {**base, "digest": _device_digest(x)}
+    except Exception as exc:  # pylint: disable=broad-except
+        return {**base, "digest": _SIG_EMPTY_DIGEST, "digest_error": type(exc).__name__}
 
 
-def _tensor_tree(value: Any, *, include_hash: bool, path: str = "") -> list[dict[str, Any]]:
+def _tensor_tree(
+    value: Any, *, include_hash: bool, device_hash: bool = False, path: str = ""
+) -> list[dict[str, Any]]:
     fingerprints = []
     if isinstance(value, torch.Tensor):
         fingerprints.append(
             {
                 "path": path or "<root>",
-                **asdict(fingerprint_tensor(value, include_hash=include_hash)),
+                **_fingerprint_payload(
+                    fingerprint_tensor(value, include_hash=include_hash, device_hash=device_hash)
+                ),
             }
         )
     elif isinstance(value, Mapping):
         for key in sorted(value, key=str):
             child = f"{path}/{key}" if path else str(key)
-            fingerprints.extend(_tensor_tree(value[key], include_hash=include_hash, path=child))
+            fingerprints.extend(
+                _tensor_tree(
+                    value[key], include_hash=include_hash, device_hash=device_hash, path=child
+                )
+            )
     elif isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
             child = f"{path}/{index}" if path else str(index)
-            fingerprints.extend(_tensor_tree(item, include_hash=include_hash, path=child))
+            fingerprints.extend(
+                _tensor_tree(item, include_hash=include_hash, device_hash=device_hash, path=child)
+            )
     return fingerprints
 
 
 def _same_tensor_values(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
     """Compare fingerprinted values while ignoring expected autograd metadata changes."""
-    value_fields = ("path", "shape", "dtype", "device", "layout", "numel", "sha256")
-    return [tuple(item[field] for field in value_fields) for item in left] == [
-        tuple(item[field] for field in value_fields) for item in right
+    value_fields = ("path", "shape", "dtype", "device", "layout", "numel")
+    return [
+        tuple(item[field] for field in value_fields)
+        + (item.get("sha256"), item.get("device_digest"))
+        for item in left
+    ] == [
+        tuple(item[field] for field in value_fields)
+        + (item.get("sha256"), item.get("device_digest"))
+        for item in right
     ]
 
 
@@ -318,8 +456,18 @@ def _runtime_payload() -> dict[str, Any]:
         allocator_getter = getattr(torch.cuda.memory, "get_allocator_backend", None)
         payload["device_name"] = torch.cuda.get_device_name(device)
         payload["device_capability"] = list(torch.cuda.get_device_capability(device))
-        payload["cudnn_version"] = torch.backends.cudnn.version()
-        payload["allocator_backend"] = allocator_getter() if allocator_getter else None
+        # Probing the environment must never kill the run being observed.
+        # torch.backends.cudnn.version() initializes cuDNN, which raises outright when
+        # LD_LIBRARY_PATH carries a cuDNN older than the one torch was built against.
+        # Record why the value is missing rather than propagating the failure.
+        try:
+            payload["cudnn_version"] = torch.backends.cudnn.version()
+        except Exception as exc:  # pylint: disable=broad-except
+            payload["cudnn_version"] = f"unavailable: {type(exc).__name__}"
+        try:
+            payload["allocator_backend"] = allocator_getter() if allocator_getter else None
+        except Exception as exc:  # pylint: disable=broad-except
+            payload["allocator_backend"] = f"unavailable: {type(exc).__name__}"
     return payload
 
 
@@ -344,11 +492,27 @@ class DeterminismTrace:
         iteration: int,
         *,
         hash_tensors: bool = False,
+        device_hashes: bool = False,
+        summary_only: bool = False,
+        flush_interval: int = 1,
+        max_events: int | None = None,
         rank: int | None = None,
     ) -> None:
+        if hash_tensors and device_hashes:
+            raise ValueError("exact SHA-256 and device digest modes are mutually exclusive")
+        if summary_only and (hash_tensors or device_hashes):
+            raise ValueError("summary-only traces cannot include tensor-content digests")
+        if flush_interval <= 0:
+            raise ValueError("flush_interval must be greater than zero")
+        if max_events is not None and max_events <= 2:
+            raise ValueError("max_events must be greater than two")
         self.iteration = iteration
         self.rank = _distributed_rank() if rank is None else rank
         self.hash_tensors = hash_tensors
+        self.device_hashes = device_hashes
+        self.summary_only = summary_only
+        self.flush_interval = flush_interval
+        self.max_events = max_events
         self.path = Path(trace_dir) / f"iter_{iteration:07d}" / f"rank_{self.rank:05d}.jsonl"
         self._sequence = 0
         self._checkpoint_sequence = 0
@@ -356,6 +520,8 @@ class DeterminismTrace:
         self._token: Token | None = None
         self._previous_process_trace: DeterminismTrace | None = None
         self._pending_collectives = 0
+        self._events_since_flush = 0
+        self._truncated = False
         self._lock = threading.RLock()
 
     def __enter__(self) -> DeterminismTrace:
@@ -364,8 +530,12 @@ class DeterminismTrace:
         self._file = self.path.open("w", encoding="utf-8")
         self._token = _ACTIVE_TRACE.set(self)
         try:
-            self.record(EventKind.RUNTIME, "runtime", _runtime_payload())
+            runtime_payload = _runtime_payload()
+            runtime_payload["trace_detail"] = "summary" if self.summary_only else "semantic"
+            self.record(EventKind.RUNTIME, "runtime", runtime_payload)
             self.record(EventKind.PHASE, "iteration.begin")
+            self._file.flush()
+            self._events_since_flush = 0
         except Exception:
             _ACTIVE_TRACE.reset(self._token)
             self._token = None
@@ -381,13 +551,17 @@ class DeterminismTrace:
         with self._lock:
             try:
                 if exc_type is not None:
-                    self.record(
-                        EventKind.PHASE, "iteration.error", {"exception_type": exc_type.__name__}
+                    self._record_event(
+                        EventKind.PHASE,
+                        "iteration.error",
+                        {"exception_type": exc_type.__name__},
+                        terminal=True,
                     )
-                self.record(
+                self._record_event(
                     EventKind.PHASE,
                     "iteration.end",
                     {"pending_collectives": self._pending_collectives},
+                    terminal=True,
                 )
             finally:
                 if self._token is not None:
@@ -401,30 +575,66 @@ class DeterminismTrace:
                     self._file = None
 
     def record(self, kind: EventKind, name: str, payload: Mapping[str, Any] | None = None) -> None:
-        """Write one event and flush it so a failed job leaves a usable prefix."""
+        """Accept one event, writing it when enabled by the trace detail level."""
         if not self.record_if_open(kind, name, payload):
             raise RuntimeError("DeterminismTrace must be entered before recording events")
 
     def record_if_open(
         self, kind: EventKind, name: str, payload: Mapping[str, Any] | None = None
     ) -> bool:
-        """Write one event if the trace is open, returning whether it was recorded."""
+        """Accept one event if the trace is open, filtering summary-only detail."""
         with self._lock:
             if self._file is None:
                 return False
-            event = TraceEvent(
-                schema_version=TRACE_SCHEMA_VERSION,
-                sequence=self._sequence,
-                rank=self.rank,
-                iteration=self.iteration,
-                kind=kind.value,
-                name=name,
-                payload=_json_safe(dict(payload or {})),
-            )
-            self._sequence += 1
-            self._file.write(json.dumps(asdict(event), sort_keys=True, allow_nan=False) + "\n")
-            self._file.flush()
+            if not self.accepts(kind, name):
+                return True
+            if self._truncated:
+                return True
+            if self.max_events is not None and self._sequence >= self.max_events:
+                self._record_event(
+                    EventKind.RUNTIME,
+                    "trace.truncated",
+                    {"max_events": self.max_events},
+                    terminal=True,
+                )
+                self._truncated = True
+                return True
+            self._record_event(kind, name, payload)
             return True
+
+    def accepts(self, kind: EventKind, name: str) -> bool:
+        """Return whether the configured detail level records this event."""
+        if not self.summary_only:
+            return True
+        if kind in (EventKind.PHASE, EventKind.OPTIMIZER):
+            return True
+        return kind == EventKind.RUNTIME and name in ("runtime", "trace.truncated")
+
+    def _record_event(
+        self,
+        kind: EventKind,
+        name: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        """Write an event while the caller holds ``_lock``."""
+        assert self._file is not None
+        event = TraceEvent(
+            schema_version=TRACE_SCHEMA_VERSION,
+            sequence=self._sequence,
+            rank=self.rank,
+            iteration=self.iteration,
+            kind=kind.value,
+            name=name,
+            payload=_json_safe(dict(payload or {})),
+        )
+        self._sequence += 1
+        self._file.write(json.dumps(asdict(event), sort_keys=True, allow_nan=False) + "\n")
+        self._events_since_flush += 1
+        if terminal or self._events_since_flush >= self.flush_interval:
+            self._file.flush()
+            self._events_since_flush = 0
 
     def next_checkpoint_id(self) -> int:
         """Return a stable per-iteration checkpoint occurrence number."""
@@ -448,13 +658,29 @@ class DeterminismTrace:
 
 @contextmanager
 def trace_iteration(
-    trace_dir: str | Path | None, iteration: int, *, hash_tensors: bool = False
+    trace_dir: str | Path | None,
+    iteration: int,
+    *,
+    hash_tensors: bool = False,
+    device_hashes: bool = False,
+    summary_only: bool = False,
+    rank_spec: str | None = None,
+    flush_interval: int = 1,
+    max_events: int | None = None,
 ) -> Iterator[DeterminismTrace | None]:
     """Activate a rank-local trace, or yield ``None`` when tracing is disabled."""
-    if trace_dir is None:
+    if trace_dir is None or not rank_is_selected(rank_spec):
         yield None
         return
-    with DeterminismTrace(trace_dir, iteration, hash_tensors=hash_tensors) as trace:
+    with DeterminismTrace(
+        trace_dir,
+        iteration,
+        hash_tensors=hash_tensors,
+        device_hashes=device_hashes,
+        summary_only=summary_only,
+        flush_interval=flush_interval,
+        max_events=max_events,
+    ) as trace:
         yield trace
 
 
@@ -487,9 +713,9 @@ def use_determinism_trace(
 
 
 def trace_tensor_hashes_enabled() -> bool:
-    """Return whether the active trace requests exact tensor byte hashes."""
+    """Return whether the active trace requests a tensor-content digest."""
     trace = active_trace()
-    return trace is not None and trace.hash_tensors
+    return trace is not None and (trace.hash_tensors or trace.device_hashes)
 
 
 def record_event(kind: EventKind, name: str, payload: Mapping[str, Any] | None = None) -> None:
@@ -502,21 +728,28 @@ def record_event(kind: EventKind, name: str, payload: Mapping[str, Any] | None =
 def record_tensor(name: str, tensor: torch.Tensor, **payload: Any) -> None:
     """Record tensor metadata and, when enabled, its exact byte hash."""
     trace = active_trace()
-    if trace is None:
+    if trace is None or trace.summary_only:
         return
     with trace._lock:
         if trace.is_open:
             trace.record(
                 EventKind.TENSOR,
                 name,
-                {**payload, **asdict(fingerprint_tensor(tensor, include_hash=trace.hash_tensors))},
+                {
+                    **payload,
+                    **_fingerprint_payload(
+                        fingerprint_tensor(
+                            tensor, include_hash=trace.hash_tensors, device_hash=trace.device_hashes
+                        )
+                    ),
+                },
             )
 
 
 def record_optimizer_state(name: str, optimizer: Any) -> None:
     """Record exact local optimizer parameters and state using stable ordinals."""
     trace = active_trace()
-    if trace is None or not trace.hash_tensors:
+    if trace is None or trace.summary_only or not (trace.hash_tensors or trace.device_hashes):
         return
 
     optimizer_instances = getattr(optimizer, "chained_optimizers", None) or [optimizer]
@@ -556,7 +789,7 @@ def begin_collective_trace(
 ) -> CollectiveTraceHandle | None:
     """Record collective inputs without introducing communication."""
     trace = active_trace() if trace is None else trace
-    if trace is None:
+    if trace is None or trace.summary_only:
         return None
     event_metadata = dict(metadata or {})
     if group is not None:
@@ -576,7 +809,9 @@ def begin_collective_trace(
             {
                 "operation": operation,
                 **event_metadata,
-                "inputs": _tensor_tree(inputs, include_hash=trace.hash_tensors),
+                "inputs": _tensor_tree(
+                    inputs, include_hash=trace.hash_tensors, device_hash=trace.device_hashes
+                ),
             },
         )
         trace._pending_collectives += 1
@@ -600,7 +835,9 @@ def record_collective_result(handle: CollectiveTraceHandle | None, outputs: Any)
                 {
                     "operation": handle.operation,
                     **handle.metadata,
-                    "outputs": _tensor_tree(outputs, include_hash=trace.hash_tensors),
+                    "outputs": _tensor_tree(
+                        outputs, include_hash=trace.hash_tensors, device_hash=trace.device_hashes
+                    ),
                 },
             )
             assert trace._pending_collectives > 0
@@ -628,7 +865,7 @@ def trace_collective_work_group(
 def begin_recompute_trace(function: Any, inputs: Any) -> RecomputeTraceHandle | None:
     """Allocate the identity shared by a checkpoint forward and recomputation."""
     trace = active_trace()
-    if trace is None:
+    if trace is None or trace.summary_only:
         return None
     with trace._lock:
         if not trace.is_open:
@@ -638,7 +875,9 @@ def begin_recompute_trace(function: Any, inputs: Any) -> RecomputeTraceHandle | 
             trace=trace,
             checkpoint_id=checkpoint_id,
             callable_name=_callable_name(function),
-            input_fingerprints=_tensor_tree(inputs, include_hash=trace.hash_tensors),
+            input_fingerprints=_tensor_tree(
+                inputs, include_hash=trace.hash_tensors, device_hash=trace.device_hashes
+            ),
         )
 
 
@@ -650,7 +889,9 @@ def record_recompute_phase(handle: RecomputeTraceHandle | None, phase: str, outp
     with trace._lock:
         if not trace.is_open:
             return
-        fingerprints = _tensor_tree(outputs, include_hash=trace.hash_tensors)
+        fingerprints = _tensor_tree(
+            outputs, include_hash=trace.hash_tensors, device_hash=trace.device_hashes
+        )
         payload: dict[str, Any] = {
             "checkpoint_id": handle.checkpoint_id,
             "callable": handle.callable_name,
@@ -659,7 +900,9 @@ def record_recompute_phase(handle: RecomputeTraceHandle | None, phase: str, outp
         }
         if phase == "forward":
             handle.forward_fingerprints = fingerprints
-        elif trace.hash_tensors and handle.forward_fingerprints is not None:
+        elif (
+            trace.hash_tensors or trace.device_hashes
+        ) and handle.forward_fingerprints is not None:
             payload["matches_forward"] = _same_tensor_values(
                 fingerprints, handle.forward_fingerprints
             )

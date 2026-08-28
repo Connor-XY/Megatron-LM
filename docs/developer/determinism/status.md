@@ -118,8 +118,14 @@ threaded into `TransformerConfig`; library code reads that flag or
   For the distributed optimizer it also requires one optimizer instance,
   rejects collective AVG, and forces ordered fp32 reduce-scatter.
 - **Small floating-point statistics** (gradient norm, reported loss, and MoE
-  metrics) use rank-ordered all-gather plus a fixed local sum. `NCCL_ALGO=Ring`
-  selects an algorithm but does not pin the physical ring across allocations.
+  metrics) use rank-ordered all-gather plus a fixed local sum, so their result
+  does not depend on NCCL's reduction order. Measured on GB300 (NCCL 2.29.2, 16
+  ranks, `NCCL_ALGO=Ring`, NVLS disabled): two disjoint allocations of the same
+  shape built the same ring and returned bit-identical all-reduce and
+  reduce-scatter results for fp32 and bf16. The same probe changed every hash
+  when the rank-to-input assignment was permuted, so it does detect a change of
+  reduction order. Allocations of a differing shape, larger scales, and other
+  topologies are untested.
 
 Flash attention is permitted when Transformer Engine honors
 `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`; the bit-exact suite covers supported

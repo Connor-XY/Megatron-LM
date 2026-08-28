@@ -53,6 +53,19 @@ def test_recompute_events_align_by_checkpoint_identity(tmp_path):
     assert compare_trace_paths(left, right)["equal"]
 
 
+def test_op_events_align_by_explicit_identity(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    first = _event(0, "aten.add.Tensor", {"checkpoint_id": "aten:add:0", "digest": "a"})
+    first["kind"] = "op"
+    second = _event(1, "aten.add.Tensor", {"checkpoint_id": "aten:add:1", "digest": "b"})
+    second["kind"] = "op"
+    _write_trace(left, [first, second])
+    _write_trace(right, [second | {"sequence": 0}, first | {"sequence": 1}])
+
+    assert compare_trace_paths(left, right)["equal"]
+
+
 def test_reports_first_semantic_event_value_difference(tmp_path):
     left = tmp_path / "left"
     right = tmp_path / "right"
@@ -66,6 +79,15 @@ def test_reports_first_semantic_event_value_difference(tmp_path):
     divergence = report["divergences"][0]
     assert divergence["reason"] == "event_values"
     assert "name=optimizer.end" in divergence["event"]
+    assert report["first_divergence"] == divergence
+    assert report["divergent_ranks"] == [0]
+    assert report["divergent_iterations"] == [1]
+    assert report["recommended_followup"] == {
+        "rank_spec": "0",
+        "start_iteration": 1,
+        "end_iteration": 1,
+        "detail": "semantic_device_digests",
+    }
 
 
 def test_reports_differences_in_local_trace_sequence_order(tmp_path):

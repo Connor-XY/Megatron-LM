@@ -59,7 +59,7 @@ def _load_events(path: Path) -> dict[str, dict[str, Any]]:
             if missing:
                 raise ValueError(f"Missing keys in {path}:{line_number}: {', '.join(missing)}")
             semantic_identity = None
-            if event["kind"] == "recompute" and isinstance(event["payload"], Mapping):
+            if isinstance(event["payload"], Mapping):
                 semantic_identity = event["payload"].get("checkpoint_id")
             base = (
                 event["iteration"],
@@ -113,20 +113,50 @@ def compare_trace_paths(
         "events_compared": 0,
         "divergence_count": 0,
         "divergences": [],
+        "first_divergence": None,
+        "divergent_ranks": [],
+        "divergent_iterations": [],
+        "recommended_followup": None,
     }
+    divergent_ranks = set()
+    divergent_iterations = set()
 
-    def add_divergence(divergence: dict) -> None:
+    def add_divergence(
+        divergence: dict, *, rank: int | None = None, iteration: int | None = None
+    ) -> None:
         report["equal"] = False
         report["divergence_count"] += 1
+        if report["first_divergence"] is None:
+            report["first_divergence"] = divergence
         if len(report["divergences"]) < max_details:
             report["divergences"].append(divergence)
+        if rank is not None:
+            divergent_ranks.add(rank)
+        if iteration is not None:
+            divergent_iterations.add(iteration)
+
+    def file_identity(relative_path: str) -> tuple[int | None, int | None]:
+        match = re.search(r"iter_(\d+)/rank_(\d+)", relative_path)
+        if match is None:
+            return None, None
+        return int(match.group(2)), int(match.group(1))
 
     for relative_path in all_files:
         if relative_path not in left_files:
-            add_divergence({"file": relative_path, "reason": "file_missing_left"})
+            rank, iteration = file_identity(relative_path)
+            add_divergence(
+                {"file": relative_path, "reason": "file_missing_left"},
+                rank=rank,
+                iteration=iteration,
+            )
             continue
         if relative_path not in right_files:
-            add_divergence({"file": relative_path, "reason": "file_missing_right"})
+            rank, iteration = file_identity(relative_path)
+            add_divergence(
+                {"file": relative_path, "reason": "file_missing_right"},
+                rank=rank,
+                iteration=iteration,
+            )
             continue
         report["matched_files"] += 1
         left_events = _load_events(left_files[relative_path])
@@ -143,27 +173,34 @@ def compare_trace_paths(
         all_events = sorted(set(left_events) | set(right_events), key=event_order)
         for event_key in all_events:
             if event_key not in left_events:
+                event = right_events[event_key]["event"]
                 add_divergence(
                     {
                         "file": relative_path,
                         "event": event_key,
                         "reason": "event_missing_left",
                         "right_sequence": right_events[event_key]["sequence"],
-                    }
+                    },
+                    rank=event["rank"],
+                    iteration=event["iteration"],
                 )
                 continue
             if event_key not in right_events:
+                event = left_events[event_key]["event"]
                 add_divergence(
                     {
                         "file": relative_path,
                         "event": event_key,
                         "reason": "event_missing_right",
                         "left_sequence": left_events[event_key]["sequence"],
-                    }
+                    },
+                    rank=event["rank"],
+                    iteration=event["iteration"],
                 )
                 continue
             report["events_compared"] += 1
             if left_events[event_key]["event"] != right_events[event_key]["event"]:
+                event = left_events[event_key]["event"]
                 add_divergence(
                     {
                         "file": relative_path,
@@ -173,9 +210,36 @@ def compare_trace_paths(
                         "right_sequence": right_events[event_key]["sequence"],
                         "left_event": left_events[event_key]["event"],
                         "right_event": right_events[event_key]["event"],
-                    }
+                    },
+                    rank=event["rank"],
+                    iteration=event["iteration"],
                 )
+    report["divergent_ranks"] = sorted(divergent_ranks)
+    report["divergent_iterations"] = sorted(divergent_iterations)
+    if divergent_ranks and divergent_iterations:
+        first_iteration = min(divergent_iterations)
+        report["recommended_followup"] = {
+            "rank_spec": _format_rank_spec(divergent_ranks),
+            "start_iteration": max(1, first_iteration - 1),
+            "end_iteration": first_iteration,
+            "detail": "semantic_device_digests",
+        }
     return report
+
+
+def _format_rank_spec(ranks: set[int]) -> str:
+    """Format ranks as the tracer's compact comma/range syntax."""
+    ordered = sorted(ranks)
+    ranges = []
+    start = previous = ordered[0]
+    for rank in ordered[1:]:
+        if rank == previous + 1:
+            previous = rank
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = rank
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
 
 
 def _print_human_report(report: dict) -> None:

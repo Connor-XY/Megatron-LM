@@ -132,6 +132,17 @@ def switch_load_balancing_loss_func(
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
 
+    # The fused kernel reduces probs over the token dimension with an order-dependent
+    # reduction, so two runs of the same step can produce aux losses that differ in the
+    # last bits. That scalar is added to the loss, so the difference reaches the
+    # gradients and grows from there. The unfused path below reduces through torch,
+    # which is bit-reproducible once torch.use_deterministic_algorithms(True) is set, so
+    # prefer it whenever deterministic algorithms are requested. Permutation and
+    # unpermutation in this module already select their deterministic variants the same
+    # way.
+    if fused and torch.are_deterministic_algorithms_enabled():
+        fused = False
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")

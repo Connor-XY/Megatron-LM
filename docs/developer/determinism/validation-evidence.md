@@ -86,7 +86,14 @@ The comparator aligns events by semantic identity rather than pipeline arrival
 order and reports the first causal mismatch. The certifier checks trace
 coverage, recompute correspondence, completed collective balance, runtime
 configuration, and selected attention-backend visibility. It rejects incomplete
-or mixed trace trees rather than producing a partial success result.
+or mixed trace trees rather than producing a partial success result. Its
+streaming implementation keeps memory proportional to one file's active
+collective names rather than the total event count. Large-scale rank sampling,
+an all-rank summary tier, device-side 128-bit digests, buffered writes, and
+event caps are localization controls. Summary comparison identifies the first
+divergent iteration and affected ranks before heavier semantic or op-level
+capture is enabled. Only all-rank, untruncated, full-byte comparisons should be
+described as cryptographic trace certificates.
 
 ## Reduction and optimizer findings
 

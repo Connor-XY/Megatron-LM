@@ -174,9 +174,65 @@ checkpoint, and collective tensor metadata remain available without the byte
 copies, and optimizer boundary tensors are omitted. The additional
 `--determinism-trace-optimizer-state` flag records local main parameters and
 direct tensor/scalar optimizer state entries before and after the step, keyed by
-stable optimizer, parameter-group, and parameter ordinals. It requires exact
-tensor hashes and is deliberately separate because hashing Adam moments roughly
-triples the optimizer-state bytes copied to the CPU.
+stable optimizer, parameter-group, and parameter ordinals. It requires either
+exact or device-side tensor digests and is deliberately separate because exact
+hashing of Adam moments roughly triples the optimizer-state bytes copied to the
+CPU.
+
+For large-scale localization, start with the all-rank summary tier:
+
+```bash
+pretrain_gpt.py ... \
+  --determinism-trace-dir /path/to/run-a \
+  --determinism-trace-interval 1 \
+  --determinism-trace-summary-only \
+  --determinism-trace-flush-interval 8
+```
+
+This tier records runtime identity, iteration and forward/backward boundaries,
+reduced loss values, and optimizer scalars. It does not enter recompute,
+collective, tensor, Transformer Engine backend, or ATen-op tracing, and it does
+not compute tensor digests. Compare two summary trees to find the first
+divergent iteration and affected ranks. The comparison report includes a
+recommended iteration window and rank specification for the next tier.
+
+Rerun only that window and rank set with semantic device digests:
+
+```bash
+pretrain_gpt.py ... \
+  --determinism-trace-dir /path/to/run-a \
+  --determinism-trace-interval 100 \
+  --determinism-trace-device-hashes \
+  --determinism-trace-rank-spec 0,4,8-11 \
+  --determinism-trace-flush-interval 64 \
+  --determinism-trace-max-events-per-rank 100000
+```
+
+`--determinism-trace-device-hashes` computes a 128-bit diagnostic digest on the
+tensor's device instead of copying every tensor to the CPU for SHA-256. It is
+mutually exclusive with `--determinism-trace-tensor-hashes`.
+`--determinism-trace-rank-spec` accepts `all` or comma-separated ranks and
+ranges. Only selected ranks enter ATen dispatch tracing, so unsampled ranks pay
+neither its Python-dispatch cost nor its storage cost. A sampled, 128-bit trace
+is divergence-localization evidence; it is not an all-rank, cryptographic
+full-byte certificate.
+`--determinism-trace-summary-only` is mutually exclusive with tensor digests,
+optimizer tensor-state capture, and ATen-op tracing.
+
+If the semantic rerun still leaves the producer ambiguous, enable
+`--determinism-trace-ops` only on the smallest divergent rank/iteration window.
+The intended progression is therefore summary on every rank, semantic device
+digests on affected ranks, then bounded op-level tracing. Full-byte SHA-256 on
+every rank is reserved for the final certificate when its observer cost is
+acceptable.
+
+The flush interval trades crash-prefix durability for lower filesystem and
+host-synchronization overhead. Runtime and iteration-begin headers, terminal
+events, errors, and truncation markers are always flushed. The event limit
+bounds an accidentally broad op trace; reaching it emits `trace.truncated`,
+suppresses further ordinary events, and forces certification to fail rather
+than accepting partial evidence. Defaults retain the prior behavior: every
+rank, exact SHA-256 only when requested, and a flush after every event.
 
 An `iteration.end` event reports `pending_collectives`. A nonzero value means a
 collective launched inside the selected window but completed after it. The late
@@ -245,6 +301,15 @@ python tools/determinism/certify_traces.py \
   --require-dp-hierarchical-fp32-accumulation
 ```
 
+For an intentionally sampled diagnostic run, replace `--expected-ranks` with
+the same explicit selection, for example
+`--expected-rank-spec 0,4,8-11`. The certifier streams events and retains only
+bounded per-file counters and collective-balance state, rather than loading the
+entire trace tree into memory.
+When either tree uses summary detail, device digests, or
+`--expected-rank-spec`, a successful
+two-run human-readable result is labeled `DIAGNOSTIC MATCH`, not `CERTIFIED`.
+
 `certify_traces.py` checks both trees independently before comparing them. It
 requires deterministic runtime state, the requested rank/iteration/file counts,
 matching activation recomputes, completed collective output hashes, zero pending
@@ -256,6 +321,7 @@ It also rejects unsupported or incomplete event schemas, mixed rank/iteration
 identities within one file, sequence gaps, duplicate or missing runtime and
 iteration boundary markers, explicit `iteration.error` events, and collective
 begins/ends that are not balanced within the trace window.
+It also rejects every `trace.truncated` marker.
 Groups of at most two are excluded from the hierarchy requirement. One rank has
 no reduction, and two ranks have exactly one floating-point addition per output,
 so there is no reduction-tree order for physical topology to change. They still

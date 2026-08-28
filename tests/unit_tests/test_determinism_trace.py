@@ -15,6 +15,8 @@ from megatron.core.determinism_trace import (
     begin_collective_trace,
     begin_recompute_trace,
     collective_trace_phase,
+    parse_rank_spec,
+    rank_is_selected,
     record_collective_result,
     record_event,
     record_optimizer_state,
@@ -83,6 +85,29 @@ def test_disabled_trace_is_a_noop(tmp_path):
     assert not list(tmp_path.rglob("*.jsonl"))
 
 
+def test_rank_spec_selects_explicit_ranks_and_rejects_invalid_ranges():
+    assert parse_rank_spec(None) is None
+    assert parse_rank_spec("all") is None
+    assert parse_rank_spec("0,3,8-10") == {0, 3, 8, 9, 10}
+    assert rank_is_selected("0,3", rank=3, world_size=4)
+    assert not rank_is_selected("0,3", rank=2, world_size=4)
+
+    with pytest.raises(ValueError, match="invalid rank range"):
+        parse_rank_spec("8-3")
+    with pytest.raises(ValueError, match="outside world size"):
+        rank_is_selected("4", rank=0, world_size=4)
+
+
+def test_trace_skips_unselected_rank(tmp_path, monkeypatch):
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+
+    with trace_iteration(tmp_path, 1, rank_spec="0,3") as trace:
+        assert trace is None
+
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
 def test_trace_writes_versioned_rank_local_events_and_tensor_hash(tmp_path):
     with trace_iteration(tmp_path, 7, hash_tensors=True) as trace:
         assert active_trace() is trace
@@ -95,8 +120,89 @@ def test_trace_writes_versioned_rank_local_events_and_tensor_hash(tmp_path):
     tensor_event = next(event for event in events if event["kind"] == "tensor")
     assert tensor_event["payload"]["shape"] == [2]
     assert len(tensor_event["payload"]["sha256"]) == 64
+    assert "device_digest" not in tensor_event["payload"]
     assert events[-1]["name"] == "iteration.end"
     assert active_trace() is None
+
+
+def test_trace_records_compact_device_digest_and_recompute_identity(tmp_path):
+    tensor = torch.tensor([1.0, 2.0])
+    with trace_iteration(tmp_path, 17, device_hashes=True):
+        record_tensor("activation", tensor)
+        handle = begin_recompute_trace(lambda value: value.square(), (tensor,))
+        record_recompute_phase(handle, "forward", tensor.square())
+        record_recompute_phase(handle, "recompute", tensor.square())
+
+    events = _read_events(_trace_path(tmp_path, 17))
+    tensor_event = next(event for event in events if event["name"] == "activation")
+    assert tensor_event["payload"]["sha256"] is None
+    assert len(tensor_event["payload"]["device_digest"]) == 32
+    recompute = next(event for event in events if event["name"] == "checkpoint.recompute")
+    assert recompute["payload"]["matches_forward"] is True
+
+
+def test_summary_trace_filters_tensor_collective_and_recompute_detail(tmp_path):
+    tensor = torch.tensor([1.0, 2.0])
+    with trace_iteration(tmp_path, 24, summary_only=True):
+        record_event(EventKind.RUNTIME, "te.attention.backend.selected", {"backend": "fused"})
+        record_event(EventKind.PHASE, "forward_backward.begin")
+        record_tensor("activation", tensor)
+        assert begin_collective_trace("test.collective", "all_reduce", tensor) is None
+        assert begin_recompute_trace(lambda value: value, (tensor,)) is None
+        record_event(
+            EventKind.PHASE, "forward_backward.end", {"losses_reduced": [{"lm loss": 1.25}]}
+        )
+        record_event(EventKind.OPTIMIZER, "optimizer.begin")
+        record_event(EventKind.OPTIMIZER, "optimizer.end", {"grad_norm": 2.5})
+
+    events = _read_events(_trace_path(tmp_path, 24))
+    assert [event["name"] for event in events] == [
+        "runtime",
+        "iteration.begin",
+        "forward_backward.begin",
+        "forward_backward.end",
+        "optimizer.begin",
+        "optimizer.end",
+        "iteration.end",
+    ]
+    assert events[0]["payload"]["trace_detail"] == "summary"
+
+
+def test_summary_trace_rejects_tensor_digest_modes(tmp_path):
+    with pytest.raises(ValueError, match="cannot include tensor-content digests"):
+        with trace_iteration(tmp_path, 25, summary_only=True, device_hashes=True):
+            pass
+
+
+def test_trace_buffers_events_after_durable_header(tmp_path):
+    path = _trace_path(tmp_path, 18)
+    with trace_iteration(tmp_path, 18, flush_interval=100):
+        record_event(EventKind.PHASE, "forward.begin")
+        visible_events = _read_events(path)
+        assert [event["name"] for event in visible_events] == ["runtime", "iteration.begin"]
+
+    assert [event["name"] for event in _read_events(path)] == [
+        "runtime",
+        "iteration.begin",
+        "forward.begin",
+        "iteration.end",
+    ]
+
+
+def test_trace_event_limit_writes_truncation_and_terminal_event(tmp_path):
+    with trace_iteration(tmp_path, 19, max_events=3):
+        record_event(EventKind.PHASE, "forward.begin")
+        record_event(EventKind.PHASE, "forward.end")
+        record_event(EventKind.PHASE, "backward.begin")
+
+    events = _read_events(_trace_path(tmp_path, 19))
+    assert [event["name"] for event in events] == [
+        "runtime",
+        "iteration.begin",
+        "forward.begin",
+        "trace.truncated",
+        "iteration.end",
+    ]
 
 
 def test_runtime_trace_records_kernel_selection_inputs(tmp_path, monkeypatch):
