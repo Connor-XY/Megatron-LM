@@ -196,3 +196,43 @@ A note on method: run the control arm. A 40 GiB poison arena raised the minority
 rate sharply, which one arm alone would have read as confirming an uninitialized
 read. Running `0x00` against `0xFF` showed the shift was identical in both, so it
 came from allocation churn rather than the bytes.
+
+## Follow-Up Experiments (nvbug 6489647)
+
+The bug review asked for four things: cuDNN 9.25, `CUDA_LAUNCH_BLOCKING=1`,
+`PYTORCH_NO_CUDA_MEMORY_CACHING=1`, and compute-sanitizer.
+`run_intervention_repeat.sbatch` runs each as a named `INTERVENTION` so every
+arm is diff-identical to its control except for one variable.
+
+`CUDA_LAUNCH_BLOCKING=1` is already answered above: 10 of 12 repeats split
+against 9 of 10 in a matched control. It does not help, and surviving launch
+blocking is what an intra-kernel ordering dependence predicts, since blocking
+serializes between kernels but not the order CTAs within one kernel claim
+tickets from a global atomic counter.
+
+For the remaining three:
+
+| arm | what it tests | how to read it |
+| --- | --- | --- |
+| `cudnn925` | whether the newer cuDNN changes the fprop kernel or its tile-assignment scheme | 0 of 12 with a same-window control near its usual rate is a real fix signal; a nonzero rate at 12 repeats means not fixed |
+| `nocache` | whether caching-allocator block reuse participates | expect a rate *shift* either way; the 0x00-vs-0xFF poison arena already showed allocation churn moves the rate without being the cause, so only 0 of 12 splits would be surprising |
+| `memcheck` / `racecheck` / `initcheck` / `synccheck` | memory corruption, shared-memory races, uninitialized reads, invalid sync | any finding inside TE/cuDNN/Megatron MoE kernels is signal; NCCL noise under memcheck is expected and not signal |
+
+Two cautions carried over from the main investigation. First, judge every rate
+arm against a control submitted in the same window with the same script —
+`INTERVENTION=control` exists for exactly that. Second, a clean sanitizer run
+is weak evidence of absence here: the divergence is one bf16 ULP from two
+valid accumulation orders, which is not a memory error, so the sanitizer arms
+test the *alternative* hypothesis (corruption / missing sync), not the primary
+one.
+
+The `cudnn925` arm swaps only `libcudnn` via the `nvidia-cudnn-cu13` wheel
+(`LD_LIBRARY_PATH` + `LD_PRELOAD`), keeping torch, TE, and the container
+fixed, and aborts unless both `ctypes` and `torch.backends.cudnn.version()`
+report the expected version. Swapping the whole container would change
+torch/TE/cuDNN at once and say nothing about which moved the rate.
+
+The sanitizer arms cut `--calib-size` to 16 (the divergence is on the first
+calibration batch, so coverage survives) and disable the caching allocator for
+`memcheck`/`initcheck`, since suballocation from cached blocks hides
+out-of-bounds and uninitialized reads from those tools.
